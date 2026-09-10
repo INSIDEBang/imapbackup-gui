@@ -42,6 +42,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -60,9 +61,14 @@ def _has_console() -> bool:
             and sys.stdout.isatty() and sys.stdin.isatty())
 
 
+def _char_width(ch: str) -> int:
+    """Terminal cells taken by one char: East Asian wide/fullwidth count as 2 (ambiguous as 1)."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def _display_width(text: str) -> int:
-    """Terminal display width: East Asian wide/fullwidth chars count as 2 cells (ambiguous count as 1)."""
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    """Terminal display width of text."""
+    return sum(_char_width(ch) for ch in text)
 
 
 def _truncate_width(text: str, max_width: int) -> str:
@@ -74,12 +80,17 @@ def _truncate_width(text: str, max_width: int) -> str:
     out: List[str] = []
     width = 0
     for ch in text:
-        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        cw = _char_width(ch)
         if width + cw > max_width - 1:
             break
         out.append(ch)
         width += cw
     return "".join(out) + "…"
+
+
+def _terminal_cols() -> int:
+    """Usable status-line columns: one cell reserved so a full line never wraps before \\r."""
+    return max(shutil.get_terminal_size().columns - 1, 20)
 
 
 class Spinner:
@@ -99,7 +110,7 @@ class Spinner:
     def _render(self, text: str) -> None:
         # A line wider than the terminal wraps, and \r could only return to the last
         # wrapped row — clamp every frame to the terminal width so redraw stays 1:1.
-        cols = max(shutil.get_terminal_size().columns - 1, 20)
+        cols = _terminal_cols()
         line = _truncate_width(f"{self.glyphs[self.pos]} {text}", cols)
         pad = " " * max(self._width - _display_width(line), 0)
         self._width = _display_width(line) + len(pad)
@@ -147,6 +158,7 @@ EML_DUP_MARK = "（{}）"  # full-width parens, per fork convention
 WIN_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 WIN_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{n}" for p in ("COM", "LPT") for n in range(1, 10)}
 INTERNALDATE_RE = re.compile(r'INTERNALDATE "([^"]+)"')
+INTERNALDATE_TS_RE = re.compile(r"(\d{1,2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$")
 DATE_HEADER_RE = re.compile(rb"^Date:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 IMAP_MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
                "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
@@ -195,15 +207,8 @@ def build_eml_target(bucket_dir: Path, timestamp: datetime, msg_id: str, subject
         parts = ([subj_part] if subj_part else []) + [mid_part, timestamp.strftime("%Y%m%d")]
         return bucket_dir / ("_".join(parts) + EML_SUFFIX)
 
-    subject_part = ""
-    if subject:
-        candidate = sanitize_segment(subject, EML_SUBJECT_MAX)
-        if candidate != "_":
-            subject_part = candidate
-    target = assemble(subject_part, sanitize_msgid(msg_id))
-    if len(str(target)) <= EML_PATH_BUDGET:
-        return target
-    for subj_cap, mid_cap in ((30, EML_MSGID_MAX), (0, 60), (0, 30), (0, 16)):
+    target: Path
+    for subj_cap, mid_cap in ((EML_SUBJECT_MAX, EML_MSGID_MAX), (30, EML_MSGID_MAX), (0, 60), (0, 30), (0, 16)):
         subject_part = sanitize_segment(subject, subj_cap) if subject and subj_cap else ""
         if subject_part == "_":
             subject_part = ""
@@ -225,7 +230,7 @@ def unique_eml_path(target: Path) -> Path:
 
 def parse_internaldate(value: str) -> Optional[datetime]:
     """Parse an IMAP INTERNALDATE (English month abbreviations, zone offset) without locale traps."""
-    m = re.match(r"(\d{1,2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$", value.strip())
+    m = INTERNALDATE_TS_RE.match(value.strip())
     if not m:
         return None
     day, mon, year, hh, mi, ss, sign, oh, om = m.groups()
@@ -279,10 +284,21 @@ def decode_mime_words(value: str) -> str:
     return "".join(out).strip()
 
 
+def _subject_label(subject: str, max_len: int) -> str:
+    """Display label for a subject: RFC 2047 decoded, placeholder when empty, ellipsized to max_len."""
+    title = decode_mime_words(subject) if subject else "(no subject)"
+    return title[: max_len - 1] + "…" if len(title) > max_len else title
+
+
+@lru_cache(maxsize=None)
+def _folded_header_re(name: str) -> re.Pattern[str]:
+    """Regex extracting a named header plus its continuation (folded) lines; compiled once per name."""
+    return re.compile(rf"^{name}[ \t]*:(.*(?:\r?\n[ \t].*)*)", re.IGNORECASE | re.MULTILINE)
+
+
 def folded_header(head: bytes, name: str) -> str:
     """Extract a (possibly folded) header value from raw head bytes, whitespace-collapsed."""
-    pat = re.compile(rf"^{name}[ \t]*:(.*(?:\r?\n[ \t].*)*)", re.IGNORECASE | re.MULTILINE)
-    m = pat.search(head.decode("utf-8", "replace"))
+    m = _folded_header_re(name).search(head.decode("utf-8", "replace"))
     return BLANKS_RE.sub(" ", m.group(1)).strip() if m else ""
 
 
@@ -323,7 +339,7 @@ def imap_utf7_decode(name: str) -> str:
 def folder_separator(idx: int, total: int, display_name: str) -> None:
     """Full-width separator line marking the start of a folder's sync (blank line above it)."""
     title = f"[{idx}/{total}] {display_name}"
-    cols = max(shutil.get_terminal_size().columns - 1, 20)
+    cols = _terminal_cols()
     dashes = max(cols - _display_width(title) - 2, 4)
     left = dashes // 2
     line = "─" * left + " " + title + " " + "─" * (dashes - left)
@@ -344,9 +360,7 @@ def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
     sender = f"{name} <{addr}>" if name and addr else (addr or sender)
     if len(sender) > 60:
         sender = sender[:59] + "…"
-    title = decode_mime_words(subject) if subject else "(no subject)"
-    if len(title) > 80:
-        title = title[:79] + "…"
+    title = _subject_label(subject, 80)
     line = f"[{foldername} {idx}/{total}] {timestamp:%Y-%m-%d %H:%M} | {sender} | {title} ({pretty_byte_count(size)})"
     if verbose:
         line += f" | {msg_id}"
@@ -379,8 +393,10 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
         return
     if basedir is not None:
         fullname.parent.mkdir(parents=True, exist_ok=True)
-    spinner = Spinner(f"Downloading {len(messages)} new messages to {foldername or filename}", nospinner, quiet=quiet)
-    total = biggest = 0
+    count = len(messages)
+    display = foldername or filename
+    spinner = Spinner(f"Downloading {count} new messages to {display}", nospinner, quiet=quiet)
+    biggest = 0
     done_bytes = 0
     t0 = time.monotonic()
     from_re = re.compile(br"\n(>*)From ")
@@ -423,20 +439,16 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
                 target.write_bytes(payload)
                 size = max(size, len(payload))
             if size > biggest: biggest = size
-            total += size
             if not compact:
-                report_message(foldername or filename, idx, len(messages), timestamp,
-                               from_value, subject_value, size, msg_id, quiet, verbose, report,
-                               erase=spinner.erase)
+                report_message(display, idx, count, timestamp, from_value, subject_value, size,
+                               msg_id, quiet, verbose, report, erase=spinner.erase)
             done_bytes += size
             elapsed = time.monotonic() - t0
             rate = f" · {pretty_byte_count(int(done_bytes / elapsed))}/s" if elapsed >= 1.0 and done_bytes else ""
-            status_text = (f"Downloading {foldername or filename} [{progress_bar(idx, len(messages))}] "
-                           f"{idx}/{len(messages)} · {pretty_byte_count(done_bytes)}{rate}")
+            status_text = (f"Downloading {display} [{progress_bar(idx, count)}] "
+                           f"{idx}/{count} · {pretty_byte_count(done_bytes)}{rate}")
             if compact:
-                title = decode_mime_words(subject_value) if subject_value else "(no subject)"
-                if len(title) > 40: title = title[:39] + "…"
-                status_text += f" | {title}"
+                status_text += f" | {_subject_label(subject_value, 40)}"
             spinner.status(status_text)
             spinner.spin()
     finally:
@@ -444,7 +456,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
             mbox.close()
     spinner.stop()
     if not quiet:
-        log.info("%s: %s total, %s largest", filename, pretty_byte_count(total), pretty_byte_count(biggest))
+        log.info("%s: %s total, %s largest", filename, pretty_byte_count(done_bytes), pretty_byte_count(biggest))
 
 
 def scan_file(filename: str, overwrite: bool, nospinner: bool, basedir: Path, quiet: bool, log: logging.Logger) -> Dict[str, str]:
@@ -755,8 +767,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             ensure_basedir(cfg.basedir); create_folder_structure(names, cfg.basedir, account)
         total_folders = len(names)
         for folder_idx, (foldername, filename, eml_relpath, display_name) in enumerate(names, start=1):
-            if foldername in exclude or display_name in exclude:
-                if not cfg.quiet: log.info("Excluding folder '%s'", display_name); continue
             if not cfg.quiet: folder_separator(folder_idx, total_folders, display_name)
             try:
                 remote_msgs = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
