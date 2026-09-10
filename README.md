@@ -48,6 +48,7 @@ Key options (3.12 script):
 * `--folders` and `--exclude-folders` are mutually exclusive.
 * `--icloud` forces BODY.PEEK fetches (works around certain providers that otherwise re-flag messages).
 * `--thunderbird` creates Thunderbird-style directory layout (.sbd folders instead of dotted names).
+* `--eml-dir DIR` additionally writes each message as an individual `.eml` file (see Fork Notes below); combine with `--mbox-dir` to write both formats from a single fetch.
 * `--yes-overwrite-mboxes` will delete existing local mbox files before writing (default is incremental append logic).
 * `--nospinner` disables the TTY spinner (always disabled if stdout is not a TTY or in quiet mode).
 
@@ -69,6 +70,37 @@ python imapbackup312.py --help
 * Improved folder include/exclude handling and Thunderbird naming translation.
 * Added graceful KeyboardInterrupt handling (prints a clean newline instead of a traceback).
 * Cleaned up and tightened error messages with consistent `SystemExit` usage and exception chaining.
+
+## Fork Notes (imapbackup-gui)
+
+This fork adds capabilities on top of upstream, aimed at a future Windows GUI distribution. The CLI remains fully usable on its own.
+
+* **Per-message `.eml` output** (`--eml-dir DIR`): each message is written as an individual `.eml` file under `<eml-dir>/<account>/<folder>/<yyyy-MM>/`, nested by IMAP folder hierarchy and grouped into `yyyy-MM` subfolders by received time (INTERNALDATE, falling back to the `Date:` header). Filenames are `<subject>_<Message-Id>_yyyyMMdd.eml` (Windows-safe sanitization; exact duplicates get a `（n）` suffix). Given only `--eml-dir`, no mbox files are written; incremental behavior is unchanged — existing messages are recognized by reading the `Message-Id` header inside each file.
+* **Per-message progress lines**: after each message is saved, a one-line summary is printed next to the existing spinner, e.g. `[INBOX 12/345] 2024-05-12 10:15 | Alice <a@b.com> | Re: budget (12.3 KB)`. Add `-v` to include the Message-Id, `--quiet` to silence. Output still prints when redirected to a file.
+* **Read-only hardening**: the synthetic-ID fallback fetch now uses `BODY.PEEK`, so messages are never flagged as seen on strict servers.
+* Planned: a Tkinter GUI and a Windows installer (PyInstaller + Inno Setup shipping `imapbackup-gui.exe` and `imapbackup.exe`).
+
+## What Changed in 1.6.0 (fork)
+
+* Added `--eml-dir` for per-message `.eml` output (see Fork Notes above).
+* Added per-message progress lines with RFC 2047-decoded senders and subjects.
+* Backups now live under `<backup-root>/<account>/…` for both output formats — see the one-time migration notes below.
+* IMAP modified UTF-7 folder names are decoded (e.g. `&UXZO1mWHTvZZOQ-` → `其他文件夹`) for display, mbox filenames, eml directories, and `--folders` matching.
+* Per-message progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
+* Each folder's sync starts with a full-width separator (e.g. `── [3/8] Sent Messages ──`) so it is easy to see where one folder ends and the next begins.
+* Log level names are spelled out (`INFO` instead of `I`).
+* Synthetic-ID fallback header fetch now uses `BODY.PEEK` (read-only invariant).
+* Console-stream guards so a future `--windowed` build cannot crash on missing stdin/stdout.
+
+### One-time migration for backups made before the account layer
+
+Incremental scanning reads the `Message-Id` header inside each message (not the path), so moving existing backups into the account directory is seamless — nothing gets re-downloaded. Modified UTF-7 folder names decode to real names now (e.g. `&UXZO1mWHTvZZOQ-` was 其他文件夹), so the old garbled directories can simply be deleted if empty:
+
+```powershell
+New-Item "D:\data\Downloads\mail_backup\3273910043@qq.com" -ItemType Directory
+Move-Item "D:\data\Downloads\mail_backup\INBOX", "D:\data\Downloads\mail_backup\Sent Messages" "D:\data\Downloads\mail_backup\3273910043@qq.com\"
+Remove-Item "D:\data\Downloads\mail_backup\&UXZO1mWHTvZZOQ-"
+```
 
 ## Migrating From Older Scripts
 
