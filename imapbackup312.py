@@ -10,7 +10,8 @@ Modernized for Python 3.12:
 
 Fork additions:
  - optional per-message .eml output tree (--eml-dir)
- - per-message progress lines (with a callback seam for the future GUI)
+ - per-message progress lines; structured report callback and cooperative
+   stop hook consumed by the Tkinter GUI (imapbackup_gui.py)
 
 Original contributors (abridged): jwagnerhki, Bob Ippolito, Michael Leonhard,
 Giuseppe Scrivano, Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett,
@@ -18,7 +19,7 @@ Mark Feit, Marco Machicao, and Rui Carmo.
 """
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 __author__ = "Rui Carmo (http://taoofmac.com)"
 __copyright__ = "(C) 2006-2025 Rui Carmo. Code under MIT License.(C)"
 __contributors__ = "jwagnerhki, Bob Ippolito, Michael Leonhard, Giuseppe Scrivano <gscrivano@gnu.org>, Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett, Mark Feit, Marco Machicao"
@@ -348,13 +349,10 @@ def folder_separator(idx: int, total: int, display_name: str) -> None:
         sys.stdout.flush()
 
 
-def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
-                   from_value: str, subject: str, size: int, msg_id: str,
-                   quiet: bool, verbose: int, report: Optional[Callable[[str], None]] = None,
-                   erase: Optional[Callable[[], None]] = None) -> None:
-    """Print the one-line per-message progress report, or hand it to the GUI callback."""
-    if quiet:
-        return
+def format_message_line(foldername: str, idx: int, total: int, timestamp: datetime,
+                        from_value: str, subject: str, size: int, msg_id: str,
+                        verbose: int) -> str:
+    """Render the one-line per-message terminal report from raw fields."""
     sender = decode_mime_words(from_value) if from_value else "?"
     name, addr = email.utils.parseaddr(sender)
     sender = f"{name} <{addr}>" if name and addr else (addr or sender)
@@ -364,9 +362,25 @@ def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
     line = f"[{foldername} {idx}/{total}] {timestamp:%Y-%m-%d %H:%M} | {sender} | {title} ({pretty_byte_count(size)})"
     if verbose:
         line += f" | {msg_id}"
-    if report is not None:
-        report(line)
+    return line
+
+
+def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
+                   from_value: str, subject: str, size: int, msg_id: str,
+                   quiet: bool, verbose: int, report: Optional[Callable[[dict], None]] = None,
+                   erase: Optional[Callable[[], None]] = None) -> None:
+    """Emit per-message progress: a structured dict to the GUI callback, else one terminal line.
+
+    The callback receives raw header values (undecoded From/Subject) — consumers
+    run decode_mime_words themselves. See ADR 0003.
+    """
+    if quiet:
         return
+    if report is not None:
+        report({"folder": foldername, "index": idx, "total": total, "timestamp": timestamp,
+                "from": from_value, "subject": subject, "size": size, "msg_id": msg_id})
+        return
+    line = format_message_line(foldername, idx, total, timestamp, from_value, subject, size, msg_id, verbose)
     if sys.stdout is not None:
         if erase is not None:
             erase()
@@ -379,7 +393,8 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
                       basedir: Optional[Path], icloud: bool, quiet: bool, log: logging.Logger,
                       eml_dir: Optional[Path] = None, foldername: str = "",
                       verbose: int = 0, compact: bool = False,
-                      report: Optional[Callable[[str], None]] = None) -> None:
+                      report: Optional[Callable[[dict], None]] = None,
+                      should_stop: Optional[Callable[[], bool]] = None) -> None:
     if basedir is not None:
         fullname = basedir / filename
         if overwrite and fullname.exists():
@@ -403,10 +418,11 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
     mbox = fullname.open("ab") if basedir is not None else None
     try:
         for idx, (msg_id, seq) in enumerate(messages.items(), start=1):
-            if icloud:
-                typ, data = server.fetch(str(seq), "(INTERNALDATE BODY.PEEK[])")
-            else:
-                typ, data = server.fetch(str(seq), "(INTERNALDATE RFC822)")
+            if should_stop is not None and should_stop():
+                if not quiet: log.info("%s: stopped by request after %d/%d messages", display, idx - 1, count)
+                break
+            fetch_cmd = "(INTERNALDATE BODY.PEEK[])" if icloud else "(INTERNALDATE RFC822)"
+            typ, data = server.fetch(str(seq), fetch_cmd)
             if typ != 'OK':
                 raise RuntimeError(f"FETCH failed for UID {seq}: {data}")
             if not data or not isinstance(data[0], tuple):
