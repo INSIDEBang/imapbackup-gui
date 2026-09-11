@@ -78,7 +78,14 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 * **Per-message `.eml` output** (`--eml-dir DIR`): each message is written as an individual `.eml` file under `<eml-dir>/<account>/<folder>/<yyyy-MM>/`, nested by IMAP folder hierarchy and grouped into `yyyy-MM` subfolders by received time (INTERNALDATE, falling back to the `Date:` header). Filenames are `<subject>_<Message-Id>_yyyyMMdd.eml` (Windows-safe sanitization; exact duplicates get a `（n）` suffix). Given only `--eml-dir`, no mbox files are written; incremental behavior is unchanged — existing messages are recognized by reading the `Message-Id` header inside each file.
 * **Per-message progress lines**: after each message is saved, a one-line summary is printed next to the existing spinner, e.g. `[INBOX 12/345] 2024-05-12 10:15 | Alice <a@b.com> | Re: budget (12.3 KB)`. Add `-v` to include the Message-Id, `--quiet` to silence. Output still prints when redirected to a file.
 * **Read-only hardening**: the synthetic-ID fallback fetch now uses `BODY.PEEK`, so messages are never flagged as seen on strict servers.
-* Planned: a Tkinter GUI and a Windows installer (PyInstaller + Inno Setup shipping `imapbackup-gui.exe` and `imapbackup.exe`).
+* **Tkinter GUI** (`imapbackup_gui.py`): single-window front-end for non-technical users — connect and load the account's folder tree as checkboxes (no typing folder names), pick mbox/eml output (both can be written from one fetch) into one backup root, and watch each backed-up message appear live in a table with a progress bar and server/pending/backed counts. Stop is cooperative (finishes the current message), reruns are incremental, and logs go to `%LOCALAPPDATA%\imapbackup-gui\log\`. See ADR 0003 for the core callback contract.
+* Planned: a Windows installer (PyInstaller + Inno Setup shipping `imapbackup-gui.exe` and `imapbackup.exe`).
+
+## What Changed in 1.7.0 (fork)
+
+* Added `imapbackup_gui.py`, the Tkinter GUI entry point (see Fork Notes above).
+* The per-message `report` callback seam now passes a structured dict (folder, index, total, timestamp, From, Subject, size, Message-Id) instead of a preformatted line; terminal output is byte-identical to 1.6.0 (ADR 0003).
+* `download_messages` gained an optional `should_stop` callback for cooperative cancellation between messages.
 
 ## What Changed in 1.6.0 (fork)
 
