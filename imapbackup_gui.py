@@ -39,17 +39,19 @@ import imapbackup312 as core
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-10s | %(funcName)s:%(lineno)d | %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "log"
 MAX_LOG_LINES = 5000
+UPTODATE_STATUS = "已是最新，无待备份邮件"
 
 
 class QueueLogHandler(logging.Handler):
     """Mirror INFO+ records onto the event queue for the 运行日志 tab (current session only)."""
 
-    def __init__(self, events: "queue.Queue[tuple]"):
+    def __init__(self, events: queue.Queue[tuple]):
         super().__init__(level=logging.INFO)
         self.events = events
-        self.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+        self.setFormatter(LOG_FORMATTER)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -72,18 +74,19 @@ class BackupApp:
         self.root.geometry("960x680")
         self.root.minsize(800, 600)
 
-        self.events: "queue.Queue[tuple]" = queue.Queue()
+        self.events: queue.Queue[tuple] = queue.Queue()
         self.stop_flag = threading.Event()
+        self.log = logging.getLogger("gui")
         self._setup_logging()
 
         # ---- state ----
         self.connect_state = "idle"  # idle | connecting | connected | stale
-        self._snapshot: "tuple[str, str, str] | None" = None  # (server, user, password) at connect time
+        self._snapshot: tuple[str, str, str] | None = None  # (server, user, password) at connect time
         self.running = False
-        self.folder_rows: "list[dict]" = []
+        self.folder_rows: list[dict] = []
         self._ever_loaded = False
         self._port_touched = False
-        self._config_widgets: "list[tuple[tk.Widget, str]]" = []
+        self._config_widgets: list[tuple[tk.Widget, str]] = []
         self.server_total = 0
         self.pending_total = 0
         self.backed_count = 0
@@ -98,14 +101,14 @@ class BackupApp:
 
     def _setup_logging(self) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        debug = os.environ.get("IMAPBACKUP_GUI_DEBUG", "") == "1"
+        debug = os.environ.get("IMAPBACKUP_GUI_DEBUG") == "1"
         file_handler = logging.FileHandler(LOG_DIR / f"run-{datetime.now():%Y-%m-%d}.log", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+        file_handler.setFormatter(LOG_FORMATTER)
         root = logging.getLogger()
         root.handlers[:] = [file_handler, QueueLogHandler(self.events)]
         root.setLevel(logging.DEBUG if debug else logging.INFO)
-        logging.getLogger("gui").info("程序启动 v%s", __version__)
+        self.log.info("程序启动 v%s", __version__)
 
     # ------------------------------------------------------------- config area
 
@@ -116,10 +119,10 @@ class BackupApp:
     def _build_config_area(self) -> None:
         outer = tk.Frame(self.root)
         outer.pack(fill="x", padx=8, pady=(8, 2))
+        outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
         left = tk.Frame(outer)
         left.grid(row=0, column=0, sticky="n", padx=(0, 8))
-        outer.columnconfigure(0, weight=1)
         self._build_conn_group(left)
         self._build_output_group(left)
         self._build_folder_group(outer)
@@ -268,7 +271,7 @@ class BackupApp:
 
     # ------------------------------------------------------- connect handlers
 
-    def _conn_values(self) -> "dict | None":
+    def _conn_values(self) -> dict | None:
         server = self.server_var.get().strip()
         user = self.user_var.get().strip()
         password = self.password_var.get()
@@ -302,14 +305,14 @@ class BackupApp:
         self._update_start_state()
         threading.Thread(target=self._connect_worker, args=(v,), daemon=True).start()
 
-    def _build_core_config(self, v: dict, *, basedir: "Path | None" = None, eml_dir: "Path | None" = None) -> core.Config:
+    def _core_config(self, v: dict, basedir: Path | None = None, eml_dir: Path | None = None) -> core.Config:
         return core.Config(overwrite=False, usessl=v["ssl"], thunderbird=False, nospinner=True,
                            basedir=basedir, icloud=False, quiet=False, user=v["user"], server=v["server"],
                            password=v["password"], timeout=60, port=v["port"], eml_dir=eml_dir)
 
     def _connect_worker(self, v: dict) -> None:
         log = logging.getLogger("imapbackup")
-        cfg = self._build_core_config(v)
+        cfg = self._core_config(v)
         try:
             server = core.connect_and_login(cfg, log)
             try:
@@ -326,15 +329,15 @@ class BackupApp:
             log.exception("连接失败")
             self.events.put(("connect_failed", f"{type(e).__name__}: {e}"))
 
-    def _on_folders_loaded(self, names: "list[tuple]", v: dict) -> None:
+    def _on_folders_loaded(self, names: list[tuple], v: dict) -> None:
         self._rebuild_folders(names)
         self._snapshot = (v["server"], v["user"], v["password"])
         self.connect_state = "connected"
-        logging.getLogger("gui").info("已加载 %d 个邮箱文件夹", len(names))
+        self.log.info("已加载 %d 个邮箱文件夹", len(names))
         self._check_stale()  # user may have edited fields while connecting
         self._update_start_state()
 
-    def _rebuild_folders(self, names: "list[tuple]") -> None:
+    def _rebuild_folders(self, names: list[tuple]) -> None:
         if self._ever_loaded:
             checked = {r["foldername"] for r in self.folder_rows if r["var"].get()}
         else:
@@ -429,10 +432,6 @@ class BackupApp:
             except tk.TclError:
                 pass
 
-    def _selected_folders(self) -> "list[tuple]":
-        return [tuple((r["foldername"], r["filename"], r["eml_relpath"], r["display"]))
-                for r in self.folder_rows if r["var"].get()]
-
     def _on_start(self) -> None:
         v = self._conn_values()
         if v is None:
@@ -440,7 +439,8 @@ class BackupApp:
         if not v["outdir"]:
             messagebox.showwarning("信息不完整", "请选择备份保存位置。", parent=self.root)
             return
-        selected = self._selected_folders()
+        selected = [(r["foldername"], r["filename"], r["eml_relpath"], r["display"])
+                    for r in self.folder_rows if r["var"].get()]
         if not selected:
             return
         self.running = True
@@ -455,38 +455,45 @@ class BackupApp:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.notebook.select(0)
-        logging.getLogger("gui").info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
-                                      len(selected), v["outdir"], v["mbox"], v["eml"])
+        self.log.info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
+                      len(selected), v["outdir"], v["mbox"], v["eml"])
         threading.Thread(target=self._backup_worker, args=(v, selected), daemon=True).start()
 
-    def _backup_worker(self, v: dict, selected: "list[tuple]") -> None:
+    def _backup_worker(self, v: dict, selected: list[tuple]) -> None:
         log = logging.getLogger("imapbackup")
-        gui = logging.getLogger("gui")
         t0 = time.monotonic()
         eq = self.events
+        backed = 0
+
+        def report(d: dict) -> None:
+            nonlocal backed
+            backed += 1
+            self.log.debug("已备份 %s：%s", d["folder"], d["msg_id"])
+            eq.put(("message", d))
+
         try:
             root_dir = Path(v["outdir"])
             basedir = root_dir if v["mbox"] else None
             eml_root = root_dir if v["eml"] else None
-            cfg = self._build_core_config(v, basedir=basedir, eml_dir=eml_root)
+            cfg = self._core_config(v, basedir, eml_root)
             server = core.connect_and_login(cfg, log)
             account = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
 
             # pass 1: enumerate + incremental scan, so 待备份 total is known before any download
-            plans: "list[tuple]" = []
+            plans: list[tuple] = []
             server_total = 0
             pending_total = 0
             for i, n in enumerate(selected, 1):
                 if self.stop_flag.is_set():
                     break
-                foldername, _filename, _eml_relpath, display = n
+                foldername, filename, eml_relpath, display = n
                 eq.put(("phase", f"扫描 {i}/{len(selected)}：{display}"))
                 try:
                     remote = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
                 except core.SkipFolderException as e:
-                    gui.warning("%s：跳过（%s）", display, e)
+                    self.log.warning("%s：跳过（%s）", display, e)
                     continue
-                local: "dict[str, str]" = {}
+                local: dict[str, str] = {}
                 if basedir is not None:
                     local.update(core.scan_file(f"{account}/{filename}", False, True, basedir, quiet=False, log=log))
                 if eml_root is not None:
@@ -498,7 +505,6 @@ class BackupApp:
             eq.put(("totals", server_total, pending_total))
 
             # pass 2: download; folders were re-selectable because scan_folder moved the selection each time
-            backed_box = [0]
             if pending_total > 0 and not self.stop_flag.is_set():
                 if basedir is not None:
                     core.ensure_basedir(basedir)
@@ -512,16 +518,10 @@ class BackupApp:
                     eq.put(("phase", f"备份 {display}（{len(new)} 封）"))
                     typ, data = server.select(f'"{foldername}"', readonly=True)
                     if typ != "OK":
-                        gui.warning("%s：SELECT 失败 %s", display, data)
+                        self.log.warning("%s：SELECT 失败 %s", display, data)
                         continue
                     label = f"{account}/{filename}" if basedir is not None else f"{account}/{eml_relpath}"
                     eml_folder_dir = eml_root / account / eml_relpath if eml_root is not None else None
-
-                    def report(d: dict) -> None:
-                        backed_box[0] += 1
-                        gui.debug("已备份 %s：%s", d["folder"], d["msg_id"])
-                        eq.put(("message", d))
-
                     core.download_messages(server, label, new, False, True, False,
                                            basedir, False, quiet=False, log=log,
                                            eml_dir=eml_folder_dir, foldername=display,
@@ -531,12 +531,12 @@ class BackupApp:
             except Exception:
                 pass
             seconds = time.monotonic() - t0
-            eq.put(("run_done", backed_box[0], server_total - pending_total, seconds,
+            eq.put(("run_done", backed, server_total - pending_total, seconds,
                     self.stop_flag.is_set(), pending_total))
         except SystemExit as e:
             eq.put(("run_failed", str(e)))
         except Exception as e:
-            gui.exception("备份运行失败")
+            self.log.exception("备份运行失败")
             eq.put(("run_failed", f"{type(e).__name__}: {e}"))
 
     def _on_stop(self) -> None:
@@ -573,7 +573,7 @@ class BackupApp:
             self.progress.configure(maximum=max(self.pending_total, 1), value=0)
             self._refresh_counts()
             if self.pending_total == 0:
-                self._set_status("已是最新，无待备份邮件", error=False)
+                self._set_status(UPTODATE_STATUS, error=False)
         elif kind == "message":
             self._add_message_row(ev[1])
         elif kind == "run_done":
@@ -595,14 +595,13 @@ class BackupApp:
         if stopped:
             self._set_status(f"已停止：本次备份 {backed} 封", error=False)
         elif pending == 0:
-            self._set_status("已是最新，无待备份邮件", error=False)
+            self._set_status(UPTODATE_STATUS, error=False)
         else:
             self.progress.configure(value=self.progress["maximum"])
             self._set_status(f"完成：本次备份 {backed} 封，跳过 {skipped} 封（本地已存在），用时 {_fmt_duration(seconds)}",
                              error=False)
-        gui = logging.getLogger("gui")
-        gui.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s", backed, skipped, _fmt_duration(seconds),
-                 "（用户停止）" if stopped else "")
+        self.log.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s", backed, skipped, _fmt_duration(seconds),
+                      "（用户停止）" if stopped else "")
         self._update_start_state()
 
     def _set_status(self, text: str, error: bool) -> None:
