@@ -27,6 +27,7 @@ python imapbackup312.py --server imap.example.com:993 --ssl --user x@y.com \
 
 - 没有测试套件。验证改动：`python -m py_compile <file>`，再手动跑 `--help` 和小范围 `--folders` 备份
 - `.gitignore` 已忽略 `*.mbox`、`dist/`、`build/` — 不要提交本地测试产生的 mbox 或打包产物
+- **未经用户明确允许，不要执行 `git commit` 或 `git push`**（包括 `--amend` 和强推）。改完代码留在工作树里等用户确认，再按用户指示提交；也不要代用户创建分支或发 PR
 
 ## 核心机制（改逻辑前必读）
 
