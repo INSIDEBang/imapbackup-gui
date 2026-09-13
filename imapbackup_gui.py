@@ -43,6 +43,10 @@ LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "log"
 MAX_LOG_LINES = 5000
 UPTODATE_STATUS = "已是最新，无待备份邮件"
+CONNECT_BTN_LABEL = "⇄ 连接并加载文件夹"
+CONNECTED_BTN_LABEL = "✓ 已成功连接"
+STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
+RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
 
 
 class QueueLogHandler(logging.Handler):
@@ -71,8 +75,8 @@ class BackupApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("邮箱备份工具")
-        self.root.geometry("960x680")
-        self.root.minsize(800, 600)
+        self.root.geometry("960x736")
+        self.root.minsize(800, 620)
 
         self.events: queue.Queue[tuple] = queue.Queue()
         self.stop_flag = threading.Event()
@@ -86,6 +90,7 @@ class BackupApp:
         self.folder_rows: list[dict] = []
         self._ever_loaded = False
         self._port_touched = False
+        self._spinner_job: int | None = None  # root.after id while the button shows a spinner
         self._config_widgets: list[tuple[tk.Widget, str]] = []
         self.server_total = 0
         self.pending_total = 0
@@ -122,7 +127,7 @@ class BackupApp:
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
         left = tk.Frame(outer)
-        left.grid(row=0, column=0, sticky="n", padx=(0, 8))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._build_conn_group(left)
         self._build_output_group(left)
         self._build_folder_group(outer)
@@ -133,37 +138,37 @@ class BackupApp:
         group.columnconfigure(1, weight=1)
 
         tk.Label(group, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
-        tk.Label(group, text="IMAP（仅接收，不发送）", anchor="w").grid(row=0, column=1, columnspan=3, sticky="w", pady=3)
+        tk.Label(group, text="IMAP（仅接收，不发送）", anchor="w").grid(row=0, column=1, columnspan=4, sticky="w", pady=3)
 
         tk.Label(group, text="帐号：").grid(row=1, column=0, sticky="e", padx=(8, 0))
         self.user_var = tk.StringVar()
-        self._register(tk.Entry(group, textvariable=self.user_var)).grid(row=1, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+        self.user_entry = self._register(tk.Entry(group, textvariable=self.user_var))
+        self.user_entry.grid(row=1, column=1, columnspan=4, sticky="we", padx=4, pady=3)
 
         tk.Label(group, text="收件服务器：").grid(row=2, column=0, sticky="e", padx=(8, 0))
         self.server_var = tk.StringVar()
-        self._register(tk.Entry(group, textvariable=self.server_var)).grid(row=2, column=1, sticky="we", padx=4, pady=3)
+        self.server_entry = self._register(tk.Entry(group, textvariable=self.server_var))
+        self.server_entry.grid(row=2, column=1, sticky="we", padx=4, pady=3)
         self.ssl_var = tk.BooleanVar(value=True)
         self._register(tk.Checkbutton(group, text="SSL", variable=self.ssl_var, command=self._on_ssl_toggle)).grid(row=2, column=2, sticky="w")
-        port_box = tk.Frame(group)
-        port_box.grid(row=2, column=3, sticky="w", padx=(0, 8))
-        tk.Label(port_box, text="端口：").pack(side="left")
+        tk.Label(group, text="端口：").grid(row=2, column=3, sticky="e", padx=(8, 0))
         self.port_var = tk.StringVar(value="993")
-        port_entry = self._register(tk.Entry(port_box, textvariable=self.port_var, width=6))
-        port_entry.pack(side="left")
-        port_entry.bind("<Key>", self._on_port_key, add="+")
+        self.port_entry = self._register(tk.Entry(group, textvariable=self.port_var, width=7))
+        self.port_entry.grid(row=2, column=4, sticky="e", padx=(4, 4), pady=3)
+        self.port_entry.bind("<Key>", self._on_port_key, add="+")
 
         tk.Label(group, text="密码：").grid(row=3, column=0, sticky="e", padx=(8, 0))
         self.password_var = tk.StringVar()
         self.password_entry = self._register(tk.Entry(group, textvariable=self.password_var, show="*"))
-        self.password_entry.grid(row=3, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+        self.password_entry.grid(row=3, column=1, columnspan=4, sticky="we", padx=4, pady=3)
         self.show_var = tk.BooleanVar(value=False)
-        self._register(tk.Checkbutton(group, text="显示", variable=self.show_var, command=self._on_show_toggle)).grid(row=3, column=4, sticky="w", padx=(0, 8))
+        self._register(tk.Checkbutton(group, text="显示", variable=self.show_var, command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
 
-        self.connect_btn = self._register(tk.Button(group, text="连接并加载文件夹", command=self._on_connect))
-        self.connect_btn.grid(row=4, column=0, columnspan=2, sticky="we", padx=8, pady=(4, 8))
-        self.stale_hint = tk.Label(group, text="连接信息已更改，请重新连接并加载文件夹", foreground="red")
-        self.stale_hint.grid(row=4, column=2, columnspan=3, sticky="w", padx=(4, 8))
-        self.stale_hint.grid_remove()
+        self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=26, command=self._on_connect))
+        self.connect_btn.grid(row=4, column=0, columnspan=6, pady=(10, 4))
+        # 常驻一行、无提示时留空文本，保证按钮位置在任何状态下都不跳动
+        self.conn_hint = tk.Label(group, text="", foreground="gray")
+        self.conn_hint.grid(row=5, column=0, columnspan=6, pady=(0, 8))
 
         for var in (self.server_var, self.user_var, self.password_var):
             var.trace_add("write", self._check_stale)
@@ -193,9 +198,9 @@ class BackupApp:
 
         toolbar = tk.Frame(group)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=6, pady=(2, 0))
-        self._register(tk.Button(toolbar, text="全选", command=lambda: self._set_all_folders(True))).pack(side="left")
-        self._register(tk.Button(toolbar, text="清空", command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
-        self._register(tk.Button(toolbar, text="仅收件箱", command=self._set_inbox_only)).pack(side="left", padx=(6, 0))
+        self._register(tk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
+        self._register(tk.Button(toolbar, text="清空", width=7, command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
+        self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(6, 0))
 
         self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=200)
         self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
@@ -366,19 +371,40 @@ class BackupApp:
         self._apply_connect_state()
         self._update_start_state()
 
+    def _show_conn_hint(self, text: str) -> None:
+        self.conn_hint.configure(text=text)
+
+    def _start_button_spinner(self) -> None:
+        """连接中的按钮图标用盲文点阵转圈（U+2800 段，Windows 字体普遍有字形）。"""
+        frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+        def tick(i: int = 0) -> None:
+            if self.connect_state != "connecting":
+                self._spinner_job = None
+                return
+            self.connect_btn.configure(text=f"{frames[i % len(frames)]} 正在连接…")
+            self._spinner_job = self.root.after(150, tick, i + 1)
+
+        self.connect_btn.configure(text=f"{frames[0]} 正在连接…", state="disabled")
+        self._spinner_job = self.root.after(150, tick, 1)
+
     def _apply_connect_state(self) -> None:
         if self.connect_state == "connecting":
-            self.connect_btn.configure(text="正在连接…", state="disabled")
-            self.stale_hint.grid_remove()
-        elif self.connect_state == "connected":
-            self.connect_btn.configure(text="已成功连接", state="disabled")
-            self.stale_hint.grid_remove()
-        else:  # idle / stale — same control, stale adds the hint
-            self.connect_btn.configure(text="连接并加载文件夹", state="normal")
-            if self.connect_state == "stale":
-                self.stale_hint.grid()
-            else:
-                self.stale_hint.grid_remove()
+            if self._spinner_job is None:
+                self._start_button_spinner()
+        else:
+            self._spinner_job = None
+            if self.running:
+                # 运行中配置区整体锁定，connect_btn 已被 _set_config_enabled(False) 禁用
+                self.connect_btn.configure(text=CONNECT_BTN_LABEL)
+                self._show_conn_hint(RUNNING_HINT_TEXT)
+            elif self.connect_state == "connected":
+                self.connect_btn.configure(text=CONNECTED_BTN_LABEL, state="disabled")
+                self._show_conn_hint("")
+            else:  # idle / stale — 同一控件，stale 额外加一行提示
+                # 必须恢复 normal：运行中 _set_config_enabled(False) 禁用的按钮在结束后要能重新点击
+                self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="normal")
+                self._show_conn_hint(STALE_HINT_TEXT if self.connect_state == "stale" else "")
 
     # --------------------------------------------------------- misc handlers
 
@@ -585,6 +611,7 @@ class BackupApp:
 
     def _end_run_controls(self) -> None:
         self.running = False
+        # 先解锁配置区再走连接状态机：状态机可能重新禁用连接按钮（过期连接），顺序反了会被解锁覆盖回去
         self._set_config_enabled(True)
         self._apply_connect_state()
         self.start_btn.configure(state="disabled")
