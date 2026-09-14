@@ -47,6 +47,17 @@ CONNECT_BTN_LABEL = "⇄ 连接并加载文件夹"
 CONNECTED_BTN_LABEL = "✓ 已成功连接"
 STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
 RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
+HINT_RED = "red"       # 需要用户操作：连接信息已过期，得重新连接
+HINT_GRAY = "gray"     # 备份运行中：配置锁定，先停下才能改
+
+# 文件夹树的勾选态与箭头符号（字形可用性以本机截图为准，缺字时退用 □/■/▦ 与 [-]/[+]）
+CHECK_OFF = "☐"        # U+2610 未勾选
+CHECK_ON = "☑"         # U+2611 已勾选
+CHECK_PARTIAL = "⊟"    # U+229F 部分勾选
+ARROW_OPEN = "▾"       # U+25BE 已展开
+ARROW_CLOSED = "▸"     # U+25B8 已折叠
+ARROW_SLOT_W = 16      # 箭头占位宽度，保证各级名称左边缘对齐
+FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
 
 
 class QueueLogHandler(logging.Handler):
@@ -69,6 +80,17 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
+    """最后一段显示名。eml_relpath 的段数等于真实层级深度，用它反查真实分隔符。
+
+    不能直接按 "/" 切 display：QQ 用 "/"，Outlook 用 "."，服务器决定分隔符。
+    """
+    for delim in ("/", "\\", "."):
+        if display.count(delim) == len(path) - 1:
+            return display.rsplit(delim, 1)[-1]
+    return display
+
+
 class BackupApp:
     """Single-window layout: config zones on top, Notebook (邮件列表/运行日志) below, status bar at the bottom."""
 
@@ -88,7 +110,8 @@ class BackupApp:
         self._snapshot: tuple[str, str, str] | None = None  # (server, user, password) at connect time
         self.running = False
         self.folder_rows: list[dict] = []
-        self._ever_loaded = False
+        self._folder_nodes: dict[tuple[str, ...], dict] = {}
+        self._folder_clickables: list[tuple[tk.Widget, str]] = []
         self._port_touched = False
         self._spinner_job: int | None = None  # root.after id while the button shows a spinner
         self._config_widgets: list[tuple[tk.Widget, str]] = []
@@ -165,10 +188,11 @@ class BackupApp:
         self._register(tk.Checkbutton(group, text="显示", variable=self.show_var, command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
 
         self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=26, command=self._on_connect))
-        self.connect_btn.grid(row=4, column=0, columnspan=6, pady=(10, 4))
-        # 常驻一行、无提示时留空文本，保证按钮位置在任何状态下都不跳动
-        self.conn_hint = tk.Label(group, text="", foreground="gray")
+        self.connect_btn.grid(row=4, column=0, columnspan=6, pady=(10, 10))
+        # 按需挂出：无提示时 grid_remove 让出这一行，按钮位置不变，让出的高度由下方邮件列表吸收
+        self.conn_hint = tk.Label(group, text="")
         self.conn_hint.grid(row=5, column=0, columnspan=6, pady=(0, 8))
+        self.conn_hint.grid_remove()
 
         for var in (self.server_var, self.user_var, self.password_var):
             var.trace_add("write", self._check_stale)
@@ -202,20 +226,19 @@ class BackupApp:
         self._register(tk.Button(toolbar, text="清空", width=7, command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
         self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(6, 0))
 
+        # 用嵌套 Frame 手搭树形，不用 ttk.Treeview：Treeview 的原生 <Button-1> 把整行都当展开/折叠
+        # 目标，单行放不下"点箭头=展开、点名字=勾选"两个动作。这里箭头和名称都是真控件，命中区明确。
         self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=200)
         self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
         folder_scroll = ttk.Scrollbar(group, orient="vertical", command=self.folder_canvas.yview)
         folder_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 6), pady=4)
+        self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
         self.folder_inner = tk.Frame(self.folder_canvas)
         self._folder_win = self.folder_canvas.create_window((0, 0), window=self.folder_inner, anchor="nw")
         self.folder_inner.bind("<Configure>", lambda _e: self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all")))
         self.folder_canvas.bind("<Configure>", lambda e: self.folder_canvas.itemconfigure(self._folder_win, width=e.width))
-        self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
-        self.folder_canvas.bind("<Enter>", lambda _e: self.folder_canvas.bind_all("<MouseWheel>", self._on_folder_wheel))
-        self.folder_canvas.bind("<Leave>", lambda _e: self.folder_canvas.unbind_all("<MouseWheel>"))
-
-        placeholder = tk.Label(self.folder_inner, text="连接成功后，这里会列出该邮箱的所有文件夹", foreground="gray")
-        placeholder.pack(anchor="w", padx=8, pady=8)
+        self.folder_canvas.bind("<MouseWheel>", self._on_folder_wheel)
+        self._insert_folder_placeholder()
 
     # --------------------------------------------------------------- run area
 
@@ -343,23 +366,139 @@ class BackupApp:
         self._update_start_state()
 
     def _rebuild_folders(self, names: list[tuple]) -> None:
-        if self._ever_loaded:
-            checked = {r["foldername"] for r in self.folder_rows if r["var"].get()}
-        else:
-            checked = {"INBOX"}
+        checked = ({r["foldername"] for r in self.folder_rows if r["var"].get()}
+                   if self.folder_rows else {"INBOX"})
+        open_keys = None
+        if self._folder_nodes:
+            open_keys = {key for key, node in self._folder_nodes.items() if node["open"]}
         for child in self.folder_inner.winfo_children():
             child.destroy()
-        self.folder_rows = []
-        ordered = sorted(names, key=lambda n: tuple(n[2].split("/")))
-        for foldername, filename, eml_relpath, display in ordered:
-            depth = eml_relpath.count("/")
-            var = tk.BooleanVar(value=foldername in checked)
-            var.trace_add("write", self._update_start_state)
-            cb = self._register(tk.Checkbutton(self.folder_inner, text="    " * depth + display, variable=var))
-            cb.pack(anchor="w", fill="x", padx=4)
-            self.folder_rows.append({"foldername": foldername, "filename": filename,
-                                     "eml_relpath": eml_relpath, "display": display, "var": var})
-        self._ever_loaded = True
+        self.folder_rows, self._folder_nodes, self._folder_clickables = [], {}, []
+
+        rows: list[dict] = []
+        for foldername, filename, eml_relpath, display in names:
+            path = tuple(eml_relpath.split("/"))
+            rows.append({"foldername": foldername, "filename": filename,
+                         "eml_relpath": eml_relpath, "display": display, "path": path,
+                         "label": last_folder_segment(display, path),
+                         "var": tk.BooleanVar(value=foldername in checked),
+                         "check_btn": None})
+        rows.sort(key=lambda r: r["path"])
+
+        real: dict[tuple, list[dict]] = {}
+        for row in rows:
+            real.setdefault(row["path"], []).append(row)
+
+        keys = sorted({row["path"][:i] for row in rows for i in range(1, len(row["path"]) + 1)},
+                      key=lambda k: (len(k), k))
+        with_kids = {k for k in keys if any(o != k and o[:len(k)] == k for o in keys)}
+        for key in keys:  # 父节点必然先于子节点建成
+            self._make_folder_node(key, real.get(key), with_kids, open_keys)
+
+        self.folder_rows.sort(key=lambda r: r["path"])
+        self._render_folder_checks()
+
+    def _make_folder_node(self, key: tuple[str, ...], rows: list[dict] | None,
+                          with_kids: set[tuple], open_keys: set[tuple] | None) -> None:
+        open_now = True if open_keys is None else key in open_keys
+        # rows 可能多于一条：两个不同文件夹名消毒后落到同一路径时共享一行，
+        # 但仍按 foldername 各自进备份清单（输出路径本就相同）。
+        node = {"key": key, "label": key[-1], "open": open_now,
+                "rows": rows or [], "arrow": None}
+        self._folder_nodes[key] = node
+        parent = self._folder_nodes.get(key[:-1])
+        host = parent["kids"] if parent is not None else self.folder_inner
+
+        frame = tk.Frame(host)
+        frame.pack(anchor="w", fill="x", pady=1)
+        node["frame"] = frame
+
+        row = tk.Frame(frame)
+        row.pack(anchor="w")
+        slot = tk.Frame(row)  # 固定宽度的箭头槽，让各级名称左边缘对齐
+        slot.pack(side="left")
+        slot.pack_propagate(False)
+        slot.configure(width=ARROW_SLOT_W)
+        if key in with_kids:
+            arrow = tk.Label(slot, text=ARROW_OPEN if open_now else ARROW_CLOSED, cursor="hand2")
+            arrow.pack(side="left")
+            arrow.bind("<Button-1>", lambda _e, _k=key: self._toggle_folder_open(_k))
+            node["arrow"] = arrow
+            self._folder_clickables.append((arrow, str(arrow.cget("foreground"))))
+
+        if rows:
+            btn = tk.Label(row, text=key[-1], cursor="hand2")
+            btn.pack(side="left")
+            btn.bind("<Button-1>", lambda _e, _k=key: self._on_folder_check(_k))
+            self._folder_clickables.append((btn, str(btn.cget("foreground"))))
+            for r in rows:
+                self.folder_rows.append(r)
+                r["check_btn"] = btn
+        else:
+            tk.Label(row, text=key[-1]).pack(side="left")
+
+        node["kids"] = tk.Frame(frame)
+        self._pack_kids(node)
+
+    def _pack_kids(self, node: dict) -> None:
+        """展开挂出子文件夹框、折叠收起；控件不销毁，勾选与展开状态都留在内存里。"""
+        if node["open"]:
+            node["kids"].pack(anchor="w", fill="x", padx=(ARROW_SLOT_W, 0))
+        else:
+            node["kids"].pack_forget()
+
+    def _insert_folder_placeholder(self) -> None:
+        tk.Label(self.folder_inner, text=FOLDER_PLACEHOLDER_TEXT,
+                 foreground="gray").pack(anchor="w", padx=8, pady=8)
+
+    def _descendant_rows(self, key: tuple[str, ...]) -> list[dict]:
+        """严格后代的行（不含该节点自己）；合成父节点没有可备份的文件夹。"""
+        return [r for k, node in self._folder_nodes.items()
+                if len(k) > len(key) and k[:len(key)] == key for r in node["rows"]]
+
+    def _folder_subtree(self, key: tuple[str, ...]) -> list[dict]:
+        """该节点自身及其全部后代的行。"""
+        node = self._folder_nodes.get(key)
+        own = node["rows"] if node is not None else []
+        return own + self._descendant_rows(key)
+
+    def _on_folder_check(self, key: tuple[str, ...]) -> None:
+        if self.running:
+            return  # 运行中配置区锁定；标签只能置灰，点击要靠这里挡住
+        subtree = self._folder_subtree(key)
+        turning_on = not any(r["var"].get() for r in subtree)
+        for r in subtree:
+            r["var"].set(turning_on)
+        # 有子文件夹的节点自身也是真实文件夹。勾它下面的文件夹时它本身一并进备份清单，
+        # 否则父级会一直停在 ⊟，看着像"没勾上"；取消时下面还有勾选就保留它，
+        # 这样父级符号只反映子文件夹：全勾 ☑、全不勾 ☐、混合 ⊟。
+        for i in range(1, len(key)):
+            anc = self._folder_nodes.get(key[:i])
+            if anc is None or not anc["rows"]:
+                continue
+            keep = any(r["var"].get() for r in self._descendant_rows(key[:i]))
+            for r in anc["rows"]:
+                r["var"].set(turning_on or keep)
+        self._render_folder_checks()
+        self._update_start_state()
+
+    def _toggle_folder_open(self, key: tuple[str, ...]) -> None:
+        if self.running:
+            return
+        node = self._folder_nodes[key]
+        node["open"] = not node["open"]
+        self._pack_kids(node)
+        node["arrow"].configure(text=ARROW_OPEN if node["open"] else ARROW_CLOSED)
+
+    def _render_folder_checks(self) -> None:
+        for node in self._folder_nodes.values():
+            if not node["rows"]:
+                continue
+            states = [r["var"].get() for r in self._folder_subtree(node["key"])]
+            glyph = CHECK_ON if all(states) else (CHECK_OFF if not any(states) else CHECK_PARTIAL)
+            text = f"{glyph} {node['label']}"
+            for r in node["rows"]:
+                r["check_btn"].configure(text=text)
 
     # ------------------------------------------------------- stale state rules
 
@@ -371,8 +510,20 @@ class BackupApp:
         self._apply_connect_state()
         self._update_start_state()
 
-    def _show_conn_hint(self, text: str) -> None:
-        self.conn_hint.configure(text=text)
+    def _show_conn_hint(self, text: str, color: str) -> None:
+        """显示提示并上色；空文案时整行让出空间，避免无提示时留一条空带。
+
+        用 winfo_manager 判断是否已挂出，不用 winfo_ismapped：后者反映显示端映射态，
+        比布局管理器滞后，刚 grid_remove 后仍报 True，会让该显示的提示被跳过。
+        """
+        if text:
+            self.conn_hint.configure(text=text, foreground=color)
+            if self.conn_hint.winfo_manager() == "":
+                self.conn_hint.grid()
+        else:
+            # 不可见时把文本清掉：标签只是不挂出，内容仍在，将来误挂出会闪出旧提示
+            self.conn_hint.configure(text="")
+            self.conn_hint.grid_remove()
 
     def _start_button_spinner(self) -> None:
         """连接中的按钮图标用盲文点阵转圈（U+2800 段，Windows 字体普遍有字形）。"""
@@ -397,14 +548,15 @@ class BackupApp:
             if self.running:
                 # 运行中配置区整体锁定，connect_btn 已被 _set_config_enabled(False) 禁用
                 self.connect_btn.configure(text=CONNECT_BTN_LABEL)
-                self._show_conn_hint(RUNNING_HINT_TEXT)
+                self._show_conn_hint(RUNNING_HINT_TEXT, HINT_GRAY)
             elif self.connect_state == "connected":
                 self.connect_btn.configure(text=CONNECTED_BTN_LABEL, state="disabled")
-                self._show_conn_hint("")
+                self._show_conn_hint("", HINT_GRAY)
             else:  # idle / stale — 同一控件，stale 额外加一行提示
                 # 必须恢复 normal：运行中 _set_config_enabled(False) 禁用的按钮在结束后要能重新点击
                 self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="normal")
-                self._show_conn_hint(STALE_HINT_TEXT if self.connect_state == "stale" else "")
+                stale = self.connect_state == "stale"
+                self._show_conn_hint(STALE_HINT_TEXT if stale else "", HINT_RED if stale else HINT_GRAY)
 
     # --------------------------------------------------------- misc handlers
 
@@ -428,10 +580,18 @@ class BackupApp:
     def _set_all_folders(self, value: bool) -> None:
         for row in self.folder_rows:
             row["var"].set(value)
+        if value:
+            for node in self._folder_nodes.values():
+                if not node["open"]:
+                    self._toggle_folder_open(node["key"])
+        self._render_folder_checks()
+        self._update_start_state()
 
     def _set_inbox_only(self) -> None:
         for row in self.folder_rows:
             row["var"].set(row["foldername"] == "INBOX")
+        self._render_folder_checks()
+        self._update_start_state()
 
     def _on_folder_wheel(self, event) -> None:
         self.folder_canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -457,6 +617,24 @@ class BackupApp:
                 widget.configure(state=default_state if enabled else "disabled")
             except tk.TclError:
                 pass
+        # 树里是 tk.Label：它有 -state 选项，但置灰和阻断绑定都不生效，
+        # 所以靠前景色 + 光标提示不可点，真正的拦截在两个 handler 的 running 判定里。
+        # 默认前景色是 Tk 的系统色名（如 SystemButtonText），"" 不是合法颜色名，须按控件记录还原。
+        for w, default_fg in self._folder_clickables:
+            w.configure(foreground=default_fg if enabled else "gray",
+                        cursor="hand2" if enabled else "arrow")
+
+    def _begin_run_ui(self) -> None:
+        """开始备份的界面侧（调用前 self.running 已置真）：锁配置区、亮出"先停止才能改"提示、切到列表。
+
+        必须调 _apply_connect_state：运行中那条提示只在连接状态机里输出，
+        只锁控件不刷状态机的话，用户会以为可以照改配置。
+        """
+        self._set_config_enabled(False)
+        self._apply_connect_state()
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.notebook.select(0)
 
     def _on_start(self) -> None:
         v = self._conn_values()
@@ -477,10 +655,7 @@ class BackupApp:
         self.progress.configure(maximum=1, value=0)
         self.count_var.set("正在统计…")
         self._set_status("正在连接…", error=False)
-        self._set_config_enabled(False)
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.notebook.select(0)
+        self._begin_run_ui()
         self.log.info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
                       len(selected), v["outdir"], v["mbox"], v["eml"])
         threading.Thread(target=self._backup_worker, args=(v, selected), daemon=True).start()
