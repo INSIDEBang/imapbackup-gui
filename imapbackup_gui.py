@@ -383,7 +383,6 @@ class BackupApp:
                          "label": last_folder_segment(display, path),
                          "var": tk.BooleanVar(value=foldername in checked),
                          "check_btn": None})
-        rows.sort(key=lambda r: r["path"])
 
         real: dict[tuple, list[dict]] = {}
         for row in rows:
@@ -495,7 +494,12 @@ class BackupApp:
             if not node["rows"]:
                 continue
             states = [r["var"].get() for r in self._folder_subtree(node["key"])]
-            glyph = CHECK_ON if all(states) else (CHECK_OFF if not any(states) else CHECK_PARTIAL)
+            if all(states):
+                glyph = CHECK_ON
+            elif any(states):
+                glyph = CHECK_PARTIAL
+            else:
+                glyph = CHECK_OFF
             text = f"{glyph} {node['label']}"
             for r in node["rows"]:
                 r["check_btn"].configure(text=text)
@@ -555,8 +559,10 @@ class BackupApp:
             else:  # idle / stale — 同一控件，stale 额外加一行提示
                 # 必须恢复 normal：运行中 _set_config_enabled(False) 禁用的按钮在结束后要能重新点击
                 self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="normal")
-                stale = self.connect_state == "stale"
-                self._show_conn_hint(STALE_HINT_TEXT if stale else "", HINT_RED if stale else HINT_GRAY)
+                if self.connect_state == "stale":
+                    self._show_conn_hint(STALE_HINT_TEXT, HINT_RED)
+                else:
+                    self._show_conn_hint("", HINT_GRAY)
 
     # --------------------------------------------------------- misc handlers
 
