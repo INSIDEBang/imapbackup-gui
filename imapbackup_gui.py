@@ -50,6 +50,8 @@ STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
 RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
 HINT_RED = "red"       # 需要用户操作：连接信息已过期，得重新连接
 HINT_GRAY = "gray"     # 备份运行中：配置锁定，先停下才能改
+ZEBRA_TAG = "zebra"    # 邮件列表偶数行（第 2、4… 行）的 tag；奇数行走 Treeview 默认白底
+ZEBRA_BG = "#f0f0f0"   # 不跟随系统深色模式，与运行日志 Text 的 #ffffff 同一取舍
 
 # 文件夹树的勾选态与箭头符号（字形可用性以本机截图为准，缺字时退用 □/■/▦ 与 [-]/[+]）
 CHECK_OFF = "☐"        # U+2610 未勾选
@@ -119,6 +121,7 @@ class BackupApp:
         self.server_total = 0
         self.pending_total = 0
         self.backed_count = 0
+        self._row_index = 0  # 邮件列表插入序号；清表归零，斑马纹按它的奇偶决定
 
         self._build_config_area()
         self._build_run_area()
@@ -195,6 +198,8 @@ class BackupApp:
         self.conn_hint.grid(row=5, column=0, columnspan=6, pady=(0, 8))
         self.conn_hint.grid_remove()
 
+        self._bind_enter(self.user_entry, self.server_entry, self.port_entry, self.password_entry)
+
         for var in (self.server_var, self.user_var, self.password_var):
             var.trace_add("write", self._check_stale)
 
@@ -205,7 +210,8 @@ class BackupApp:
 
         tk.Label(group, text="备份保存位置：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
         self.outdir_var = tk.StringVar(value=str(Path.home() / "邮箱备份"))
-        self._register(tk.Entry(group, textvariable=self.outdir_var)).grid(row=0, column=1, sticky="we", padx=4, pady=3)
+        self.outdir_entry = self._register(tk.Entry(group, textvariable=self.outdir_var))
+        self.outdir_entry.grid(row=0, column=1, sticky="we", padx=4, pady=3)
         self._register(tk.Button(group, text="浏览…", command=self._on_browse)).grid(row=0, column=2, sticky="w", padx=(0, 8))
 
         fmt_row = tk.Frame(group)
@@ -214,6 +220,8 @@ class BackupApp:
         self.eml_var = tk.BooleanVar(value=True)
         self._register(tk.Checkbutton(fmt_row, text="mbox 输出", variable=self.mbox_var, command=self._update_start_state)).pack(side="left")
         self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var, command=self._update_start_state)).pack(side="left", padx=(12, 0))
+
+        self._bind_enter(self.outdir_entry)
 
     def _build_folder_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="邮箱文件夹")
@@ -268,6 +276,7 @@ class BackupApp:
         self.tree.column("when", width=110, stretch=False)
         self.tree.column("folder", width=140, stretch=False)
         self.tree.column("size", width=90, anchor="e", stretch=False)
+        self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
         tree_scroll = ttk.Scrollbar(list_tab, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -326,6 +335,10 @@ class BackupApp:
                 "outdir": self.outdir_var.get().strip()}
 
     def _on_connect(self) -> None:
+        if str(self.connect_btn.cget("state")) != "normal":
+            # 连接中/已连接/备份运行时按钮被禁用，输入框在连接中并未禁用——
+            # 门控不挡住的话，连接中再按一次 Enter 会起第二条连接线程。
+            return
         v = self._conn_values()
         if v is None:
             return
@@ -578,6 +591,15 @@ class BackupApp:
     def _on_show_toggle(self) -> None:
         self.password_entry.configure(show="" if self.show_var.get() else "*")
 
+    def _bind_enter(self, *entries: tk.Entry) -> None:
+        """连接相关的输入框里 Enter = 点连接按钮；小键盘的 Enter 是独立事件名 KP_Enter。"""
+        for entry in entries:
+            for key in ("<Return>", "<KP_Enter>"):
+                entry.bind(key, self._on_return)
+
+    def _on_return(self, _event) -> None:
+        self._on_connect()
+
     def _on_browse(self) -> None:
         initial = self.outdir_var.get().strip() or str(Path.home())
         chosen = filedialog.askdirectory(parent=self.root, title="选择备份保存位置", initialdir=initial)
@@ -657,8 +679,7 @@ class BackupApp:
         self.running = True
         self.stop_flag.clear()
         self.server_total = self.pending_total = self.backed_count = 0
-        if children := self.tree.get_children():
-            self.tree.delete(*children)
+        self._clear_message_rows()
         self.progress.configure(maximum=1, value=0)
         self.count_var.set("正在统计…")
         self._set_status("正在连接…", error=False)
@@ -824,6 +845,12 @@ class BackupApp:
         self.count_var.set(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ 已备份 {self.backed_count} / {self.pending_total}")
         self.progress.configure(value=self.backed_count)
 
+    def _clear_message_rows(self) -> None:
+        """清掉上一轮的邮件行；序号归零，斑马纹从第 1 行重新起算。"""
+        if children := self.tree.get_children():
+            self.tree.delete(*children)
+        self._row_index = 0
+
     def _add_message_row(self, d: dict) -> None:
         dt: datetime = d["timestamp"]
         ts_fmt = "%m-%d %H:%M" if dt.year == datetime.now().year else "%Y-%m-%d %H:%M"
@@ -831,9 +858,12 @@ class BackupApp:
         name, addr = email.utils.parseaddr(sender_raw)
         sender = name or addr or "?"
         subject = core.decode_mime_words(d["subject"]) if d["subject"] else ""
+        # 行都是 append 到 "end"，插入顺序即显示顺序，按序号奇偶就是按视觉行号
+        self._row_index += 1
+        tags = (ZEBRA_TAG,) if self._row_index % 2 == 0 else ()
         iid = self.tree.insert("", "end", values=(sender, subject or "(no subject)",
                                                   dt.strftime(ts_fmt), d["folder"],
-                                                  core.pretty_byte_count(d["size"])))
+                                                  core.pretty_byte_count(d["size"])), tags=tags)
         self.tree.see(iid)
         self.backed_count += 1
         self._refresh_counts()
