@@ -60,7 +60,9 @@ CHECK_PARTIAL = "⊟"    # U+229F 部分勾选
 ARROW_OPEN = "▾"       # U+25BE 已展开
 ARROW_CLOSED = "▸"     # U+25B8 已折叠
 ARROW_SLOT_W = 16      # 箭头占位宽度，保证各级名称左边缘对齐
+EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
 FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
+LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
 
 
 class QueueLogHandler(logging.Handler):
@@ -247,7 +249,7 @@ class BackupApp:
         self.folder_inner.bind("<Configure>", lambda _e: self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all")))
         self.folder_canvas.bind("<Configure>", lambda e: self.folder_canvas.itemconfigure(self._folder_win, width=e.width))
         self.folder_canvas.bind("<MouseWheel>", self._on_folder_wheel)
-        self._insert_folder_placeholder()
+        self.folder_ph = self._empty_hint(group, FOLDER_PLACEHOLDER_TEXT, 1, 0)
 
     # --------------------------------------------------------------- run area
 
@@ -281,6 +283,7 @@ class BackupApp:
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.list_ph = self._empty_hint(list_tab, LIST_PLACEHOLDER_TEXT, 0, 0)
 
         log_tab = tk.Frame(self.notebook)
         self.notebook.add(log_tab, text="运行日志")
@@ -410,6 +413,8 @@ class BackupApp:
 
         self.folder_rows.sort(key=lambda r: r["path"])
         self._render_folder_checks()
+        # 重建会铺满树区，空态提示得跟着收掉；一个文件夹都没解析出来时重新挂回
+        self._toggle_hint(self.folder_ph, not self.folder_rows)
 
     def _make_folder_node(self, key: tuple[str, ...], rows: list[dict] | None,
                           with_kids: set[tuple], open_keys: set[tuple] | None) -> None:
@@ -460,9 +465,17 @@ class BackupApp:
         else:
             node["kids"].pack_forget()
 
-    def _insert_folder_placeholder(self) -> None:
-        tk.Label(self.folder_inner, text=FOLDER_PLACEHOLDER_TEXT,
-                 foreground="gray").pack(anchor="w", padx=8, pady=8)
+    def _empty_hint(self, parent: tk.Frame, text: str, row: int, column: int) -> tk.Label:
+        """空态提示：与内容控件占同一格居中叠放，内容出现后用 _toggle_hint 收掉。"""
+        label = tk.Label(parent, text=text, foreground=EMPTY_HINT_FG)
+        label.grid(row=row, column=column, padx=8, pady=6)
+        return label
+
+    def _toggle_hint(self, hint: tk.Label, show: bool) -> None:
+        hint.grid_remove()
+        if show:
+            hint.grid()
+            hint.tkraise()
 
     def _descendant_rows(self, key: tuple[str, ...]) -> list[dict]:
         """严格后代的行（不含该节点自己）；合成父节点没有可备份的文件夹。"""
@@ -846,10 +859,11 @@ class BackupApp:
         self.progress.configure(value=self.backed_count)
 
     def _clear_message_rows(self) -> None:
-        """清掉上一轮的邮件行；序号归零，斑马纹从第 1 行重新起算。"""
+        """清掉上一轮的邮件行；序号归零，斑马纹从第 1 行重新起算，空态提示重新挂出。"""
         if children := self.tree.get_children():
             self.tree.delete(*children)
         self._row_index = 0
+        self._toggle_hint(self.list_ph, True)
 
     def _add_message_row(self, d: dict) -> None:
         dt: datetime = d["timestamp"]
@@ -860,6 +874,8 @@ class BackupApp:
         subject = core.decode_mime_words(d["subject"]) if d["subject"] else ""
         # 行都是 append 到 "end"，插入顺序即显示顺序，按序号奇偶就是按视觉行号
         self._row_index += 1
+        if self._row_index == 1:
+            self._toggle_hint(self.list_ph, False)
         tags = (ZEBRA_TAG,) if self._row_index % 2 == 0 else ()
         iid = self.tree.insert("", "end", values=(sender, subject or "(no subject)",
                                                   dt.strftime(ts_fmt), d["folder"],
