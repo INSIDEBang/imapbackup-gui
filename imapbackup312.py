@@ -10,6 +10,7 @@ Modernized for Python 3.12:
 
 Fork additions:
  - optional per-message .eml output tree (--eml-dir)
+ - per-format incremental dedupe when both -d and --eml-dir are selected
  - per-message progress lines; structured report callback and cooperative
    stop hook consumed by the Tkinter GUI (imapbackup_gui.py)
 
@@ -45,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 class SkipFolderException(Exception):
@@ -391,10 +392,17 @@ def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
 def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, int],
                       overwrite: bool, nospinner: bool, thunderbird: bool,
                       basedir: Optional[Path], icloud: bool, quiet: bool, log: logging.Logger,
-                      eml_dir: Optional[Path] = None, foldername: str = "",
+                      eml_dir: Optional[Path] = None, skip_mbox: Optional[Set[str]] = None,
+                      skip_eml: Optional[Set[str]] = None, foldername: str = "",
                       verbose: int = 0, compact: bool = False,
                       report: Optional[Callable[[dict], None]] = None,
                       should_stop: Optional[Callable[[], bool]] = None) -> None:
+    """Download `messages` (Message-Id -> seq) once each, writing to whichever sinks are
+    selected. skip_mbox/skip_eml hold Message-Ids already present in that sink, so a
+    message missing from only one format is fetched once and written only to the sink
+    that lacks it. `messages` must not contain an id present in BOTH skip sets."""
+    if skip_mbox is None: skip_mbox = frozenset()
+    if skip_eml is None: skip_eml = frozenset()
     if basedir is not None:
         fullname = basedir / filename
         if overwrite and fullname.exists():
@@ -434,7 +442,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
             from_value = folded_header(head, "From")
             subject_value = folded_header(head, "Subject")
             size = 0
-            if mbox is not None:
+            if mbox is not None and msg_id not in skip_mbox:
                 buf = f"From nobody {time.ctime()}\n"
                 if UUID in msg_id: buf += f"Message-Id: {msg_id}\n"
                 mbox.write(buf.encode("utf-8"))
@@ -445,7 +453,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
                     text_bytes = from_re.sub(b"\n>\\1From ", text_bytes)
                 mbox.write(text_bytes + b"\n\n")
                 size = len(text_bytes)
-            if eml_dir is not None:
+            if eml_dir is not None and msg_id not in skip_eml:
                 payload = raw_bytes.strip() + b"\r\n"
                 if UUID in msg_id and b"message-id:" not in head.lower():
                     payload = f"Message-Id: {msg_id}\r\n".encode("utf-8") + payload
@@ -531,6 +539,18 @@ def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool
         spinner.stop()
     if not quiet: log.info("%s: %d messages", folder_dir, len(messages))
     return messages
+
+
+def pending_messages(remote: Dict[str, int], *scans: Optional[Dict[str, str]]) -> Dict[str, int]:
+    """Server messages that still need downloading, for the selected output formats.
+
+    Each entry in `scans` is one selected format's local scan result (scan_file /
+    scan_eml_dir); pass None for a format that is not selected so it cannot make
+    every message look pending. A message is pending iff at least one selected
+    format lacks it; download_messages' skip sets then gate per-sink writes.
+    """
+    selected = [scan for scan in scans if scan is not None]
+    return {mid: remote[mid] for mid in remote if any(mid not in scan for scan in selected)}
 
 
 def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: bool, log: logging.Logger, display: Optional[str] = None) -> Dict[str, int]:
@@ -786,20 +806,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not cfg.quiet: folder_separator(folder_idx, total_folders, display_name)
             try:
                 remote_msgs = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
-                local_msgs: Dict[str, str] = {}
+                # per-format incremental: pending iff any selected format lacks the message;
+                # download_messages then writes only the sinks that still lack it
+                local_mbox: Optional[Dict[str, str]] = None
                 if cfg.basedir is not None:
-                    mbox_name = f"{account}/{filename}"
-                    local_msgs.update(scan_file(mbox_name, cfg.overwrite, cfg.nospinner, cfg.basedir, quiet=cfg.quiet, log=log))
+                    local_mbox = scan_file(f"{account}/{filename}", cfg.overwrite, cfg.nospinner,
+                                           cfg.basedir, quiet=cfg.quiet, log=log)
+                local_eml: Optional[Dict[str, str]] = None
                 eml_folder_dir = None
                 if cfg.eml_dir is not None:
                     eml_folder_dir = cfg.eml_dir / account / eml_relpath
-                    local_msgs.update(scan_eml_dir(eml_folder_dir, cfg.overwrite, cfg.nospinner, quiet=cfg.quiet, log=log))
-                new_messages = {mid: remote_msgs[mid] for mid in remote_msgs if mid not in local_msgs}
+                    local_eml = scan_eml_dir(eml_folder_dir, cfg.overwrite, cfg.nospinner, quiet=cfg.quiet, log=log)
+                new_messages = pending_messages(remote_msgs, local_mbox, local_eml)
                 label = f"{account}/{filename}" if cfg.basedir is not None else f"{account}/{eml_relpath}"
                 download_messages(server, label, new_messages, cfg.overwrite, cfg.nospinner,
                                   cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
-                                  eml_dir=eml_folder_dir, foldername=display_name,
-                                  verbose=cfg.verbose, compact=cfg.compact)
+                                  eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
+                                  foldername=display_name, verbose=cfg.verbose, compact=cfg.compact)
             except SkipFolderException as e:
                 if not cfg.quiet: log.warning("%s", e); continue
         if not cfg.quiet: log.info("Disconnecting")

@@ -1,6 +1,6 @@
 # 0003 - 核心以结构化逐封回调与协作式停止对接 GUI
 
-Status: accepted
+Status: superseded（仅"增量判重取并集"一条被 0004 取代；本条的回调契约与协作式停止设计仍然有效）
 
 GUI 需要在"每备份完一封邮件"时拿到发件人、主题、时间、大小等元数据来填充邮件列表，并需要"停止"按钮能干净地中断下载循环。核心（`imapbackup312.py` 的 `download_messages`）因此改为：`report` 回调接收**结构化 dict**（`folder/index/total/timestamp/from/subject/size/msg_id`，头部值为未解码的原始值，由消费方自行 `decode_mime_words`）；新增 `should_stop` 回调形参，在逐封循环顶部检查，命中即写完当前封后干净跳出。CLI 的终端一行由 `format_message_line` 从同一组字段格式化，输出逐字节不变。
 
@@ -16,4 +16,4 @@ GUI 需要在"每备份完一封邮件"时拿到发件人、主题、时间、�
 - `report` 仅在 `quiet=False` 时触发（沿用既有门控）；GUI 必须传 `quiet=False` 且 `nospinner=True`。
 - 停止粒度为"每封之间"：当前封写完后才退出，不做半途而废的文件写入。
 - fork 核心 API 契约变更：未来任何核心消费方（如打包后的 CLI 变体）都按 dict 契约对接；CLI 终端行为经逐字节 parity 校验（`.scratch/tkinter-gui/cli_output_parity.py`）。
-- 增量判重取 mbox 与 eml 已扫描消息的**并集**：待备份数按"任一格式已存在即跳过"计算，GUI 的"跳过"计数与之一致。
+- ~~增量判重取 mbox 与 eml 已扫描消息的**并集**：待备份数按"任一格式已存在即跳过"计算，GUI 的"跳过"计数与之一致。~~ **已作废**：双格式下并集会漏掉另一格式（详见 0004）。

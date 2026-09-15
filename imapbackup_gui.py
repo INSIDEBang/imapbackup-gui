@@ -4,7 +4,8 @@
 Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
 .scratch/tkinter-gui/. Key contracts:
  - Reuses imapbackup312 module-level functions (connect_and_login, get_names,
-   scan_folder, scan_file, scan_eml_dir, download_messages); no core logic is copied.
+   scan_folder, scan_file, scan_eml_dir, pending_messages, download_messages);
+   no core logic is copied.
  - All IMAP work runs on a worker thread; UI updates flow through a queue polled
    by Tk's after() — widgets are never touched off the main thread.
  - Per-message rows come from the structured report dict; Stop uses the
@@ -700,15 +701,17 @@ class BackupApp:
                 except core.SkipFolderException as e:
                     self.log.warning("%s：跳过（%s）", display, e)
                     continue
-                local: dict[str, str] = {}
+                # 两种格式各自判重：任一已选格式缺这封就算待备份，写盘时只补缺的那一份。
+                local_mbox: dict[str, str] | None = None
                 if basedir is not None:
-                    local.update(core.scan_file(f"{account}/{filename}", False, True, basedir, quiet=False, log=log))
+                    local_mbox = core.scan_file(f"{account}/{filename}", False, True, basedir, quiet=False, log=log)
+                local_eml: dict[str, str] | None = None
                 if eml_root is not None:
-                    local.update(core.scan_eml_dir(eml_root / account / eml_relpath, False, True, quiet=False, log=log))
-                new = {mid: remote[mid] for mid in remote if mid not in local}
+                    local_eml = core.scan_eml_dir(eml_root / account / eml_relpath, False, True, quiet=False, log=log)
+                new = core.pending_messages(remote, local_mbox, local_eml)
                 server_total += len(remote)
                 pending_total += len(new)
-                plans.append((n, new))
+                plans.append((n, new, local_mbox, local_eml))
             eq.put(("totals", server_total, pending_total))
 
             # pass 2: download; folders were re-selectable because scan_folder moved the selection each time
@@ -716,7 +719,7 @@ class BackupApp:
                 if basedir is not None:
                     core.ensure_basedir(basedir)
                     core.create_folder_structure([p[0] for p in plans], basedir, account)
-                for n, new in plans:
+                for n, new, local_mbox, local_eml in plans:
                     if self.stop_flag.is_set():
                         break
                     foldername, filename, eml_relpath, display = n
@@ -731,7 +734,8 @@ class BackupApp:
                     eml_folder_dir = eml_root / account / eml_relpath if eml_root is not None else None
                     core.download_messages(server, label, new, False, True, False,
                                            basedir, False, quiet=False, log=log,
-                                           eml_dir=eml_folder_dir, foldername=display,
+                                           eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
+                                           foldername=display,
                                            report=report, should_stop=self.stop_flag.is_set)
             try:
                 server.logout()
