@@ -58,6 +58,14 @@ To view all options:
 python imapbackup312.py --help
 ```
 
+## Quick Start — GUI (Python 3.12+)
+
+```bash
+python imapbackup_gui.py
+```
+
+A single-window front-end for people who would rather not use a terminal: fill in the server, account and password, connect to load the account's folder tree (collapsible, with cascade-selectable checkboxes), pick a backup folder and the mbox/eml output, then start the backup and watch each message appear in the table with live server/pending/backed counts. Stop is cooperative (it finishes the current message), reruns are incremental, and the logs go to `%LOCALAPPDATA%\imapbackup-gui\log\` — one file per day, so an uninstaller can simply delete the folder. It runs the same backup code as the CLI above, so the two never drift apart. The interface text is Chinese.
+
 ## What Changed in 1.5.2 (Experimental Python 3.12 modernization)
 
 * Replaced legacy option parsing with `argparse` (adds `--help`, clearer errors).
@@ -75,20 +83,26 @@ python imapbackup312.py --help
 
 This fork adds capabilities on top of upstream, aimed at a future Windows GUI distribution. The CLI remains fully usable on its own.
 
-* **Per-message `.eml` output** (`--eml-dir DIR`): each message is written as an individual `.eml` file under `<eml-dir>/<account>/<folder>/<yyyy-MM>/`, nested by IMAP folder hierarchy and grouped into `yyyy-MM` subfolders by received time (INTERNALDATE, falling back to the `Date:` header). Filenames are `<subject>_<Message-Id>_yyyyMMdd.eml` (Windows-safe sanitization; exact duplicates get a `（n）` suffix). Given only `--eml-dir`, no mbox files are written; incremental behavior is unchanged — existing messages are recognized by reading the `Message-Id` header inside each file.
-* **Per-message progress lines**: after each message is saved, a one-line summary is printed next to the existing spinner, e.g. `[INBOX 12/345] 2024-05-12 10:15 | Alice <a@b.com> | Re: budget (12.3 KB)`. Add `-v` to include the Message-Id, `--quiet` to silence. Output still prints when redirected to a file.
-* **Read-only hardening**: the synthetic-ID fallback fetch now uses `BODY.PEEK`, so messages are never flagged as seen on strict servers.
-* Planned: a Tkinter GUI and a Windows installer (PyInstaller + Inno Setup shipping `imapbackup-gui.exe` and `imapbackup.exe`).
-
 ## What Changed in 1.6.0 (fork)
 
-* Added `--eml-dir` for per-message `.eml` output (see Fork Notes above).
-* Added per-message progress lines with RFC 2047-decoded senders and subjects.
+**Output formats and incremental scanning**
+
+* Added `--eml-dir` for per-message `.eml` output (directory layout and file naming in ADR 0001).
 * Backups now live under `<backup-root>/<account>/…` for both output formats — see the one-time migration notes below.
 * IMAP modified UTF-7 folder names are decoded (e.g. `&UXZO1mWHTvZZOQ-` → `其他文件夹`) for display, mbox filenames, eml directories, and `--folders` matching.
-* Per-message progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
+
+**Terminal output**
+
+* Added per-message progress lines with RFC 2047-decoded senders and subjects.
+* The progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
 * Each folder's sync starts with a full-width separator (e.g. `── [3/8] Sent Messages ──`) so it is easy to see where one folder ends and the next begins.
 * Log level names are spelled out (`INFO` instead of `I`).
+
+**GUI entry point and the core seams it relies on**
+
+* Added `imapbackup_gui.py`, the Tkinter GUI entry point (see Quick Start — GUI above).
+* The per-message `report` callback seam now passes a structured dict (folder, index, total, timestamp, From, Subject, size, Message-Id) instead of a preformatted line; the refactor itself leaves terminal output byte-identical (ADR 0003).
+* `download_messages` gained an optional `should_stop` callback for cooperative cancellation between messages.
 * Synthetic-ID fallback header fetch now uses `BODY.PEEK` (read-only invariant).
 * Console-stream guards so a future `--windowed` build cannot crash on missing stdin/stdout.
 
@@ -97,8 +111,8 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 Incremental scanning reads the `Message-Id` header inside each message (not the path), so moving existing backups into the account directory is seamless — nothing gets re-downloaded. Modified UTF-7 folder names decode to real names now (e.g. `&UXZO1mWHTvZZOQ-` was 其他文件夹), so the old garbled directories can simply be deleted if empty:
 
 ```powershell
-New-Item "D:\data\Downloads\mail_backup\3273910043@qq.com" -ItemType Directory
-Move-Item "D:\data\Downloads\mail_backup\INBOX", "D:\data\Downloads\mail_backup\Sent Messages" "D:\data\Downloads\mail_backup\3273910043@qq.com\"
+New-Item "D:\data\Downloads\mail_backup\your.name@example.com" -ItemType Directory
+Move-Item "D:\data\Downloads\mail_backup\INBOX", "D:\data\Downloads\mail_backup\Sent Messages" "D:\data\Downloads\mail_backup\your.name@example.com\"
 Remove-Item "D:\data\Downloads\mail_backup\&UXZO1mWHTvZZOQ-"
 ```
 
@@ -117,7 +131,9 @@ Remove-Item "D:\data\Downloads\mail_backup\&UXZO1mWHTvZZOQ-"
 
 ## Versioning
 
-The version number is embedded in `imapbackup312.py` (`__version__`). Tagging or packaging (e.g. as a `pipx` tool) is a possible future enhancement.
+The version number lives in `imapbackup312.py` (`__version__`) and is duplicated verbatim in `imapbackup_gui.py`: the CLI and the GUI are one project and carry one version — currently 1.6.0. Optimizations stay on 1.6.x; swapping the GUI framework would move the project to 1.7.0 or 2.0.0. `imapbackup.py` and `imapbackup38.py` are frozen/transitional and still report `1.4h`, outside this numbering. Bump the two literals together, and only when intended — never as a side effect of a feature commit.
+
+Tagging and packaging (a `pipx` tool for the CLI, a Windows installer for the GUI) are possible future enhancements.
 
 ## Contributing
 
