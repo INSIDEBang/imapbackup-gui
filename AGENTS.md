@@ -40,7 +40,7 @@ python imapbackup312.py --server imap.example.com:993 --ssl --user x@y.com \
 ## 其他
 
 - `README.md` 是上游英文文档；fork 层面的功能改动需注意同步或注明 fork 特性。
-- 版本号嵌在 `imapbackup312.py` 的 `__version__`。
+- 版本号全项目统一：`imapbackup312.py` 与 `imapbackup_gui.py` 的 `__version__` 保持相同字面量（当前 1.6.0；后续优化走 1.6.x，换 GUI 框架才跳 1.7.0/2.0.0）。**任何版本改动必须经用户明确批准，代理不得擅自修改。**
 - MIT 许可证，贡献者名单在各脚本头部注释中，新文件保持同样的头部风格。
 
 ## Agent skills

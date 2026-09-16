@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""邮箱备份工具 — Tkinter GUI front-end for imapbackup312 (fork addition)
+"""IMAP Backup GUI — Tkinter GUI front-end for imapbackup312 (fork addition)
 
 Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
 .scratch/tkinter-gui/. Key contracts:
@@ -20,7 +20,7 @@ contributors listed in imapbackup312.py.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "1.6.0"  # 与 imapbackup312.__version__ 同一个号（项目统一版本，冒烟 version.sync 守卫）
 __author__ = "Chen Chong"
 __copyright__ = "(C) 2026 Chen Chong. Code under MIT License."
 
@@ -35,6 +35,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
 
 import imapbackup312 as core
 
@@ -63,6 +64,11 @@ ARROW_SLOT_W = 16      # 箭头占位宽度，保证各级名称左边缘对齐
 EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
 FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
 LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
+ELLIPSIS = "…"                    # 截断省略号，与「正在连接…」同一字符
+PROGRESS_MIN_WIDTH = 80           # 进度条地板宽度(px)：计数文字变长先压进度条，触底才开始截断文字
+TIP_DELAY_MS = 400                # 悬停多久后弹气泡
+TIP_BG = "#ffffe0"                # 气泡底色（经典 tooltip 浅黄）
+TIP_WRAP = 600                    # 气泡内容最长宽度(px)，超出自动换行
 
 
 class QueueLogHandler(logging.Handler):
@@ -85,6 +91,31 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def _ellipsize(full: str, budget: int, font: tkfont.Font) -> str:
+    """按像素预算截断：放得下返回原文；放不下二分最长前缀，使「前缀+…」刚好 ≤ budget。
+
+    始终从 full 重算，调用方在行宽变大后重调即可自动恢复全文（双向动态）。
+    """
+    if font.measure(full) <= budget:
+        return full
+    lo, hi = 0, len(full)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.measure(full[:mid] + ELLIPSIS) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return full[:lo] + ELLIPSIS
+
+
+def _italic_font(base: tkfont.Font) -> tkfont.Font:
+    """同一字体的斜体版：Tk 没有字体克隆 API，按 family/size 重建，其余属性走默认。
+
+    size 取绝对值——系统默认字号可能是负数（DPI 无关），Font 构造要正数。
+    """
+    return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), slant="italic")
+
+
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
     """最后一段显示名。eml_relpath 的段数等于真实层级深度，用它反查真实分隔符。
 
@@ -101,7 +132,7 @@ class BackupApp:
 
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("邮箱备份工具")
+        self.root.title("IMAP Backup GUI")
         self.root.geometry("960x736")
         self.root.minsize(800, 620)
 
@@ -124,6 +155,11 @@ class BackupApp:
         self.pending_total = 0
         self.backed_count = 0
         self._row_index = 0  # 邮件列表插入序号；清表归零，斑马纹按它的奇偶决定
+        self._status_full = ""              # 状态行全文；status_var 里可能是它的截断形
+        self._count_full = "尚未开始备份"    # 计数行全文；count_var 同理
+        self._fit_font: tkfont.Font | None = None  # 量字宽的缓存，两行标签同一默认字体
+        self._tip: tk.Toplevel | None = None
+        self._tip_after: str | None = None  # 待发的气泡 after id，leave 时取消
 
         self._build_config_area()
         self._build_run_area()
@@ -257,8 +293,12 @@ class BackupApp:
         run = tk.Frame(self.root)
         run.pack(fill="both", expand=True, padx=8, pady=(2, 8))
 
-        # status bar packs first (side=bottom) so the Notebook's expand can never clip it
-        bar = tk.Frame(run)
+        # 两行状态条都先于 Notebook 以 side=bottom 打包，Notebook 的 expand 才不会挤掉它们。
+        # msg_bar 先打包所以落在最底。初始只显示一行（未开始备份时没有进度与状态可显示），
+        # 首次开始备份时 _ensure_status_rows 放出进度条与第二行，之后不再收回。
+        self._msg_bar = msg_bar = tk.Frame(run)
+        msg_bar.pack(side="bottom", fill="x", pady=(4, 0))
+        self._bar = bar = tk.Frame(run)
         bar.pack(side="bottom", fill="x", pady=(6, 0))
         self.notebook = ttk.Notebook(run)
         self.notebook.pack(fill="both", expand=True)
@@ -298,17 +338,36 @@ class BackupApp:
         log_scroll.grid(row=1, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        self.count_var = tk.StringVar(value="尚未开始备份")
-        tk.Label(bar, textvariable=self.count_var, anchor="w").pack(side="left")
-        self.status_var = tk.StringVar(value="")
-        self.status_label = tk.Label(bar, textvariable=self.status_var, anchor="w")
-        self.status_label.pack(side="left", padx=(16, 8), fill="x", expand=True)
-        self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)
-        self.progress.pack(side="left", padx=(0, 8))
-        self.start_btn = tk.Button(bar, text="开始备份", width=10, command=self._on_start)
-        self.start_btn.pack(side="left")
+        # 按钮 side=right 钉在右端：进度条隐藏时它们也在右边，放出后位置纹丝不动
+        self.count_var = tk.StringVar(value=self._count_full)
+        self.count_label = tk.Label(bar, textvariable=self.count_var, anchor="w")
+        self.count_label.pack(side="left")
         self.stop_btn = tk.Button(bar, text="停止", width=6, state="disabled", command=self._on_stop)
-        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.stop_btn.pack(side="right")
+        self.start_btn = tk.Button(bar, text="开始备份", width=10, command=self._on_start)
+        self.start_btn.pack(side="right", padx=(0, 6))
+        # 进度条是这一行唯一可伸缩的控件：文字变长它先缩水，触及地板宽度后文字才截断
+        self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)
+        self.progress.pack(side="left", fill="x", expand=True, padx=(16, 8))
+
+        # 版本号先打包占住右端一条：pack 从不动先打包的自然宽度控件，状态文本只能自己截断
+        # 斜体 + 灰字，跟正文区分开但不抢注意力
+        self.status_var = tk.StringVar(value="")
+        self.version_label = tk.Label(msg_bar, text=f"v{__version__}", foreground=EMPTY_HINT_FG,
+                                      font=_italic_font(tkfont.nametofont("TkDefaultFont")))
+        self.version_label.pack(side="right")
+        self.status_label = tk.Label(msg_bar, textvariable=self.status_var, anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
+
+        # 计数标签不 expand、宽度不跟窗口走，<Configure> 得绑行容器；状态标签 expand，绑它自身
+        bar.bind("<Configure>", lambda _e: self._fit_counts())
+        self.status_label.bind("<Configure>", lambda _e: self._fit_status())
+        self._bind_tip(self.count_label, self.count_var, lambda: self._count_full)
+        self._bind_tip(self.status_label, self.status_var, lambda: self._status_full)
+
+        # 初始单行：进度条与第二行在首次开始备份时才出现
+        self.progress.pack_forget()
+        msg_bar.pack_forget()
 
     # ------------------------------------------------------- connect handlers
 
@@ -666,12 +725,26 @@ class BackupApp:
             w.configure(foreground=default_fg if enabled else "gray",
                         cursor="hand2" if enabled else "arrow")
 
+    def _ensure_status_rows(self) -> None:
+        """首次开始备份时放出进度条和第二行状态条；放出后不再收回。
+
+        结束/停止后保持两行：完成与停止消息需要第二行显示。before= 保持
+        msg_bar 居最底、进度条排在计数与按钮之间，与初始打包顺序一致。
+        """
+        if self._msg_bar.winfo_manager():
+            return
+        self.progress.pack(side="left", fill="x", expand=True, padx=(16, 8), before=self.start_btn)
+        self._msg_bar.pack(side="bottom", fill="x", pady=(4, 0), before=self._bar)
+        self._fit_counts()
+        self._fit_status()
+
     def _begin_run_ui(self) -> None:
         """开始备份的界面侧（调用前 self.running 已置真）：锁配置区、亮出"先停止才能改"提示、切到列表。
 
         必须调 _apply_connect_state：运行中那条提示只在连接状态机里输出，
         只锁控件不刷状态机的话，用户会以为可以照改配置。
         """
+        self._ensure_status_rows()
         self._set_config_enabled(False)
         self._apply_connect_state()
         self.start_btn.configure(state="disabled")
@@ -694,7 +767,7 @@ class BackupApp:
         self.server_total = self.pending_total = self.backed_count = 0
         self._clear_message_rows()
         self.progress.configure(maximum=1, value=0)
-        self.count_var.set("正在统计…")
+        self._set_counts("正在统计…")
         self._set_status("正在连接…", error=False)
         self._begin_run_ui()
         self.log.info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
@@ -851,11 +924,106 @@ class BackupApp:
         self._update_start_state()
 
     def _set_status(self, text: str, error: bool) -> None:
-        self.status_var.set(text)
+        self._status_full = text
         self.status_label.configure(foreground="red" if error else "black")
+        self._fit_status()
+
+    def _set_counts(self, text: str) -> None:
+        self._count_full = text
+        self._fit_counts()
+
+    def _fit_counts(self) -> None:
+        """计数文案与进度条的退让：文字变长先缩进度条，触底 PROGRESS_MIN_WIDTH 后文字才截断。
+
+        不能靠 pack 的亏空裁剪让进度条变小——控件总请求超过行宽时 expand 控件收缩、
+        后打包的按钮会叠进它的残 parcel 里（实测叠影）。所以进度条用 length 主动改请求，
+        保证整行请求宽度始终 ≤ 行宽：pack 无亏空，按钮永不受损。
+        """
+        width = self._bar.winfo_width()
+        if width < 20:  # 未映射时宽度是 1，等真实 <Configure> 再算
+            self.count_var.set(self._count_full)
+            return
+        fixed = self.start_btn.winfo_reqwidth() + self.stop_btn.winfo_reqwidth() + 30  # 进度条 padx 24 + 按钮间距 6
+        # 先放全文拿标签的真实请求宽（font.measure 与 reqwidth 差一个固定边距，估算不可靠）
+        self.count_var.set(self._count_full)
+        natural = self.count_label.winfo_reqwidth()
+        spare = width - fixed - natural  # 全文显示时进度条能分到的宽度
+        if spare >= 220:
+            self.progress.configure(length=220)
+        elif spare >= PROGRESS_MIN_WIDTH:
+            self.progress.configure(length=max(spare, 1))  # 缩水阶段：文字照旧全文
+        else:
+            self.progress.configure(length=PROGRESS_MIN_WIDTH)  # 触底：文字开始截断
+            self._shrink_to_fit(self.count_label, self.count_var, self._count_full,
+                                width - fixed - PROGRESS_MIN_WIDTH)
+        self._hide_tip()
+
+    def _fit_status(self) -> None:
+        """状态文案按标签实得宽度动态截断；行变宽后从全文重算，省略号自动消失。"""
+        width = self.status_label.winfo_width()
+        if width < 20:
+            self.status_var.set(self._status_full)
+            return
+        self.status_var.set(self._status_full)  # 先放全文拿真实请求宽；同一回调内改回，不上屏
+        if self.status_label.winfo_reqwidth() > width:
+            self._shrink_to_fit(self.status_label, self.status_var, self._status_full, width)
+        self._hide_tip()
+
+    def _shrink_to_fit(self, label: tk.Label, var: tk.StringVar, full: str, budget: int) -> None:
+        """把 full 截到标签请求宽 ≤ budget（像素）。font.measure 与标签请求宽差一个固定
+        边距（本机约 6px），先留 8px 余量砍一刀，再按真实请求宽补一刀收口。"""
+        font = self._text_font()
+        var.set(_ellipsize(full, budget - 8, font))
+        over = label.winfo_reqwidth() - budget
+        if over > 0:
+            var.set(_ellipsize(full, budget - 8 - over, font))
+
+    def _text_font(self) -> tkfont.Font:
+        """两行标签同为默认字体，缓存一份用来量像素宽。"""
+        if self._fit_font is None:
+            self._fit_font = tkfont.nametofont(str(self.status_label.cget("font")) or "TkDefaultFont")
+        return self._fit_font
+
+    # ------------------------------------------------------------- tooltip
+
+    def _bind_tip(self, label: tk.Label, var: tk.StringVar, get_full) -> None:
+        label.bind("<Enter>", lambda e: self._on_tip_enter(e, var, get_full))
+        label.bind("<Leave>", lambda _e: self._on_tip_leave())
+
+    def _on_tip_enter(self, event, var: tk.StringVar, get_full) -> None:
+        """只在文本被截断时调度气泡：全文本就完整显示，悬停不弹。"""
+        if var.get() == get_full():
+            return
+        x, y = event.x_root, event.y_root
+        self._tip_after = self.root.after(TIP_DELAY_MS, lambda: self._show_tip(x, y, get_full()))
+
+    def _on_tip_leave(self) -> None:
+        if self._tip_after is not None:
+            self.root.after_cancel(self._tip_after)
+            self._tip_after = None
+        self._hide_tip()
+
+    def _show_tip(self, x: int, y: int, text: str) -> None:
+        """无边框气泡显示被截断的全文；x 贴屏幕右缘收拢，避免超出屏幕。"""
+        self._tip_after = None
+        self._hide_tip()
+        tip = tk.Toplevel(self.root)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=text, background=TIP_BG, relief="solid", borderwidth=1,
+                 padx=6, pady=3, justify="left", wraplength=TIP_WRAP).pack()
+        tip.update_idletasks()
+        x = min(x + 8, tip.winfo_screenwidth() - tip.winfo_reqwidth() - 8)
+        tip.wm_geometry(f"+{max(x, 0)}+{y + 14}")
+        self._tip = tip
+
+    def _hide_tip(self) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
     def _refresh_counts(self) -> None:
-        self.count_var.set(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ 已备份 {self.backed_count} / {self.pending_total}")
+        self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ 已备份 {self.backed_count} / {self.pending_total}")
         self.progress.configure(value=self.backed_count)
 
     def _clear_message_rows(self) -> None:

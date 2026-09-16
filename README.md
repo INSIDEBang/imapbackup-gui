@@ -81,13 +81,11 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 * **Tkinter GUI** (`imapbackup_gui.py`): single-window front-end for non-technical users — connect and load the account's folder tree as a collapsible tree with cascading checkboxes (folders show only their last path segment, no typing folder names), pick mbox/eml output (both can be written from one fetch) into one backup root, and watch each backed-up message appear live in a table with a progress bar and server/pending/backed counts. Stop is cooperative (finishes the current message), reruns are incremental, and logs go to `%LOCALAPPDATA%\imapbackup-gui\log\`. See ADR 0003 for the core callback contract.
 * Planned: a Windows installer (PyInstaller + Inno Setup shipping `imapbackup-gui.exe` and `imapbackup.exe`).
 
-## What Changed in 1.7.0 (fork)
+## What Changed in 1.6.0 (fork)
 
 * Added `imapbackup_gui.py`, the Tkinter GUI entry point (see Fork Notes above).
-* The per-message `report` callback seam now passes a structured dict (folder, index, total, timestamp, From, Subject, size, Message-Id) instead of a preformatted line; terminal output is byte-identical to 1.6.0 (ADR 0003).
+* The per-message `report` callback seam now passes a structured dict (folder, index, total, timestamp, From, Subject, size, Message-Id) instead of a preformatted line; the refactor itself leaves terminal output byte-identical (ADR 0003).
 * `download_messages` gained an optional `should_stop` callback for cooperative cancellation between messages.
-
-## What Changed in 1.6.0 (fork)
 
 * Added `--eml-dir` for per-message `.eml` output (see Fork Notes above).
 * Added per-message progress lines with RFC 2047-decoded senders and subjects.

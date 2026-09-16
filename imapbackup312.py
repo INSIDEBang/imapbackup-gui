@@ -20,7 +20,7 @@ Mark Feit, Marco Machicao, and Rui Carmo.
 """
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.6.0"
 __author__ = "Rui Carmo (http://taoofmac.com)"
 __copyright__ = "(C) 2006-2025 Rui Carmo. Code under MIT License.(C)"
 __contributors__ = "jwagnerhki, Bob Ippolito, Michael Leonhard, Giuseppe Scrivano <gscrivano@gnu.org>, Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett, Mark Feit, Marco Machicao"
