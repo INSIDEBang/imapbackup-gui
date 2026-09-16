@@ -33,6 +33,7 @@ python imapbackup_gui.py        # GUI，没有命令行参数
 - `.scratch/tkinter-gui/gui_headless_smoke.py` — GUI 无头冒烟（拉起真窗口 + 喂合成事件，140+ 项断言），改 GUI 必跑
 - `.scratch/tkinter-gui/cli_output_parity.py` — CLI 终端输出与基线逐字节一致（`PARITY OK`），改核心必跑
 - `.scratch/tkinter-gui/per_format_incremental_test.py` — 按格式判重回归（30 个场景全过）
+- `.scratch/cli-folder-listing/folder_listing_probe.py` — 用 fake IMAP 服务器跑完整 `main()`，验文件夹列表与 `--folders`/`--exclude-folders` 匹配语义（26 项断言），改文件夹选择或输出排序必跑
 - 视觉确认用 `.scratch/tkinter-gui/*_probe.py`（真窗口 + GDI 截图，不起网）
 - `.scratch/tkinter-gui/real_gui_e2e.py` 需要真实 IMAP 账号，**默认不跑**（QQ 限流激进）
 - 其余：手动跑 `--help` 和小范围 `--folders` 备份
@@ -45,7 +46,7 @@ python imapbackup_gui.py        # GUI，没有命令行参数
 
 - **增量备份按输出格式独立判重**（ADR 0004）：任一**已选**格式缺这封就算待备份，写盘时只写还缺它的那个格式，每封只 fetch 一次。缺 `Message-Id` 的消息用固定 UUID salt（`UUID` 常量）生成合成 ID — 改动 `UUID` 或 `MSGID_RE` 会破坏既有备份的增量行为
 - 只做只读 IMAP 操作（read-only `SELECT` / `BODY.PEEK`），包括缺 `Message-Id` 时的兜底 header 抓取
-- `--folders` 与 `--exclude-folders` 互斥
+- `--folders` 与 `--exclude-folders` 互斥；按**分隔符段边界**匹配（精确全名或段前缀，`系统文件夹` 选中整棵子树，`INBOX` 不误中 `INBOX/archive`），中文显示名直接可用。include 0 匹配**报错并非 0 退出**并附可用文件夹列表，exclude 0 匹配只警告不退出
 - CLI 的 Spinner 在 stdout 非 TTY 或 quiet 模式自动禁用；GUI 同理——通过 `report` 回调（结构化 dict）拿进度、`should_stop` 回调协作停止，**不要向 stdout 写进度**
 - GUI 线程模型：工作线程跑 连接→枚举→扫描→下载→logout，`queue` 回投，UI 用 `after(100ms)` 轮询；**工作线程绝不碰 widget**
 - `main(argv)` 返回 int；密码支持 `@/path/to/file` 语法；312 版已移除内置压缩（mbox 事后自行压缩）

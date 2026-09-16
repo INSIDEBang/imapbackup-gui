@@ -39,13 +39,13 @@ python imapbackup312.py \
   --user your.name@example.com \
   --pass @/path/to/secret.txt \
   --mbox-dir ./mail_backup \
-  --folders INBOX,Sent,Archive \
+  --folders INBOX,Archive \
   --quiet
 ```
 
 Key options (3.12 script):
 
-* `--folders` and `--exclude-folders` are mutually exclusive.
+* `--folders` and `--exclude-folders` are mutually exclusive. Each takes a comma-separated list of folder display names, matched either exactly or as a path prefix, so `Archive` also covers every folder nested under it (`INBOX` does not catch `INBOX/archive`). Chinese names as printed after connecting work as-is; a value that matches nothing exits with the account's folder list instead of backing up an empty selection.
 * `--icloud` forces BODY.PEEK fetches (works around certain providers that otherwise re-flag messages).
 * `--thunderbird` creates Thunderbird-style directory layout (.sbd folders instead of dotted names).
 * `--eml-dir DIR` additionally writes each message as an individual `.eml` file (see Fork Notes below); combine with `--mbox-dir` to write both formats from a single fetch.
@@ -89,10 +89,12 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 
 * Added `--eml-dir` for per-message `.eml` output (directory layout and file naming in ADR 0001).
 * Backups now live under `<backup-root>/<account>/…` for both output formats — see the one-time migration notes below.
-* IMAP modified UTF-7 folder names are decoded (e.g. `&UXZO1mWHTvZZOQ-` → `其他文件夹`) for display, mbox filenames, eml directories, and `--folders` matching.
+* IMAP modified UTF-7 folder names are decoded (e.g. `&UXZO1mWHTvZZOQ-` → `其他文件夹`) for display, mbox filenames, eml directories, and `--folders` / `--exclude-folders` matching.
+* `--folders` and `--exclude-folders` match on a delimiter-aware segment boundary, so `系统文件夹` selects that folder and its whole subtree while `Archived` is not caught by the prefix `Archive`. Previously only an exact full path matched, which made a Chinese leaf name silently select nothing; a selection that still matches nothing now exits non-zero and prints the folder list.
 
 **Terminal output**
 
+* Right after connecting, the account's folders are listed as a bulleted list — one `- ` per line, parents before the folders nested under them — and the backup then runs in that same order, so the names can be read off the list and quoted in `--folders`. `--quiet` suppresses the listing.
 * Added per-message progress lines with RFC 2047-decoded senders and subjects.
 * The progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
 * Each folder's sync starts with a full-width separator (e.g. `── [3/8] Sent Messages ──`) so it is easy to see where one folder ends and the next begins.

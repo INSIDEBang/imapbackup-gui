@@ -166,6 +166,7 @@ IMAP_MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
                "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
 BAR_FILL = "█"
 BAR_EMPTY = "░"
+FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate per char
 
 
 def string_from_file(value: str) -> str:
@@ -625,6 +626,45 @@ def folder_to_eml_relpath(foldername: str, delim: str) -> str:
     return "/".join(sanitize_segment(s, EML_SEGMENT_MAX) for s in foldername.split(delim))
 
 
+def split_folder_display(display_name: str) -> Tuple[str, ...]:
+    """Hierarchy segments of a decoded folder name.
+
+    The delimiter is the server's choice, not the client's (QQ uses "/", Outlook
+    "."), so pick the first one actually present; a name with none is one segment.
+    """
+    delim = next((d for d in FOLDER_DELIMS if d in display_name), None)
+    return tuple(display_name.split(delim)) if delim else (display_name,)
+
+
+def split_folder_patterns(value: Optional[str]) -> List[str]:
+    """Comma-separated --folders/--exclude-folders value as trimmed patterns; empty items dropped."""
+    if not value:
+        return []
+    return [p.strip().rstrip(FOLDER_DELIMS) for p in value.split(",") if p.strip()]
+
+
+def folder_matches(display_name: str, raw_name: str, pattern: str) -> bool:
+    """One --folders/--exclude-folders pattern against one folder.
+
+    An exact decoded or raw IMAP name, or a proper segment prefix of the decoded
+    name: "Archive" takes Archive plus everything nested under it, while "INBOX"
+    misses INBOX/archive because the comparison stops at delimiter boundaries.
+    """
+    if pattern in (display_name, raw_name):
+        return True
+    pattern_segs = split_folder_display(pattern)
+    folder_segs = split_folder_display(display_name)
+    return len(pattern_segs) < len(folder_segs) and folder_segs[:len(pattern_segs)] == pattern_segs
+
+
+def folder_listing(names: List[Tuple[str, str, str, str]]) -> str:
+    """Every folder as one markdown-style bullet per line, names sorted parents-first.
+
+    Input must already be sorted so a parent precedes the folders nested under it.
+    """
+    return "\n".join(f"- {n[3]}" for n in names)
+
+
 def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> List[Tuple[str, str, str, str]]:
     spinner = Spinner("Finding Folders", nospinner, quiet=quiet)
     typ, data = server.list()
@@ -632,7 +672,7 @@ def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: 
         log.error("LIST failed: %s", data)
         raise RuntimeError(f"LIST failed: {data}")
     spinner.spin()
-    names: List[Tuple[str, str, str, str]] = []
+    entries: List[Tuple[Tuple[str, ...], Tuple[str, str, str, str]]] = []
     for raw in data:
         row_str = str(raw, 'utf-8', 'replace')
         try:
@@ -646,9 +686,14 @@ def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: 
             if filename.startswith("INBOX"): filename = filename.replace("INBOX", "Inbox")
         else:
             filename = '.'.join(display_name.split(delim)) + '.mbox'
-        names.append((foldername, filename, folder_to_eml_relpath(display_name, delim), display_name))
+        # key by segments so a parent always precedes its descendants
+        entries.append((tuple(display_name.split(delim)),
+                        (foldername, filename, folder_to_eml_relpath(display_name, delim), display_name)))
     spinner.stop()
-    if not quiet: log.info("Found %d folders", len(names))
+    names = [entry for _, entry in sorted(entries, key=lambda e: e[0])]
+    if not quiet:
+        listing = folder_listing(names)
+        log.info("Found %d folders:%s", len(names), "" if not listing else "\n" + listing)
     return names
 
 
@@ -662,8 +707,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add('--eml-dir', help='enable per-message .eml output under this directory')
     add('-a','--append-to-mboxes', action='store_true')
     add('-y','--yes-overwrite-mboxes', action='store_true')
-    add('-f','--folders')
-    add('--exclude-folders')
+    add('-f','--folders', help='comma-separated folder names to back up: an exact name or a path prefix, '
+                               'so "Archive" takes Archive and every folder nested under it. '
+                               'Chinese display names as printed after connecting work')
+    add('--exclude-folders', help='comma-separated folder names to skip; same exact-or-prefix matching as --folders')
     add('-e','--ssl', action='store_true')
     add('-k','--keyfile')
     add('-c','--certfile')
@@ -686,8 +733,8 @@ class Config:
     verbose: int = 0
     eml_dir: Optional[Path] = None
     compact: bool = False
-    def parsed_folders(self) -> List[str]: return [f.strip() for f in self.folders.split(',')] if self.folders else []
-    def parsed_excludes(self) -> List[str]: return [f.strip() for f in self.exclude_folders.split(',')] if self.exclude_folders else []
+    def parsed_folders(self) -> List[str]: return split_folder_patterns(self.folders)
+    def parsed_excludes(self) -> List[str]: return split_folder_patterns(self.exclude_folders)
 
 
 def parse_args_to_config(argv: List[str]) -> Config:
@@ -788,16 +835,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     server = connect_and_login(cfg, log)
     try:
         names = get_names(server, cfg.thunderbird, cfg.nospinner, quiet=cfg.quiet, log=log)
-        include = set(cfg.parsed_folders()) if cfg.folders else None
-        exclude = set(cfg.parsed_excludes()) if cfg.exclude_folders else set()
+        # `--folders ""` must fail loudly, not be read as "no filter"
+        include = cfg.parsed_folders() if cfg.folders is not None else None
+        exclude = cfg.parsed_excludes() if cfg.exclude_folders else []
+        # thunderbird output writes an "Inbox" folder, so map that spelling onto the server's INBOX
         if include is not None and cfg.thunderbird:
-            assert isinstance(include, set)
-            thunder_include: set[str] = set()
-            for f in list(include):
-                thunder_include.add(f.replace("Inbox","INBOX",1) if f.startswith("Inbox") else f)
-            include = thunder_include
-        if include is not None: names = [n for n in names if n[0] in include or n[3] in include]
-        if exclude: names = [n for n in names if n[0] not in exclude and n[3] not in exclude]
+            include = [f.replace("Inbox", "INBOX", 1) if f.startswith("Inbox") else f for f in include]
+        if include is not None:
+            selected = [n for n in names if any(folder_matches(n[3], n[0], p) for p in include)]
+            if not selected:
+                raise SystemExit(f"No folder matches --folders '{cfg.folders}'. Available folders:\n{folder_listing(names)}")
+            names = selected
+        if exclude:
+            unmatched = [p for p in exclude if not any(folder_matches(n[3], n[0], p) for n in names)]
+            names = [n for n in names if not any(folder_matches(n[3], n[0], p) for p in exclude)]
+            if unmatched:
+                log.warning("No folder matches --exclude-folders '%s'", ", ".join(unmatched))
         account = sanitize_segment(cfg.user, EML_SEGMENT_MAX)
         if cfg.basedir is not None:
             ensure_basedir(cfg.basedir); create_folder_structure(names, cfg.basedir, account)
