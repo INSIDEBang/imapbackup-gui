@@ -13,6 +13,8 @@ Fork additions:
  - per-format incremental dedupe when both -d and --eml-dir are selected
  - per-message progress lines; structured report callback and cooperative
    stop hook consumed by the Tkinter GUI (imapbackup_gui.py)
+ - shared daily run log written to %LOCALAPPDATA%\\imapbackup-gui\\log alongside
+   the stderr output, so a failed run leaves something on disk to diagnose
 
 Original contributors (abridged): jwagnerhki, Bob Ippolito, Michael Leonhard,
 Giuseppe Scrivano, Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett,
@@ -47,6 +49,42 @@ from email.header import decode_header
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+
+# Daily run log shared with the Tkinter GUI: both entry points append to one
+# file per day under the app data directory, which the uninstaller deletes whole.
+# LOG_DIR is a module attribute rather than a function-local so tests can redirect it.
+LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "log"
+LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-10s | %(funcName)s:%(lineno)d | %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
+# Run failures are recorded through this logger instead of 'imapbackup'. It holds
+# only the file handler and does not propagate, so the failure is not printed a
+# second time on stderr: the interpreter already prints the SystemExit message.
+# When the run log cannot be created it is left without handlers, and the record
+# falls back to stderr via propagation to root.
+RUN_LOG_LOGGER = 'imapbackup.runlog'
+
+
+def make_log_file_handler() -> Optional[logging.FileHandler]:
+    """Handler for today's run log, or None so the caller can degrade gracefully.
+
+    The log is a diagnostic convenience and never a precondition for the backup:
+    an unopenable directory or file returns None instead of raising. Hands back
+    the handler already attached to root for the same file, so configuring
+    logging twice in one process cannot write the daily log twice.
+    """
+    filename = LOG_DIR / f"run-{datetime.now():%Y-%m-%d}.log"
+    base = os.path.normcase(os.path.normpath(str(filename)))
+    for existing in logging.getLogger().handlers:
+        if isinstance(existing, logging.FileHandler) and \
+                os.path.normcase(os.path.normpath(existing.baseFilename)) == base:
+            return existing
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return logging.FileHandler(filename, encoding="utf-8")
+    except OSError:
+        return None
 
 
 class SkipFolderException(Exception):
@@ -721,6 +759,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add('--icloud', action='store_true')
     add('--quiet', action='store_true')
     add('-v','--verbose', action='count', default=0, help='Increase verbosity (repeatable)')
+    add('--version', action='version', version=f"imapbackup {__version__}",
+        help='print the version and exit')
     return p
 
 
@@ -775,9 +815,27 @@ def configure_logging(cfg: Config) -> logging.Logger:
         level = logging.WARNING
     else:
         level = logging.INFO if cfg.verbose == 0 else logging.DEBUG
-    logging.basicConfig(level=level,
+    # Root stays permissive so records are not dropped before the handlers see
+    # them; the console level is applied to the StreamHandler itself. That is
+    # what lets the run log keep INFO records while --quiet silences stderr.
+    logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            handler.setLevel(level)
+    file_handler = make_log_file_handler()
+    if file_handler is None:
+        print(f"imapbackup: cannot write run log to {LOG_DIR}", file=sys.stderr)
+    else:
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(LOG_FORMATTER)
+        root.addHandler(file_handler)
+        runlog = logging.getLogger(RUN_LOG_LOGGER)
+        runlog.setLevel(logging.INFO)
+        runlog.propagate = False
+        runlog.addHandler(file_handler)
     log = logging.getLogger('imapbackup')
     log.debug('Logger initialized (level=%s quiet=%s verbose=%s)', logging.getLevelName(level), cfg.quiet, cfg.verbose)
     return log
@@ -832,8 +890,15 @@ def create_folder_structure(names: Iterable[Tuple[str, str, str, str]], basedir:
 def main(argv: Optional[List[str]] = None) -> int:
     cfg = get_config(argv)
     log = configure_logging(cfg)
-    server = connect_and_login(cfg, log)
+    runlog = logging.getLogger(RUN_LOG_LOGGER)
+    # First line of every run: the version, and a delimiter in the shared daily
+    # log, which now holds both CLI and GUI runs.
+    log.info("imapbackup v%s starting", __version__)
+    # Starts before connect_and_login so connection and authentication
+    # failures reach the run log too; argparse failures still happen earlier,
+    # before any handler exists (see ADR 0005).
     try:
+        server = connect_and_login(cfg, log)
         names = get_names(server, cfg.thunderbird, cfg.nospinner, quiet=cfg.quiet, log=log)
         # `--folders ""` must fail loudly, not be read as "no filter"
         include = cfg.parsed_folders() if cfg.folders is not None else None
@@ -882,8 +947,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         try: server.logout()
         except imaplib.IMAP4.error: pass
         return 0
-    finally:
-        pass
+    except KeyboardInterrupt:
+        runlog.warning("Run interrupted by user")
+        raise
+    except SystemExit as exc:
+        runlog.warning("Run aborted: %s", exc)
+        raise
+    except Exception:
+        runlog.exception("Run failed")
+        raise
 
 
 def cli_exception(typ, value, traceback):

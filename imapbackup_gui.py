@@ -40,10 +40,11 @@ import tkinter.font as tkfont
 
 import imapbackup312 as core
 
-LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-10s | %(funcName)s:%(lineno)d | %(message)s"
-LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
-LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
-LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "log"
+# 日志目录、文件名与格式由 core 模块统一定义：命令行与 GUI 写入同一日文件（见 ADR 0005）
+LOG_FORMAT = core.LOG_FORMAT
+LOG_DATEFMT = core.LOG_DATEFMT
+LOG_FORMATTER = core.LOG_FORMATTER
+LOG_DIR = core.LOG_DIR
 MAX_LOG_LINES = 5000
 
 # 单实例互斥量名：必须与 packaging/imapbackup-gui.iss 的 AppMutex 完全一致（卸载时靠它探测运行中的实例）。
@@ -204,14 +205,20 @@ class BackupApp:
     # ------------------------------------------------------------------ logging
 
     def _setup_logging(self) -> None:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
         debug = os.environ.get("IMAPBACKUP_GUI_DEBUG") == "1"
-        file_handler = logging.FileHandler(LOG_DIR / f"run-{datetime.now():%Y-%m-%d}.log", encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-        file_handler.setFormatter(LOG_FORMATTER)
+        level = logging.DEBUG if debug else logging.INFO
         root = logging.getLogger()
-        root.handlers[:] = [file_handler, QueueLogHandler(self.events)]
-        root.setLevel(logging.DEBUG if debug else logging.INFO)
+        handlers: list = [QueueLogHandler(self.events)]
+        file_handler = core.make_log_file_handler()
+        if file_handler is not None:
+            file_handler.setLevel(level)
+            file_handler.setFormatter(LOG_FORMATTER)
+            handlers.append(file_handler)
+        root.handlers[:] = handlers
+        root.setLevel(level)
+        # 日志文件建不出来不该让程序起不来：降级为只写运行日志面板
+        if file_handler is None:
+            self.log.warning("无法创建日志文件：%s", LOG_DIR)
         self.log.info("程序启动 v%s", __version__)
 
     # ------------------------------------------------------------- config area

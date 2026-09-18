@@ -99,6 +99,13 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 * The progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
 * Each folder's sync starts with a full-width separator (e.g. `── [3/8] Sent Messages ──`) so it is easy to see where one folder ends and the next begins.
 * Log level names are spelled out (`INFO` instead of `I`).
+* Each run opens with a version banner (`imapbackup v1.6.0 starting`) so the version is visible before the first network attempt. `--quiet` keeps it out of the terminal but not out of the run log.
+
+**Run log**
+
+* The CLI now writes a daily run log to `%LOCALAPPDATA%\imapbackup-gui\log\run-YYYY-MM-DD.log` — the same file and format as the GUI (ADR 0005). Connection, folder enumeration, per-folder sync and disconnect events are recorded; failures, unexpected exceptions and user interrupts are recorded too. An unopenable log directory degrades to a warning instead of aborting the backup, so logging is never a precondition for the backup itself.
+* Because the daily file holds both CLI and GUI runs, each run's version banner doubles as a delimiter marking where one run ends and the next begins.
+* Added `--version` for reporting the version without starting a backup. It answers before any required flag is checked and before logging is configured, so it leaves no run log entry.
 
 **GUI entry point and the core seams it relies on**
 
