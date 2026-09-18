@@ -24,6 +24,7 @@ __version__ = "1.6.0"  # 与 imapbackup312.__version__ 同一个号（项目统�
 __author__ = "Chen Chong"
 __copyright__ = "(C) 2026 Chen Chong. Code under MIT License."
 
+import ctypes
 import email.utils
 import logging
 import os
@@ -44,6 +45,13 @@ LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "log"
 MAX_LOG_LINES = 5000
+
+# 单实例互斥量名：必须与 packaging/imapbackup-gui.iss 的 AppMutex 完全一致（卸载时靠它探测运行中的实例）。
+# 不加 Global\ 前缀——每用户安装（PrivilegesRequired=lowest）没有创建全局对象的权利。
+APP_MUTEX_NAME = "INSIDEBang.imapbackup-gui.single-instance"
+ERROR_ALREADY_EXISTS = 183
+ICON_FILENAME = "imapbackup-gui.ico"
+_instance_mutex_handle: int | None = None  # 进程级持有，不 CloseHandle：进程活着互斥量就该活着
 UPTODATE_STATUS = "已是最新，无待备份邮件"
 CONNECT_BTN_LABEL = "⇄ 连接并加载文件夹"
 CONNECTED_BTN_LABEL = "✓ 已成功连接"
@@ -127,11 +135,37 @@ def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
     return display
 
 
+def _window_icon_path() -> str | None:
+    """窗口/文件图标路径：打包后在 PyInstaller 数据目录（onedir 的 _internal/），源码运行时在 packaging/。"""
+    base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) if getattr(sys, "frozen", False) \
+        else Path(__file__).resolve().parent
+    for cand in (base / ICON_FILENAME, base / "packaging" / ICON_FILENAME):
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def _another_instance_running() -> bool:
+    """抢不到同名互斥量就说明已有实例在跑。非 Windows 不创建互斥量，直接放行。"""
+    global _instance_mutex_handle
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _instance_mutex_handle = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
+    return ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+
+
 class BackupApp:
     """Single-window layout: config zones on top, Notebook (邮件列表/运行日志) below, status bar at the bottom."""
 
     def __init__(self) -> None:
         self.root = tk.Tk()
+        icon = _window_icon_path()
+        if icon:
+            try:
+                self.root.iconbitmap(icon)
+            except tk.TclError:
+                pass  # 非 Windows 平台没有 iconbitmap，或图标不可读时退回 Tk 默认图标
         self.root.title("IMAP Backup GUI")
         self.root.geometry("960x736")
         self.root.minsize(800, 620)
@@ -1074,6 +1108,9 @@ class BackupApp:
 
 
 def main() -> int:
+    if _another_instance_running():
+        print("IMAP Backup GUI 已经在运行了。", file=sys.stderr)
+        return 1
     app = BackupApp()
     app.run()
     return 0
