@@ -13,8 +13,9 @@
   - `imapbackup38.py` — Python 3.8+ 过渡版（仍报 `1.4h`）
   - `imapbackup312.py` — Python 3.12+ 现代化版（argparse/dataclass/pathlib/logging），**新工作基于此**
 - `imapbackup_gui.py` — Tkinter 单窗口 GUI 入口，复用 `imapbackup312.py` 的模块级函数（`connect_and_login`、`get_names`、`scan_file`/`scan_folder`、`download_messages` 等），**不复制核心逻辑**
-- `CONTEXT.md` + `docs/adr/`（4 篇）记领域术语与架构决策；`docs/agents/` 是 agent 流程约定
-- 无 `setup.py`/`pyproject.toml`/`requirements.txt`、无打包配置、无进版的测试与 lint 配置；CI 仅有 stale-bot 工作流。GUI 的验证脚本在 `.scratch/tkinter-gui/`（gitignore，不进 PR）
+- `CONTEXT.md` + `docs/adr/`（6 篇）记领域术语与架构决策；`docs/agents/` 是 agent 流程约定
+- `tests/` + 根目录 `pytest.ini`：进版回归套件（75 个测试 / 约 410 项断言），由 `.venv/Scripts/python.exe -m pytest` 跑，配置见 ADR 0006
+- 无 `setup.py`/`pyproject.toml`/`requirements.txt`、无打包配置、无 lint 配置；CI 仅有 stale-bot 工作流，测试套件**没有 CI job**（有意，见 ADR 0006）。`.scratch/`（gitignore）是本地一次性探针：视觉/GDI 截图与真账号 e2e，不重复 `tests/` 的回归断言
 
 ## 运行与验证
 
@@ -27,17 +28,17 @@ python imapbackup312.py --server imap.example.com:993 --ssl --user x@y.com \
 python imapbackup_gui.py        # GUI，没有命令行参数
 ```
 
-改完后的验证顺序（前四条都不需要联网）：
+改完后的验证顺序（都不需要联网；pytest 一律用 `.venv/Scripts/python.exe -m pytest`）：
 
 - `python -m py_compile <改动的 .py>`
-- `.scratch/tkinter-gui/gui_headless_smoke.py` — GUI 无头冒烟（拉起真窗口 + 喂合成事件，140+ 项断言），改 GUI 必跑
-- `.scratch/tkinter-gui/cli_output_parity.py` — CLI 终端输出与基线逐字节一致（`PARITY OK`），改核心必跑。基线 `.scratch/old_head/imapbackup312.py` 不入库，跑之前先重建：`git show HEAD:imapbackup312.py > .scratch/old_head/imapbackup312.py`
-- `.scratch/tkinter-gui/per_format_incremental_test.py` — 按格式判重回归（30 个场景全过）
-- `.scratch/cli-folder-listing/folder_listing_probe.py` — 用 fake IMAP 服务器跑完整 `main()`，验文件夹列表与 `--folders`/`--exclude-folders` 匹配语义（26 项断言），改文件夹选择或输出排序必跑
-- `.scratch/cli-file-logging/cli_file_logging_test.py` — 用 fake IMAP 服务器验 CLI 文件日志：当日日志内容与共享格式、`--quiet` 不削弱文件、失败/异常/中断入日志且不在 stderr 重复打印、日志目录不可写时降级、退出码不变（44 项断言），改日志或 `main()` 控制流必跑
-- 视觉确认用 `.scratch/tkinter-gui/*_probe.py`（真窗口 + GDI 截图，不起网）
+- `.venv/Scripts/python.exe -m pytest -m "not gui" -q` — 57 个测试，不依赖显示环境。**改核心跑这个**：按格式判重、CLI 终端输出格式、文件夹列表与 `--folders`/`--exclude-folders` 匹配语义、CLI 文件日志、`main()` 控制流与退出码
+- `.venv/Scripts/python.exe -m pytest -m gui -q` — 18 个 GUI 冒烟测试（拉起真窗口 + 喂合成事件），**改 GUI 必跑**。几何断言（`winfo_width`、`winfo_rootx`、`winfo_rooty` 序）在当前机器的 DPI/ttk 主题下标定，换环境可能挂，这也是它被 `gui` marker 隔离的原因
+- `.venv/Scripts/python.exe -m pytest -q` — 全量 75 个
+- 视觉确认用 `.scratch/tkinter-gui/*_probe.py`（真窗口 + GDI 截图，不起网）：外观判断走这里，回归断言不再往 `.scratch/` 加
 - `.scratch/tkinter-gui/real_gui_e2e.py` 需要真实 IMAP 账号，**默认不跑**（QQ 限流激进）
 - 其余：手动跑 `--help` 和小范围 `--folders` 备份
+
+**仓库没有「CLI 终端输出与基线逐字节一致」的回归门。** 原 `.scratch/tkinter-gui/cli_output_parity.py` 及其基线副本已随测试迁移删除；要恢复同等能力需要一个 golden 基线快照测试（把已知良好版本的输出字节提交为 fixture），那是另一个切片。
 
 `.gitignore` 已忽略 `*.mbox`、`*.eml`、`secret.txt`、`dist/`、`build/`、`.scratch/**` — 不要提交本地备份、凭证或探针产物。
 

@@ -28,4 +28,4 @@ Status: accepted
 - 每次运行第一行是版本横幅（`imapbackup v<版本> starting`）。共享文件里 CLI 与 GUI 的运行交错在一起，没有这个标记就无法判断一段记录属于哪次运行；它同时是版本归属的唯一凭据（此前 CLI 的 `__version__` 是死数据，从不打印）。`--quiet` 下横幅只进文件、不上 stderr，与 quiet 语义一致。
 - CLI 核心的 `imapbackup312.py` 目前没有任何逐封 DEBUG 日志（全文件只有 `Logger initialized` 一条），所以 `-v` 对文件内容没有可见效果。「文件恒 INFO」与「文件恒 DEBUG」在当前代码下输出完全相同；要逐封明细需另开切片。
 - CLI 侧日志消息为英文，与该模块其余日志一致；GUI 侧为中文。同一文件里两种语言并存，靠来源列区分。
-- `cli_output_parity.py` 的基线 `.scratch/old_head/imapbackup312.py` 不入库，跑之前需要 `git show HEAD:imapbackup312.py` 重建。
+- 版本横幅本身不受任何测试守卫：当时唯一逐字节比对 CLI 输出的 `cli_output_parity.py` 已随回归测试迁到 `tests/` 一并删除（见 ADR 0006），仓库目前没有任何「CLI 输出字节」的基线门。改横幅格式属于低但非零风险。
