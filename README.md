@@ -81,7 +81,7 @@ A single-window front-end for people who would rather not use a terminal: fill i
 
 ## Fork Notes (imapbackup-gui)
 
-This fork adds capabilities on top of upstream, aimed at a future Windows GUI distribution. The CLI remains fully usable on its own.
+This fork adds capabilities on top of upstream and ships as a per-user Windows installer for non-technical colleagues. The CLI remains fully usable on its own.
 
 ## What Changed in 1.6.0 (fork)
 
@@ -115,6 +115,12 @@ This fork adds capabilities on top of upstream, aimed at a future Windows GUI di
 * Synthetic-ID fallback header fetch now uses `BODY.PEEK` (read-only invariant).
 * Console-stream guards so a future `--windowed` build cannot crash on missing stdin/stdout.
 
+**Windows installer**
+
+* `packaging\build.bat` runs PyInstaller (GUI and CLI executables sharing one runtime directory) and then Inno Setup, producing `dist\installer\imapbackup-gui-setup-<version>.exe`. The wizard is in Chinese, installs per-user (no administrator), and creates Start-menu entries for both executables; the desktop icon is an optional task.
+* The GUI is single-instance — a second launch exits with a message instead of opening a second window; the installer and uninstaller detect a running instance through the same mutex.
+* The uninstaller removes program files, shortcuts and registry entries by itself. When launched from Control Panel or Windows "Settings → Apps", it runs as a small wizard: the first page carries a pre-checked checkbox for deleting the run-log directory under `%LOCALAPPDATA%\imapbackup-gui\` (it holds server addresses and account names, never passwords) — uncheck it to keep the logs, or cancel the wizard to abort the uninstall entirely; a final dialog confirms completion. (The stock confirmation and completion message boxes are suppressed by launching the uninstaller silently through a rewritten `UninstallString`; running `unins000.exe` directly keeps them.) Silent uninstalls with plain `/SILENT` (automation) stay fully unattended and delete the logs by default. Backups are never touched. The CLI executable is `imapbackup-gui-cli.exe`; adding it to `PATH` is deliberately not done — it is reachable from the Start menu.
+
 ### One-time migration for backups made before the account layer
 
 Incremental scanning reads the `Message-Id` header inside each message (not the path), so moving existing backups into the account directory is seamless — nothing gets re-downloaded. Modified UTF-7 folder names decode to real names now (e.g. `&UXZO1mWHTvZZOQ-` was 其他文件夹), so the old garbled directories can simply be deleted if empty:
@@ -140,9 +146,9 @@ Remove-Item "D:\data\Downloads\mail_backup\&UXZO1mWHTvZZOQ-"
 
 ## Versioning
 
-The version number lives in `imapbackup312.py` (`__version__`) and is duplicated verbatim in `imapbackup_gui.py`: the CLI and the GUI are one project and carry one version — currently 1.6.0. Optimizations stay on 1.6.x; swapping the GUI framework would move the project to 1.7.0 or 2.0.0. `imapbackup.py` and `imapbackup38.py` are frozen/transitional and still report `1.4h`, outside this numbering. Bump the two literals together, and only when intended — never as a side effect of a feature commit.
+The version number lives in `imapbackup312.py` (`__version__`) and is duplicated verbatim in `imapbackup_gui.py`: the CLI and the GUI are one project and carry one version — currently 1.6.0. Optimizations stay on 1.6.x; swapping the GUI framework would move the project to 1.7.0 or 2.0.0. `imapbackup.py` and `imapbackup38.py` are frozen/transitional and still report `1.4h`, outside this numbering. Bump the two literals together, and only when intended — never as a side effect of a feature commit. The installer carries the same number: `packaging/imapbackup-gui.iss` (`#define MyAppVersion`, which also names the setup file and the registered `AppVersion`) and the completion message in `packaging/build.bat` must move in the same change.
 
-Tagging and packaging (a `pipx` tool for the CLI, a Windows installer for the GUI) are possible future enhancements.
+The Windows installer is built from `packaging/` (see Fork Notes); release tags are cut when a version line wraps up.
 
 ## Contributing
 
