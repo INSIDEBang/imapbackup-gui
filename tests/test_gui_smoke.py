@@ -118,6 +118,17 @@ def row_tags(instance, iid):
     return tags.split() if isinstance(tags, str) else list(tags)
 
 
+def icon_rgb(color: str) -> tuple:
+    """#rrggbb → Tk 的 (r, g, b)：按钮图标就是按这个色值逐像素画上去的。"""
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def assert_start_button_idle(instance):
+    """开始按钮回到静止态：文案与绿三角图标都回位。"""
+    assert instance.start_btn.cget("text") == g.START_BTN_LABEL
+    assert instance.start_btn.cget("image") == str(instance.start_icon)
+
+
 class FakeBox:
     """messagebox 替身：记录弹了什么，askokcancel 一律放行。"""
     def __init__(self):
@@ -149,10 +160,31 @@ def _message(folder="INBOX", index=1, total=23, **overrides):
 def test_window_initial_state(app):
     assert app.root.title() == "IMAP Backup GUI"
     assert str(app.start_btn.cget("state")) == "disabled"
+    # 两个按钮各自挂着一枚代码画的图标，静止态文案固定（改动前开始/停止按钮都是纯文字）
+    assert app.start_btn.cget("text") == g.START_BTN_LABEL
+    assert app.stop_btn.cget("text") == g.STOP_BTN_LABEL
+    assert app.start_btn.cget("image") == str(app.start_icon)
+    assert app.stop_btn.cget("image") == str(app.stop_icon)
     assert app.folder_ph.cget("text") == g.FOLDER_PLACEHOLDER_TEXT
     assert app.folder_ph.winfo_manager() == "grid"
     assert app.list_ph.cget("text") == g.LIST_PLACEHOLDER_TEXT
     assert app.list_ph.winfo_manager() == "grid"
+
+
+def test_button_icons_are_code_drawn_in_color(app):
+    """图标是代码逐像素画进 PhotoImage 的彩色图形，不是字库字形。
+
+    字形只有一种颜色、且按钮禁用时会被系统灰盖掉，所以中心像素必须正好是指定色值，
+    并且不是透明像素（透明＝那块根本没画）。
+    """
+    size = app.start_icon.width()
+    assert size == app.stop_icon.width()
+    assert size == g._icon_size()
+    for icon, color in ((app.start_icon, g.PLAY_ICON_COLOR), (app.stop_icon, g.STOP_ICON_COLOR)):
+        center = size // 2
+        assert tuple(icon.get(center, center))[:3] == icon_rgb(color), (icon.get(center, center), color)
+        assert not icon.transparency_get(center, center)
+    assert app.start_icon.get(size // 2, size // 2) != app.stop_icon.get(size // 2, size // 2)
 
 
 def test_version_is_shared_and_status_bar_starts_on_one_row(app):
@@ -625,3 +657,48 @@ def test_ellipsis_tooltip_arms_only_when_truncated(app):
     app._on_tip_enter(_Ev(), app.status_var, lambda: app._status_full)
     app._on_tip_enter(_Ev(), app.count_var, lambda: app._count_full)
     assert app._tip_after is None and app._tip is None
+
+
+def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monkeypatch):
+    """备份中开始按钮撤掉绿三角、显示「⠋ 正在备份…」，与连接按钮同一套帧与节奏。
+
+    帧推进（_run_spinner_tick / _set_loading_frame）与 after 调度是分开的，所以第 i 帧长什么样
+    可以直接断言，不必 sleep 等定时器。
+    """
+    for index in (0, 3, len(g.SPINNER_FRAMES) - 1):
+        app._set_loading_frame(app.start_btn, g.RUNNING_BTN_LABEL, index)
+        assert app.start_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.RUNNING_BTN_LABEL}"
+        app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, index)
+        assert app.connect_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.CONNECTING_BTN_LABEL}"
+
+    app.running = True
+    app._begin_run_ui()
+    text = str(app.start_btn.cget("text"))
+    assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+    assert app.start_btn.cget("image") == ""  # 绿三角让位给转圈文字
+    assert str(app.start_btn.cget("state")) == "disabled"
+    assert str(app.stop_btn.cget("state")) == "normal"
+
+    app._end_run_controls()
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None
+    app._apply_connect_state()  # 上面借连接按钮验了共享帧，把它的文案交回状态机
+
+    # 自愈：有的路径直接把 running 置假、不走 _end_run_controls，帧推进函数得自己复位，
+    # 否则「正在备份…」会残留在按钮上
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()  # 停掉真实帧链，下面手动推进
+    app.running = False
+    app._run_spinner_tick(2)
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None
+
+    # 失败路径同样要走复位（messagebox 换替身，否则会弹真对话框）
+    monkeypatch.setattr(g, "messagebox", FakeBox())
+    app.running = True
+    app._begin_run_ui()
+    app.events.put(("run_failed", "boom"))
+    pump(app)
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None

@@ -55,9 +55,28 @@ ICON_FILENAME = "imapbackup-gui.ico"
 _instance_mutex_handle: int | None = None  # 进程级持有，不 CloseHandle：进程活着互斥量就该活着
 UPTODATE_STATUS = "已是最新，无待备份邮件"
 CONNECT_BTN_LABEL = "⇄ 连接并加载文件夹"
+CONNECTING_BTN_LABEL = "正在连接…"
 CONNECTED_BTN_LABEL = "✓ 已成功连接"
+CONNECT_BTN_CHARS = 26          # 连接按钮的固定宽度（字符数）：各状态文案长短不一，定宽才不会抖
+START_BTN_LABEL = "开始备份"
+RUNNING_BTN_LABEL = "正在备份…"
+STOP_BTN_LABEL = "停止"
 STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
 RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
+
+# 加载动画：连接与备份共用同一套帧与节奏——用户要求两处的加载图标看起来一样。
+# 帧是盲文点阵（U+2800 段，Windows 字体普遍有字形），画在按钮文字前缀上，不需要图片资产；
+# 按钮处在禁用态时 Tk 会用系统灰降级渲染，两处观感因此天然一致。
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+SPINNER_INTERVAL_MS = 150
+
+# 按钮图标：彩色图形只能由代码逐像素画出来——文字字形只有一种颜色，且按钮一进禁用态
+# 就会被系统灰覆盖。不引图片资产：PhotoImage 运行时生成，打包零成本、没有图标路径问题。
+PLAY_ICON_COLOR = "#1f9d55"     # 开始：绿色
+STOP_ICON_COLOR = "#d13438"     # 停止：红色
+ICON_MIN_SIZE = 9               # 图标边长下限(px)
+ICON_LINESPACE_GAP = 5          # 图标边长 = 默认字体行高 − 这个值：行高变大图标同比例变大，不设上限
+STOP_ICON_INSET_RATIO = 0.125   # 红方块相对外接框的内缩比例：方块视觉比同框三角重，缩一圈才平衡
 HINT_RED = "red"       # 需要用户操作：连接信息已过期，得重新连接
 HINT_GRAY = "gray"     # 备份运行中：配置锁定，先停下才能改
 ZEBRA_TAG = "zebra"    # 邮件列表偶数行（第 2、4… 行）的 tag；奇数行走 Treeview 默认白底
@@ -146,6 +165,41 @@ def _window_icon_path() -> str | None:
     return None
 
 
+def _icon_size() -> int:
+    """图标边长(px)：跟默认字体行高走——系统缩放或字号变大，图标同比例变大。
+
+    不设上限（封顶会让高 DPI 下的图标相对文字偏小）；比行高矮几像素，按钮高度因此仍由文字决定，
+    只留一个下限兜底。
+    """
+    linespace = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+    return max(ICON_MIN_SIZE, linespace - ICON_LINESPACE_GAP)
+
+
+def _put(img: tk.PhotoImage, color: str, x0: int, y0: int, x1: int, y1: int) -> None:
+    """画一个矩形色块。坐标先夹进画布：put 越界会抛 TclError。"""
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(img.width(), x1), min(img.height(), y1)
+    if x1 > x0 and y1 > y0:
+        img.put(color, to=(x0, y0, x1, y1))
+
+
+def _play_icon(color: str, size: int) -> tk.PhotoImage:
+    """实心右向三角（开始/播放）：左边缘竖直，尖端落在中线。"""
+    img = tk.PhotoImage(width=size, height=size)
+    mid = (size - 1) / 2
+    for y in range(size):
+        width = int(round(size * (1 - abs(y - mid) / (mid + 0.5))))
+        _put(img, color, 0, y, width, y + 1)
+    return img
+
+
+def _stop_icon(color: str, size: int) -> tk.PhotoImage:
+    """实心方块（停止）。缩到 3/4 边长：同外接框的方块比三角视觉更重，缩一点才平衡。"""
+    img = tk.PhotoImage(width=size, height=size)
+    inset = max(1, round(size * STOP_ICON_INSET_RATIO))
+    _put(img, color, inset, inset, size - inset, size - inset)
+    return img
+
+
 def _another_instance_running() -> bool:
     """抢不到同名互斥量就说明已有实例在跑。非 Windows 不创建互斥量，直接放行。"""
     global _instance_mutex_handle
@@ -185,6 +239,7 @@ class BackupApp:
         self._folder_clickables: list[tuple[tk.Widget, str]] = []
         self._port_touched = False
         self._spinner_job: int | None = None  # root.after id while the button shows a spinner
+        self._run_spinner_job: int | None = None  # 同上，备份运行中的开始按钮
         self._config_widgets: list[tuple[tk.Widget, str]] = []
         self.server_total = 0
         self.pending_total = 0
@@ -270,7 +325,8 @@ class BackupApp:
         self.show_var = tk.BooleanVar(value=False)
         self._register(tk.Checkbutton(group, text="显示", variable=self.show_var, command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
 
-        self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=26, command=self._on_connect))
+        self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=CONNECT_BTN_CHARS,
+                                                     command=self._on_connect))
         self.connect_btn.grid(row=4, column=0, columnspan=6, pady=(10, 10))
         # 按需挂出：无提示时 grid_remove 让出这一行，按钮位置不变，让出的高度由下方邮件列表吸收
         self.conn_hint = tk.Label(group, text="")
@@ -383,10 +439,14 @@ class BackupApp:
         self.count_var = tk.StringVar(value=self._count_full)
         self.count_label = tk.Label(bar, textvariable=self.count_var, anchor="w")
         self.count_label.pack(side="left")
-        self.stop_btn = tk.Button(bar, text="停止", width=6, state="disabled", command=self._on_stop)
+        # 两个按钮都不给 -width：带图标的按钮里该选项按像素解释（纯文字时才按字符数），
+        # 写死就既不随 DPI 也不随文案长度走——实测 width=10 会把带图标的按钮塌到 18px。
+        # 交给 Tk 按「图标 + 文字」的内在尺寸算，缩放与文案变化都自动跟得上。
+        self.stop_btn = tk.Button(bar, text=STOP_BTN_LABEL, state="disabled", command=self._on_stop)
         self.stop_btn.pack(side="right")
-        self.start_btn = tk.Button(bar, text="开始备份", width=10, command=self._on_start)
+        self.start_btn = tk.Button(bar, text=START_BTN_LABEL, command=self._on_start)
         self.start_btn.pack(side="right", padx=(0, 6))
+        self._attach_button_icons()
         # 进度条是这一行唯一可伸缩的控件：文字变长它先缩水，触及地板宽度后文字才截断
         self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)
         self.progress.pack(side="left", fill="x", expand=True, padx=(16, 8))
@@ -409,6 +469,18 @@ class BackupApp:
         # 初始单行：进度条与第二行在首次开始备份时才出现
         self.progress.pack_forget()
         msg_bar.pack_forget()
+
+    def _attach_button_icons(self) -> None:
+        """给两个按钮挂上代码画的彩色图标（开始=绿三角、停止=红方块）。
+
+        位图必须由 Python 侧持引用：Tkinter 不持引用，PhotoImage 一旦被 GC，按钮上的图标
+        会变空白。
+        """
+        size = _icon_size()
+        self.start_icon = _play_icon(PLAY_ICON_COLOR, size)
+        self.stop_icon = _stop_icon(STOP_ICON_COLOR, size)
+        self.start_btn.configure(image=self.start_icon, compound="left")
+        self.stop_btn.configure(image=self.stop_icon, compound="left")
 
     # ------------------------------------------------------- connect handlers
 
@@ -657,18 +729,17 @@ class BackupApp:
             self.conn_hint.grid_remove()
 
     def _start_button_spinner(self) -> None:
-        """连接中的按钮图标用盲文点阵转圈（U+2800 段，Windows 字体普遍有字形）。"""
-        frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+        """连接中的按钮加载态：帧与节奏跟开始按钮共用（两处加载图标必须看起来一样）。"""
+        self.connect_btn.configure(state="disabled")
+        self._connect_spinner_tick(0)
 
-        def tick(i: int = 0) -> None:
-            if self.connect_state != "connecting":
-                self._spinner_job = None
-                return
-            self.connect_btn.configure(text=f"{frames[i % len(frames)]} 正在连接…")
-            self._spinner_job = self.root.after(150, tick, i + 1)
-
-        self.connect_btn.configure(text=f"{frames[0]} 正在连接…", state="disabled")
-        self._spinner_job = self.root.after(150, tick, 1)
+    def _connect_spinner_tick(self, index: int) -> None:
+        """画第 index 帧并按连接状态决定排不排下一帧；文案由 _apply_connect_state 收尾复位。"""
+        if self.connect_state != "connecting":
+            self._spinner_job = None
+            return
+        self._set_loading_frame(self.connect_btn, CONNECTING_BTN_LABEL, index)
+        self._spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._connect_spinner_tick, index + 1)
 
     def _apply_connect_state(self) -> None:
         if self.connect_state == "connecting":
@@ -753,6 +824,41 @@ class BackupApp:
               and not self.running)
         self.start_btn.configure(state="normal" if ok else "disabled")
 
+    def _set_loading_frame(self, button: tk.Button, label: str, index: int) -> None:
+        """把按钮画成加载态的第 index 帧——连接与备份共用这一个入口。
+
+        盲文点阵当前缀，节奏同为 SPINNER_INTERVAL_MS，所以两处的加载图标看起来一模一样。
+        """
+        button.configure(text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {label}")
+
+    def _start_run_spinner(self) -> None:
+        """开始按钮的加载态（进入运行态时调用，此刻 self.running 已置真）：撤掉绿三角、只留转圈文字。"""
+        self._stop_run_spinner()  # 防重复进入：旧 job 不取消会留下第二条帧链
+        self.start_btn.configure(image="")
+        self._run_spinner_tick(0)
+
+    def _run_spinner_tick(self, index: int) -> None:
+        """画第 index 帧，并按状态决定排不排下一帧。
+
+        退出时复位文案与图标：有的路径会把 running 直接置假而不走 _end_run_controls，
+        不在这儿兜一下，按钮上就会残留「正在备份…」。帧推进单独成方法，测试可直接驱动。
+        """
+        if not self.running:
+            self._run_spinner_job = None
+            self._restore_start_button()
+            return
+        self._set_loading_frame(self.start_btn, RUNNING_BTN_LABEL, index)
+        self._run_spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._run_spinner_tick, index + 1)
+
+    def _stop_run_spinner(self) -> None:
+        if self._run_spinner_job is not None:
+            self.root.after_cancel(self._run_spinner_job)
+            self._run_spinner_job = None
+
+    def _restore_start_button(self) -> None:
+        """回到静止态：文案与绿三角一并回位（完成、停止、失败三条路径都收口到这里）。"""
+        self.start_btn.configure(text=START_BTN_LABEL, image=self.start_icon)
+
     def _set_config_enabled(self, enabled: bool) -> None:
         for widget, default_state in self._config_widgets:
             try:
@@ -788,6 +894,7 @@ class BackupApp:
         self._ensure_status_rows()
         self._set_config_enabled(False)
         self._apply_connect_state()
+        self._start_run_spinner()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.notebook.select(0)
@@ -944,11 +1051,16 @@ class BackupApp:
 
     def _end_run_controls(self) -> None:
         self.running = False
+        # 停表先于解锁：转圈 job 必须取消，否则复位后它还会按 running 判定自己退出，白跑一轮
+        self._stop_run_spinner()
+        self._restore_start_button()
         # 先解锁配置区再走连接状态机：状态机可能重新禁用连接按钮（过期连接），顺序反了会被解锁覆盖回去
         self._set_config_enabled(True)
         self._apply_connect_state()
-        self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="disabled")
+        # 开始按钮按当前连接与勾选情况重新判定（不是一律 disabled）：失败路径原先停在禁用态，
+        # 用户想重跑还得先去动一下复选框才解禁
+        self._update_start_state()
 
     def _finish_run(self, backed: int, skipped: int, seconds: float, stopped: bool, pending: int) -> None:
         self._end_run_controls()
@@ -962,7 +1074,6 @@ class BackupApp:
                              error=False)
         self.log.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s", backed, skipped, _fmt_duration(seconds),
                       "（用户停止）" if stopped else "")
-        self._update_start_state()
 
     def _set_status(self, text: str, error: bool) -> None:
         self._status_full = text
