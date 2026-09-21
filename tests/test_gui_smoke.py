@@ -129,6 +129,12 @@ def assert_start_button_idle(instance):
     assert instance.start_btn.cget("image") == str(instance.start_icon)
 
 
+def assert_stop_button_idle(instance):
+    """停止按钮回到静止态：文案与红方块图标都回位。"""
+    assert instance.stop_btn.cget("text") == g.STOP_BTN_LABEL
+    assert instance.stop_btn.cget("image") == str(instance.stop_icon)
+
+
 class FakeBox:
     """messagebox 替身：记录弹了什么，askokcancel 一律放行。"""
     def __init__(self):
@@ -660,7 +666,7 @@ def test_ellipsis_tooltip_arms_only_when_truncated(app):
 
 
 def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monkeypatch):
-    """备份中开始按钮撤掉绿三角、显示「⠋ 正在备份…」，与连接按钮同一套帧与节奏。
+    """备份中开始按钮把绿三角换成透明占位、显示「⠋ 正在备份…」，与连接按钮同一套帧与节奏。
 
     帧推进（_run_spinner_tick / _set_loading_frame）与 after 调度是分开的，所以第 i 帧长什么样
     可以直接断言，不必 sleep 等定时器。
@@ -675,7 +681,7 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     app._begin_run_ui()
     text = str(app.start_btn.cget("text"))
     assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
-    assert app.start_btn.cget("image") == ""  # 绿三角让位给转圈文字
+    assert app.start_btn.cget("image") == str(app.blank_icon)  # 绿三角让位给透明占位（撤成 "" 会矮/高一截）
     assert str(app.start_btn.cget("state")) == "disabled"
     assert str(app.stop_btn.cget("state")) == "normal"
 
@@ -819,3 +825,117 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
     app._rebuild_folders([])
     app.root.update()
     assert int(canvas.cget("yscrollincrement")) == 0
+
+
+def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
+    """「停止中」三处同时换口径：停止按钮接手转圈、开始按钮退回静止外观、状态行清空、提示改文案。
+
+    回归自：点了停止之后开始按钮还在转圈「正在备份…」、停止按钮只是变灰且文案不变、
+    第二行还写着「正在停止…」（与按钮重复）——按钮和状态行都没有「我收到了」的反应。
+    现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
+    第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
+    """
+    app.connect_state = "connected"
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始/连接按钮那套用例同法）
+    app._set_counts("已备份 3 / 10")
+    app._set_status("备份 INBOX（7 封）", error=False)
+    counts_before, progress_before = app.count_var.get(), float(app.progress["value"])
+
+    app._on_stop()
+    assert app.stopping is True and app.stop_flag.is_set()
+    text = str(app.stop_btn.cget("text"))
+    assert text.endswith(g.STOPPING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+    assert app.stop_btn.cget("image") == str(app.blank_icon)  # 红方块让位给转圈文字
+    assert str(app.stop_btn.cget("state")) == "disabled"
+    assert_start_button_idle(app)                             # 开始按钮：文案与绿三角回位
+    assert str(app.start_btn.cget("state")) == "disabled"     # 但仍不可点（运行还没真正结束）
+    assert app.status_var.get() == "" and app._status_full == ""           # 第二行清空
+    assert app._msg_bar.winfo_manager() == "pack"             # 行不收回
+    assert app.version_label.winfo_manager() == "pack"        # 版本号留在原处
+    assert app.conn_hint.cget("text") == g.STOPPING_HINT_TEXT
+    # 停止这个动作本身不动第一行计数与进度条（工作线程在途的那封照常落盘、计数据实更新，
+    # 那是有意义的真实进展，这里不冻结它）
+    assert app.count_var.get() == counts_before, app.count_var.get()
+    assert float(app.progress["value"]) == progress_before
+
+    # 帧推进落在停止按钮上，开始按钮不再被写文案（全行只剩一个转圈）——走真函数，别抄它的映射
+    for index in (2, len(g.SPINNER_FRAMES) - 1):
+        app._run_spinner_tick(index)
+        assert app.stop_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.STOPPING_BTN_LABEL}"
+        assert_start_button_idle(app)
+
+    # 运行真正结束：按钮、状态行、提示全部回位，不残留「正在停止…」
+    app.events.put(("run_done", 5, 100, 9.0, True, 20))
+    pump(app)
+    assert app.running is False and app.stopping is False
+    assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)
+    assert app.conn_hint.cget("text") == "", app.conn_hint.cget("text")
+
+    # 不在运行时按停止（那时按钮本就禁用）不产生任何变化
+    app._on_stop()
+    assert app.stopping is False
+    assert_stop_button_idle(app)
+
+
+def test_stopping_then_failing_restores_the_controls(app, monkeypatch):
+    """停止中撞上运行失败：除弹窗外按钮与状态行也要完整复位（messagebox 换替身，别弹真框）。"""
+    monkeypatch.setattr(g, "messagebox", FakeBox())
+    app.connect_state = "connected"
+    app.running = True
+    app._begin_run_ui()
+    app._on_stop()
+    assert app.stopping is True
+
+    app.events.put(("run_failed", "boom"))
+    pump(app)
+    assert app.running is False and app.stopping is False
+    assert app._run_spinner_job is None
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)
+    assert app.status_var.get() == "备份失败，详见运行日志", app.status_var.get()
+
+
+def test_loading_buttons_keep_their_height(app):
+    """加载态不许改按钮高度：开始/停止/连接三颗按钮在加载与非加载之间高度一致。
+
+    回归自：用户看到运行中的开始按钮比旁边的停止按钮高一块。探针量出的根因不是盲文帧，
+    而是加载态把 image 撤成 ""——Tk 的按钮请求高度取决于「有没有 image」（同一按钮实测
+    有图 28px / 无图 30px，与文案是中文还是盲文帧无关）。修法是加载态换一枚同尺寸的
+    全透明占位图（blank_icon），图标槽一直占着、只换里面的像素。
+    断言只比同一颗按钮的前后高度，不钉绝对像素值（异 DPI/主题下数字会变）。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+    idle = (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+    assert idle[0] == idle[1], idle                    # 同一行两颗按钮本就该等高
+    connect_idle = app.connect_btn.winfo_reqheight()
+
+    # 连接按钮：加载态只换文案（它本来就没有图标），高度不变
+    app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, 0)
+    app.root.update()
+    assert app.connect_btn.winfo_reqheight() == connect_idle
+    app._apply_connect_state()                         # 文案交回连接状态机
+
+    # 运行中：开始按钮的图标槽换成透明占位，高度与静止态一致，同行的停止按钮不被顶高
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()                            # 停掉真实帧链，免得它把文案改回别的帧
+    app.root.update()
+    assert app.start_btn.cget("image") == str(app.blank_icon), app.start_btn.cget("image")
+    assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
+        app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+
+    # 停止中：转圈换到停止按钮上，两颗按钮的高度仍然一致
+    app._on_stop()
+    app.root.update()
+    assert app.stop_btn.cget("image") == str(app.blank_icon)
+    assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
+        app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+
+    app._end_run_controls()
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)

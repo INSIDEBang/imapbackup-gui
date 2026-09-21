@@ -61,8 +61,10 @@ CONNECT_BTN_CHARS = 26          # 连接按钮的固定宽度（字符数）：�
 START_BTN_LABEL = "开始备份"
 RUNNING_BTN_LABEL = "正在备份…"
 STOP_BTN_LABEL = "停止"
+STOPPING_BTN_LABEL = "正在停止…"  # 停止中：转圈挪到停止按钮上，开始按钮退回静止外观
 STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
 RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
+STOPPING_HINT_TEXT = "备份正在停止，完成后即可修改"  # 已按过停止，再说「请先停止」就是过期信息
 
 # 加载动画：连接与备份共用同一套帧与节奏——用户要求两处的加载图标看起来一样。
 # 帧是盲文点阵（U+2800 段，Windows 字体普遍有字形），画在按钮文字前缀上，不需要图片资产；
@@ -203,6 +205,16 @@ def _stop_icon(color: str, size: int) -> tk.PhotoImage:
     return img
 
 
+def _blank_icon(size: int) -> tk.PhotoImage:
+    """与彩色图标同尺寸的全透明位图（一个像素都不画）。
+
+    加载态不能把 image 撤成 ""：Tk 的按钮请求高度取决于「有没有 image」——实测同一按钮
+    带图 28px、撤图 30px，与文案是中文还是盲文帧无关。撤图换成它，图标槽的宽高照旧占着，
+    按钮高度在加载/静止之间不动（宽度只随文案走），换的只是槽里的像素。
+    """
+    return tk.PhotoImage(width=size, height=size)
+
+
 def _another_instance_running() -> bool:
     """抢不到同名互斥量就说明已有实例在跑。非 Windows 不创建互斥量，直接放行。"""
     global _instance_mutex_handle
@@ -237,6 +249,7 @@ class BackupApp:
         self.connect_state = "idle"  # idle | connecting | connected | stale
         self._snapshot: tuple[str, str, str] | None = None  # (server, user, password) at connect time
         self.running = False
+        self.stopping = False  # 运行中的子阶段：已按停止、工作线程还在收尾（按钮与提示都跟着换口径）
         self.folder_rows: list[dict] = []
         self._folder_nodes: dict[tuple[str, ...], dict] = {}
         self._folder_clickables: list[tuple[tk.Widget, str]] = []
@@ -492,11 +505,12 @@ class BackupApp:
         """给两个按钮挂上代码画的彩色图标（开始=绿三角、停止=红方块）。
 
         位图必须由 Python 侧持引用：Tkinter 不持引用，PhotoImage 一旦被 GC，按钮上的图标
-        会变空白。
+        会变空白。blank_icon 是加载态的透明占位（见 _blank_icon），同样要持引用。
         """
         size = _icon_size()
         self.start_icon = _play_icon(PLAY_ICON_COLOR, size)
         self.stop_icon = _stop_icon(STOP_ICON_COLOR, size)
+        self.blank_icon = _blank_icon(size)
         self.start_btn.configure(image=self.start_icon, compound="left")
         self.stop_btn.configure(image=self.stop_icon, compound="left")
 
@@ -807,7 +821,8 @@ class BackupApp:
             if self.running:
                 # 运行中配置区整体锁定，connect_btn 已被 _set_config_enabled(False) 禁用
                 self.connect_btn.configure(text=CONNECT_BTN_LABEL)
-                self._show_conn_hint(RUNNING_HINT_TEXT, HINT_GRAY)
+                hint = STOPPING_HINT_TEXT if self.stopping else RUNNING_HINT_TEXT
+                self._show_conn_hint(hint, HINT_GRAY)
             elif self.connect_state == "connected":
                 self.connect_btn.configure(text=CONNECTED_BTN_LABEL, state="disabled")
                 self._show_conn_hint("", HINT_GRAY)
@@ -916,22 +931,30 @@ class BackupApp:
         button.configure(text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {label}")
 
     def _start_run_spinner(self) -> None:
-        """开始按钮的加载态（进入运行态时调用，此刻 self.running 已置真）：撤掉绿三角、只留转圈文字。"""
+        """开始按钮的加载态（进入运行态时调用，此刻 self.running 已置真）：绿三角换透明占位、只留转圈文字。"""
         self._stop_run_spinner()  # 防重复进入：旧 job 不取消会留下第二条帧链
-        self.start_btn.configure(image="")
+        self.start_btn.configure(image=self.blank_icon)
         self._run_spinner_tick(0)
 
     def _run_spinner_tick(self, index: int) -> None:
-        """画第 index 帧，并按状态决定排不排下一帧。
+        """画第 index 帧，并按状态决定排不排下一帧、以及画在哪颗按钮上。
 
-        退出时复位文案与图标：有的路径会把 running 直接置假而不走 _end_run_controls，
-        不在这儿兜一下，按钮上就会残留「正在备份…」。帧推进单独成方法，测试可直接驱动。
+        帧链只有一条（job 槽 self._run_spinner_job）：运行中画开始按钮，停止中改画停止按钮
+        （开始按钮已在 _on_stop 里退回静止外观），所以「谁在忙」永远只有一颗按钮在转。
+        退出时把整段运行态界面复位（两颗按钮 + 配置区提示）：有的路径会把 running 直接置假
+        而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」、
+        提示会滞留在「备份正在停止…」。帧推进单独成方法，测试可直接驱动。
         """
         if not self.running:
             self._run_spinner_job = None
+            self.stopping = False
             self._restore_start_button()
+            self._restore_stop_button()
+            self._apply_connect_state()
             return
-        self._set_loading_frame(self.start_btn, RUNNING_BTN_LABEL, index)
+        button, label = ((self.stop_btn, STOPPING_BTN_LABEL) if self.stopping
+                         else (self.start_btn, RUNNING_BTN_LABEL))
+        self._set_loading_frame(button, label, index)
         self._run_spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._run_spinner_tick, index + 1)
 
     def _stop_run_spinner(self) -> None:
@@ -940,8 +963,12 @@ class BackupApp:
             self._run_spinner_job = None
 
     def _restore_start_button(self) -> None:
-        """回到静止态：文案与绿三角一并回位（完成、停止、失败三条路径都收口到这里）。"""
+        """回到静止态：文案与绿三角一并回位（完成/停止/失败三条结局与帧链自愈分支都收口到这里）。"""
         self.start_btn.configure(text=START_BTN_LABEL, image=self.start_icon)
+
+    def _restore_stop_button(self) -> None:
+        """回到静止态：文案与红方块一并回位（与 _restore_start_button 成对、同两个收口点）。"""
+        self.stop_btn.configure(text=STOP_BTN_LABEL, image=self.stop_icon)
 
     def _set_config_enabled(self, enabled: bool) -> None:
         for widget, default_state in self._config_widgets:
@@ -995,6 +1022,7 @@ class BackupApp:
         if not selected:
             return
         self.running = True
+        self.stopping = False
         self.stop_flag.clear()
         self.server_total = self.pending_total = self.backed_count = 0
         self._clear_message_rows()
@@ -1090,9 +1118,22 @@ class BackupApp:
             eq.put(("run_failed", f"{type(e).__name__}: {e}"))
 
     def _on_stop(self) -> None:
+        """停止中：多处同时给反馈——停止按钮接手转圈、开始按钮退回静止外观、状态行清空、配置区提示换口径。
+
+        帧链不用重启（工作线程还在收尾、self.running 仍为真），下一帧起 _run_spinner_tick 会按
+        stopping 把帧画到停止按钮上；所以这里翻状态后当帧就把开始按钮复位，点击立刻有反馈。
+        状态行只清文案、不收回整行：版本号与行高都留在原地，结束时已有「已停止：…」回填。
+        """
+        if not self.running:
+            return
         self.stop_flag.set()
-        self.stop_btn.configure(state="disabled")
-        self._set_status("正在停止…", error=False)
+        self.stopping = True
+        self.stop_btn.configure(state="disabled", image=self.blank_icon)
+        self._restore_start_button()
+        self._stop_run_spinner()  # 取消挂起的那一帧，立即按新目标重画第 0 帧：点下去当刻就见反馈
+        self._run_spinner_tick(0)
+        self._set_status("", error=False)
+        self._apply_connect_state()
 
     # ------------------------------------------------------------ event pump
 
@@ -1135,9 +1176,12 @@ class BackupApp:
 
     def _end_run_controls(self) -> None:
         self.running = False
+        self.stopping = False
         # 停表先于解锁：转圈 job 必须取消，否则复位后它还会按 running 判定自己退出，白跑一轮
         self._stop_run_spinner()
+        # 两颗按钮一起复位：停止中收尾时停止按钮上也挂着转圈文案
         self._restore_start_button()
+        self._restore_stop_button()
         # 先解锁配置区再走连接状态机：状态机可能重新禁用连接按钮（过期连接），顺序反了会被解锁覆盖回去
         self._set_config_enabled(True)
         self._apply_connect_state()
