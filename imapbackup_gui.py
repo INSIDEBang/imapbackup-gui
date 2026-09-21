@@ -360,7 +360,10 @@ class BackupApp:
 
     def _build_folder_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="邮箱文件夹")
-        group.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        # 面板右边不留白：右边界与下方区域（邮件列表/运行日志/停止按钮）共用同一条线，
+        # 即"内容右边距 == 内容左边距（8px）"。单独再留 8px 会让面板比下方窄一块。
+        group.grid(row=0, column=1, sticky="nsew")
+        self.folder_group = group
         group.columnconfigure(0, weight=1)
         group.rowconfigure(1, weight=1)
 
@@ -374,8 +377,10 @@ class BackupApp:
         # 目标，单行放不下"点箭头=展开、点名字=勾选"两个动作。这里箭头和名称都是真控件，命中区明确。
         self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=200)
         self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
+        # 滚条紧贴面板内沿（右边不留白），与下方"邮件列表/运行日志"页签里的滚条贴边方式一致
         folder_scroll = ttk.Scrollbar(group, orient="vertical", command=self.folder_canvas.yview)
-        folder_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 6), pady=4)
+        folder_scroll.grid(row=1, column=1, sticky="ns", pady=4)
+        self.folder_scroll = folder_scroll
         self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
         self.folder_inner = tk.Frame(self.folder_canvas)
         self._folder_win = self.folder_canvas.create_window((0, 0), window=self.folder_inner, anchor="nw")
@@ -417,6 +422,7 @@ class BackupApp:
         self.tree.column("size", width=90, anchor="e", stretch=False)
         self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
         tree_scroll = ttk.Scrollbar(list_tab, orient="vertical", command=self.tree.yview)
+        self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")

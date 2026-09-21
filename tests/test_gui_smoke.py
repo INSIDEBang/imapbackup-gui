@@ -702,3 +702,40 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     pump(app)
     assert_start_button_idle(app)
     assert app._run_spinner_job is None
+
+
+def test_right_edges_share_one_baseline(app):
+    """右边界基线：内容右边距 == 左边距，「邮箱文件夹」面板与下方区域同一条右边线。
+
+    用户口径：左边留多少，右边就留多少；面板内的滚条要紧贴面板边框线。回归自：面板曾
+    单独多留 8px 右留白、滚条自己再留 6px，于是面板边框比下方窄一块、滚条比下方滚条左 13px。
+    断言全走控件之间的相对关系，不钉绝对坐标，换 DPI/主题也成立。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+
+    def left(widget):
+        return widget.winfo_rootx()
+
+    def right(widget):
+        return widget.winfo_rootx() + widget.winfo_width()
+
+    # 上半区容器的左边距 vs 面板的右边距：两边都得是 8px
+    client_left = app.root.winfo_rootx()
+    client_right = client_left + app.root.winfo_width()
+    left_margin = left(app.folder_group.master) - client_left
+    right_margin = client_right - right(app.folder_group)
+    assert left_margin == right_margin == 8, (left_margin, right_margin)
+
+    # 面板右边界 == 下方区域（Notebook）右边界
+    assert right(app.folder_group) == right(app.notebook), (
+        right(app.folder_group), right(app.notebook))
+
+    # 面板内滚条贴住面板边框线：与面板内沿只差一个 borderwidth
+    border = int(app.folder_group.cget("borderwidth"))
+    assert right(app.folder_group) - right(app.folder_scroll) == border, (
+        right(app.folder_group), right(app.folder_scroll), border)
+
+    # 跨面板观感：文件夹滚条与邮件列表滚条的右边线差 ≤ 2px（实测 1px，差在 ttk 主题内边距）
+    assert abs(right(app.folder_scroll) - right(app.tree_scroll)) <= 2, (
+        right(app.folder_scroll), right(app.tree_scroll))
