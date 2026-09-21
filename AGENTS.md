@@ -49,7 +49,7 @@
   - `imapbackup312.py` — Python 3.12+ 现代化版（argparse/dataclass/pathlib/logging），**新工作基于此**
 - `imapbackup_gui.py` — Tkinter 单窗口 GUI 入口，复用 `imapbackup312.py` 的模块级函数（`connect_and_login`、`get_names`、`scan_file`/`scan_folder`、`download_messages` 等），**不复制核心逻辑**
 - `CONTEXT.md` + `docs/adr/`（6 篇）记领域术语与架构决策；`docs/agents/` 是 agent 流程约定
-- `tests/` + 根目录 `pytest.ini`：进版回归套件（79 个测试 / 455 项断言），由 `.venv/Scripts/python.exe -m pytest` 跑，配置见 ADR 0006
+- `tests/` + 根目录 `pytest.ini`：进版回归套件（82 个测试 / 483 项断言），由 `.venv/Scripts/python.exe -m pytest` 跑，配置见 ADR 0006
 - `packaging/` — Windows 安装程序构建：PyInstaller spec（GUI `imapbackup-gui.exe` 与 CLI `imapbackup-gui-cli.exe` 双 EXE 共享一份 `_internal/` 运行库）、Inno Setup 中文脚本 `.iss`、`build.bat` 一条龙、图标与中文语言包；产物在 `dist/`（gitignore）
 - 无 `setup.py`/`pyproject.toml`/`requirements.txt`（不入 pip 生态，Windows 打包走 `packaging/`）、无 lint 配置；CI 仅有 stale-bot 工作流，测试套件**没有 CI job**（有意，见 ADR 0006）。`.scratch/`（gitignore）是本地一次性探针：视觉/GDI 截图与真账号 e2e，不重复 `tests/` 的回归断言
 >>>>>>> 66e44e2 (docs: record the GUI right-edge baseline rule)
@@ -83,8 +83,8 @@
 =======
 - `python -m py_compile <改动的 .py>`
 - `.venv/Scripts/python.exe -m pytest -m "not gui" -q` — 57 个测试，不依赖显示环境。**改核心跑这个**：按格式判重、CLI 终端输出格式、文件夹列表与 `--folders`/`--exclude-folders` 匹配语义、CLI 文件日志、`main()` 控制流与退出码
-- `.venv/Scripts/python.exe -m pytest -m gui -q` — 22 个 GUI 冒烟测试（拉起真窗口 + 喂合成事件），**改 GUI 必跑**。几何断言（`winfo_width`、`winfo_rootx`、`winfo_rooty` 序）在当前机器的 DPI/ttk 主题下标定，换环境可能挂，这也是它被 `gui` marker 隔离的原因
-- `.venv/Scripts/python.exe -m pytest -q` — 全量 79 个
+- `.venv/Scripts/python.exe -m pytest -m gui -q` — 25 个 GUI 冒烟测试（拉起真窗口 + 喂合成事件），**改 GUI 必跑**。几何断言（`winfo_width`、`winfo_rootx`、`winfo_rooty` 序）在当前机器的 DPI/ttk 主题下标定，换环境可能挂，这也是它被 `gui` marker 隔离的原因
+- `.venv/Scripts/python.exe -m pytest -q` — 全量 82 个
 - 改 GUI 打包面（互斥量、图标路径）或 `packaging/` 时：在 cmd 里跑 `packaging\build.bat` 重建（PyInstaller + ISCC），产出 `dist\installer\imapbackup-gui-setup-<版本>.exe`。本机起不了 Inno 生成的 setup exe，装卸验证只能用户双击
 - 视觉确认用 `.scratch/tkinter-gui/*_probe.py`（真窗口 + GDI 截图，不起网）：外观判断走这里，回归断言不再往 `.scratch/` 加
 - `.scratch/tkinter-gui/real_gui_e2e.py` 需要真实 IMAP 账号，**默认不跑**（QQ 限流激进）
@@ -106,7 +106,8 @@
 - CLI 的 Spinner 在 stdout 非 TTY 或 quiet 模式自动禁用；GUI 同理——通过 `report` 回调（结构化 dict）拿进度、`should_stop` 回调协作停止，**不要向 stdout 写进度**
 - GUI 线程模型：工作线程跑 连接→枚举→扫描→下载→logout，`queue` 回投，UI 用 `after(100ms)` 轮询；**工作线程绝不碰 widget**
 - GUI 单实例互斥量：`imapbackup_gui.py` 的 `APP_MUTEX_NAME` 与 `packaging/imapbackup-gui.iss` 的 `AppMutex` **必须逐字一致**（安装/卸载器靠它探测运行中的实例），改一处必须同步另一处
-- GUI 按钮图标：彩色图形（开始按钮绿三角 `PLAY_ICON_COLOR`、停止按钮红方块 `STOP_ICON_COLOR`）由代码用 `PhotoImage` 逐像素画，**不引图片资产**（字体字形只有一种颜色、且禁用态会被系统灰盖掉，所以字形做不到）。位图必须由 Python 侧持引用，否则被 GC 后图标变空白。尺寸由 `_icon_size()` 从字体行高推导、不封顶，图标始终比文字矮一点。加载动画只**一套帧与节奏**（`SPINNER_FRAMES` 盲文点阵 + `SPINNER_INTERVAL_MS`，连接与备份都经 `_set_loading_frame()` 出帧，改一处两处一起变），但两个按钮各有一条帧链与 job 槽（`_connect_spinner_tick` / `_run_spinner_tick`），**要改节奏改常量、要改观感改共用出帧函数，别只改其中一条链**（用户要求两处加载图标一致；备份中开始按钮撤图标、文案变「正在备份…」）。两个按钮不设 `-width`：带图标的 `tk.Button` 里该选项按像素解释、纯文字时按字符数，写死会塌成图标宽
+- GUI 按钮图标：彩色图形（开始按钮绿三角 `PLAY_ICON_COLOR`、停止按钮红方块 `STOP_ICON_COLOR`）由代码用 `PhotoImage` 逐像素画，**不引图片资产**（字体字形只有一种颜色、且禁用态会被系统灰盖掉，所以字形做不到）。位图必须由 Python 侧持引用，否则被 GC 后图标变空白。尺寸由 `_icon_size()` 从字体行高推导、不封顶，图标始终比文字矮一点。加载动画只**一套帧与节奏**（`SPINNER_FRAMES` 盲文点阵 + `SPINNER_INTERVAL_MS`，连接与备份都经 `_set_loading_frame()` 出帧，改一处两处一起变），帧链只有两条：`_connect_spinner_tick` 管连接按钮，`_run_spinner_tick` 管运行/停止中、按 `self.stopping` 决定把帧画在开始按钮还是停止按钮上（job 槽 `_run_spinner_job`），**要改节奏改常量、要改观感改共用出帧函数，别只改其中一条链**（用户要求两处加载图标一致）。两个按钮不设 `-width`：带图标的 `tk.Button` 里该选项按像素解释、纯文字时按字符数，写死会塌成图标宽。**加载态不能把 image 撤成 `""`**：Tk 的按钮请求高度随「有没有 image」变（同一按钮实测有图 28px / 无图 30px，与文案是中文还是盲文帧无关），撤掉图标会让按钮比旁边那颗高一块——换 `_blank_icon()` 的同尺寸全透明占位，图标槽一直占着、只换里面的像素。回归断言 `tests/test_gui_smoke.py::test_loading_buttons_keep_their_height`
+- GUI「停止中」（点了停止、工作线程还在收尾）：协作式停止（ADR 0003）只在下一条消息/下一个文件夹前生效，卡在对端最坏要等 socket 超时（约 1 分钟），所以这段窗口必须给反馈——`_on_stop` 置 `self.stopping` 并把转圈挪到停止按钮上（「⠋ 正在停止…」，红方块换透明占位），开始按钮退回静止外观（仍禁用），状态行 `_set_status("")` 只清文案（行**不**收回：版本号留在原处，收尾写「已停止：…」时不跳版），配置区提示换 `STOPPING_HINT_TEXT`。完成/停止/失败三种结局与帧链自愈分支都复位两颗按钮（`_end_run_controls` 与 `_run_spinner_tick` 的退出分支 → `_restore_start_button` / `_restore_stop_button`，自愈分支连配置区提示一起刷回）。文案里不要出现「暂停」——ADR 0003 已否决暂停/续传。回归断言 `tests/test_gui_smoke.py::test_stopping_feedback_covers_buttons_status_line_and_hint` 与 `test_stopping_then_failing_restores_the_controls`
 - GUI 右边界基线：内容左边距与右边距都是 8px（上半区 `outer` 与下半区 `run` 都 `pack(padx=8)`），**单个面板不要再给自己加右 padx**——「邮箱文件夹」面板曾多留 8px，于是它的边框比下方区域窄一块、面板内滚条又比下方滚条左 13px；面板里的竖直滚条右边不留白、贴住面板边框线（与「邮件列表/运行日志」页签里的滚条一致）。`tests/test_gui_smoke.py::test_right_edges_share_one_baseline` 用控件间相对坐标锁住这三条关系，动布局先跑它
 - 「邮箱文件夹」面板的滚轮：**窗口级单入口**——`root.bind("<MouseWheel>", _on_wheel)`（root 的路径就是主窗口内每个控件的 toplevel bindtag），事件控件沿 `.master` 上溯命中 `folder_group` 才接管、否则返回 `None` 放行（节奏与下方「邮件列表」的 1 行/格一致；运行日志约 2.4 行/格是 Tk Text 的默认，未动）。**别改回**绑在画布上：Tk 只把事件投给指针正下方的控件、不冒泡，绑画布时行里的 Label/Frame 收不到，面板 90% 面积滚不动（这正是当初的现象）。面板内滚条另绑同一个入口并 `return "break"`，压掉 `TScrollbar` 自带的 4 units（实测≈98px，比内容区快）——`break` 也会挡掉 root 那条，所以滚条必须由这个函数自己完成滚动。一格 = `FOLDER_WHEEL_ROWS` 行（当前 1 行，与下方邮件列表同节奏；用户 2026-09-21 定），**按行对齐**靠画布 `yscrollincrement`＝行距（`_sync_folder_row_increment` 由 `folder_inner` 的 `<Configure>` 驱动；重建当刻量到的是 Tk 占位值，量不到就归 0），顺带滚条箭头一格也成一整行、拖滚条同样停在行边界；不足一格的 delta 按 `WHEEL_DELTA` 累加（高分辨率鼠标/触摸板）。回归断言 `tests/test_gui_smoke.py::test_folder_panel_wheel_covers_the_whole_panel`，动滚轮/布局先跑它
 - **日志：CLI 与 GUI 共用同一日文件**（ADR 0005）。路径/格式常量与 `make_log_file_handler()` 工厂在 `imapbackup312.py`，两个入口**各自安装** handler——共享构造，不共享安装。CLI 把 console 级别下沉到 StreamHandler 自身（`basicConfig(level=DEBUG)` 只是放行 root，否则 `--quiet` 会在 logger 层把 INFO 全丢掉），文件 handler 恒 INFO，所以 `--quiet` 只压 stderr、不削弱文件。失败/异常/中断走**不传播**的 `imapbackup.runlog` logger，只进文件：`SystemExit` 的消息解释器已打到 stderr，再打一遍就是重复。**argparse 阶段在 `configure_logging` 之前，参数校验类失败天然不入日志**，这是有意的。日志目录建不出来时工厂返回 `None`，降级为不写文件并警告到 stderr，**备份照常跑**
