@@ -739,3 +739,83 @@ def test_right_edges_share_one_baseline(app):
     # 跨面板观感：文件夹滚条与邮件列表滚条的右边线差 ≤ 2px（实测 1px，差在 ttk 主题内边距）
     assert abs(right(app.folder_scroll) - right(app.tree_scroll)) <= 2, (
         right(app.folder_scroll), right(app.tree_scroll))
+
+
+def test_folder_panel_wheel_covers_the_whole_panel(app):
+    """「邮箱文件夹」面板整块都能用滚轮滚：一格 1 行（与下方邮件列表同节奏）、停在行边界。
+
+    回归自：滚轮只有画布自己那一小条空白和面板内滚条吃得到，文件夹名字、箭头、行容器、
+    工具栏、面板边框全无反应（Tk 把事件投给指针正下方的控件、不冒泡到画布）；面板内滚条
+    还自带 TScrollbar 一格 4 units 的更快步长；不足一格的 delta（高分辨率鼠标/触摸板）一律
+    没反应。断言走控件间的相对关系，行距现量，不钉 26 这类机器相关的像素值。
+
+    本用例会把文件夹列表换成 32 个文件夹行（要能滚出可视区），排在文件最后，不影响前面的用例。
+    """
+    many = [(f"Box{i:02d}", f"Box{i:02d}.mbox", f"Box{i:02d}", f"Box{i:02d}") for i in range(30)]
+    many += [("Group", "Group.mbox", "Group", "Group"),
+             ("Group/Leaf", "Group.Leaf.mbox", "Group/Leaf", "Group/Leaf")]
+    app.events.put(("folders_loaded", (many, V)))
+    pump(app)
+    app.root.geometry("960x736")
+    app.root.update()
+
+    canvas = app.folder_canvas
+    frames = app.folder_inner.winfo_children()          # 顶层节点框
+    pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
+    assert len(frames) > 9 and pitch > 0, (len(frames), pitch)
+    notch = g.FOLDER_WHEEL_ROWS * pitch                 # 一格该滚的距离（行距现量，不钉像素值）
+
+    def at_top():
+        canvas.yview_moveto(0)
+        app._wheel_accum = 0                            # 不把上一格没攒满的余量带进下一个子用例
+        app.root.update()
+        return canvas.canvasy(0)
+
+    def wheel(target, delta=-g.WHEEL_DELTA):
+        before = canvas.canvasy(0)
+        target.event_generate("<MouseWheel>", delta=delta, x=5, y=5)
+        app.root.update()
+        return canvas.canvasy(0) - before
+
+    toolbar = [w for w in app.folder_group.winfo_children() if isinstance(w, tk.Frame)][0]
+    assert at_top() == 0
+    for name, target in [("文件夹名字", app.folder_rows[0]["check_btn"]),
+                         ("父节点箭头", app._folder_nodes[("Group",)]["arrow"]),
+                         ("行容器", app.folder_inner),
+                         ("画布空白条", canvas),
+                         ("工具栏按钮", toolbar.winfo_children()[0]),
+                         ("面板边框", app.folder_group),
+                         ("面板内滚条", app.folder_scroll)]:
+        at_top()
+        # 面板内任何落点都是同一节奏：一格 1 行（滚条的原生 4 units 已被压掉）
+        assert wheel(target) == notch, name
+
+    # 一格滚得多远由常量定：两格一次给完就滚两倍
+    at_top()
+    assert wheel(app.folder_rows[0]["check_btn"], delta=-2 * g.WHEEL_DELTA) == 2 * notch
+
+    # 按行对齐：滚完停在行边界上
+    at_top()
+    wheel(app.folder_rows[0]["check_btn"])
+    assert canvas.canvasy(0) % pitch == 0, canvas.canvasy(0)
+
+    # 不足一格的 delta 攒够一格才滚（高分辨率鼠标/触摸板）
+    at_top()
+    for _ in range(4):
+        wheel(app.folder_rows[0]["check_btn"], delta=-g.WHEEL_DELTA // 4)
+    assert canvas.canvasy(0) == notch
+
+    # 面板外（下方两页签）的滚轮不该动到文件夹面板，且它们自己照常滚
+    app.notebook.select(app.tree.master)                # 只有选中的页签才真的会滚
+    for _ in range(20):
+        app.tree.insert("", "end", values=("from", "主题", "2026-09-21", "INBOX", "1 KB"))
+    app.root.update()
+    for outside in (app.tree, app.log_text):
+        at_top()
+        assert wheel(outside) == 0
+    assert app.tree.yview()[0] > 0                      # 枚举没被窗口级入口吞掉：邮件列表自己滚了
+
+    # 空树把单位归回 0，别把上次的行距留给没有内容的树
+    app._rebuild_folders([])
+    app.root.update()
+    assert int(canvas.cget("yscrollincrement")) == 0

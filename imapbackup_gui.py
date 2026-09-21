@@ -89,6 +89,9 @@ CHECK_PARTIAL = "⊟"    # U+229F 部分勾选
 ARROW_OPEN = "▾"       # U+25BE 已展开
 ARROW_CLOSED = "▸"     # U+25B8 已折叠
 ARROW_SLOT_W = 16      # 箭头占位宽度，保证各级名称左边缘对齐
+FOLDER_ROW_PAD_Y = 1   # 文件夹行的上下 pady(px)；行距 = 行高 + 2×它，滚轮的按行对齐按行距算
+WHEEL_DELTA = 120      # Windows 一格滚轮的标准 delta；高分辨率鼠标/触摸板给更小的值，须累加
+FOLDER_WHEEL_ROWS = 1  # 一格滚轮滚几行：与下方「邮件列表」的 1 行/格（Tk Treeview 默认）一致
 EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
 FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
 LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
@@ -250,6 +253,7 @@ class BackupApp:
         self._fit_font: tkfont.Font | None = None  # 量字宽的缓存，两行标签同一默认字体
         self._tip: tk.Toplevel | None = None
         self._tip_after: str | None = None  # 待发的气泡 after id，leave 时取消
+        self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
 
         self._build_config_area()
         self._build_run_area()
@@ -384,10 +388,18 @@ class BackupApp:
         self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
         self.folder_inner = tk.Frame(self.folder_canvas)
         self._folder_win = self.folder_canvas.create_window((0, 0), window=self.folder_inner, anchor="nw")
-        self.folder_inner.bind("<Configure>", lambda _e: self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all")))
+        self.folder_inner.bind("<Configure>", self._on_folder_inner_configure)
         self.folder_canvas.bind("<Configure>", lambda e: self.folder_canvas.itemconfigure(self._folder_win, width=e.width))
-        self.folder_canvas.bind("<MouseWheel>", self._on_folder_wheel)
         self.folder_ph = self._empty_hint(group, FOLDER_PLACEHOLDER_TEXT, 1, 0)
+
+        # 滚轮只有一个入口：绑在 root 上（root 的路径是主窗口内所有控件的 toplevel bindtag）。
+        # 绑在画布上只有画布自己那一小条空白生效——Tk 把事件投给指针正下方的控件、不冒泡，
+        # 行里的 Label/Frame 不会转给画布，于是面板 90% 面积滚不动。作用域仅限主窗口：
+        # 工具气泡与原生对话框的 toplevel tag 是它们自己的路径，不受影响。
+        self.root.bind("<MouseWheel>", self._on_wheel)
+        # 面板内的滚条得单独接管：TScrollbar 的类绑定自带一格 4 units（实测≈98px，比内容区快），
+        # 控件级绑定先于类绑定执行，靠返回 "break" 把它压掉，全场节奏才一致。
+        folder_scroll.bind("<MouseWheel>", self._on_wheel)
 
     # --------------------------------------------------------------- run area
 
@@ -591,6 +603,12 @@ class BackupApp:
 
         self.folder_rows.sort(key=lambda r: r["path"])
         self._render_folder_checks()
+        self._wheel_accum = 0   # 换了棵树，上一棵树没攒满一格的滚轮余量作废
+        # 行距的同步挂在前面的 folder_inner <Configure> 上：此刻新建控件的几何还没结算，
+        # 只有布局铺完那次 Configure 量到的行距才是真的（重建时量到的是 Tk 占位值）。空树
+        # 不会再触发那个事件，所以这里显式归零——不然上次的行距会留在没内容的树上。
+        if not self.folder_rows:
+            self._sync_folder_row_increment()
         # 重建会铺满树区，空态提示得跟着收掉；一个文件夹都没解析出来时重新挂回
         self._toggle_hint(self.folder_ph, not self.folder_rows)
 
@@ -606,7 +624,7 @@ class BackupApp:
         host = parent["kids"] if parent is not None else self.folder_inner
 
         frame = tk.Frame(host)
-        frame.pack(anchor="w", fill="x", pady=1)
+        frame.pack(anchor="w", fill="x", pady=FOLDER_ROW_PAD_Y)
         node["frame"] = frame
 
         row = tk.Frame(frame)
@@ -708,6 +726,39 @@ class BackupApp:
             text = f"{glyph} {node['label']}"
             for r in node["rows"]:
                 r["check_btn"].configure(text=text)
+
+    def _on_folder_inner_configure(self, _event=None) -> None:
+        """树区内容重排后（首次铺满、加载完文件夹、窗口缩放）同步滚动范围与行距。"""
+        self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all"))
+        self._sync_folder_row_increment()
+
+    def _measure_folder_row_pitch(self) -> int:
+        """任取一对相邻的行容器，用它们的真实间距当行距（含 pady、随 DPI 与字体走）。
+
+        行容器是 folder_inner 的顶层节点框，也是各节点 kids 框里的子节点框——先看主宿主，
+        只有一个顶层节点时（都挂在那一个父节点下面）退到它的 kids 框里量。量不到返回 0：
+        新建控件的请求尺寸与位置要等布局铺完才可信，重建那一刻量到的是 Tk 的占位值。
+        """
+        hosts = [self.folder_inner] + [n["kids"] for n in self._folder_nodes.values()]
+        for host in hosts:
+            frames = host.winfo_children()
+            # 折叠节点的 kids 框没上屏，里头的控件还留着折叠前的位置，不能拿来量
+            if len(frames) > 1 and (host is self.folder_inner or host.winfo_ismapped()):
+                pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
+                if pitch > 0:
+                    return pitch
+        return 0
+
+    def _sync_folder_row_increment(self) -> None:
+        """让画布的 1 unit = 1 行：滚轮一格（`FOLDER_WHEEL_ROWS` 行）才落在行边界上，
+        滚条箭头一格也正好一行。
+
+        量不到行距（还没有行 / 布局没铺完）时归 0，单位回到 Tk 默认的窗口高的 1/10。
+        只在与画布现值不同时才写，免得布局事件里反复做无谓的配置。
+        """
+        pitch = self._measure_folder_row_pitch()
+        if pitch != int(self.folder_canvas.cget("yscrollincrement")):
+            self.folder_canvas.configure(yscrollincrement=pitch)
 
     # ------------------------------------------------------- stale state rules
 
@@ -812,8 +863,35 @@ class BackupApp:
         self._render_folder_checks()
         self._update_start_state()
 
-    def _on_folder_wheel(self, event) -> None:
-        self.folder_canvas.yview_scroll(int(-event.delta / 120), "units")
+    def _on_wheel(self, event) -> str | None:
+        """主窗口唯一的滚轮入口：指针落在「邮箱文件夹」面板内才接管，面板外原样放行。
+
+        返回 "break" 才是真的中断后续 bindtag（Tkinter 拿回调返回值与 "break" 比较）——面板内的
+        滚条正是靠它压掉 TScrollbar 的类绑定；反过来 break 也会挡掉 root 上这条，所以滚条必须
+        绑到这个函数、由它自己完成滚动。
+        """
+        if not self._wheel_in_folder_panel(event.widget):
+            return None  # 邮件列表 / 运行日志的滚轮节奏一字不动
+        self._wheel_accum += event.delta
+        notches = int(self._wheel_accum / WHEEL_DELTA)  # 向零取整：正反两个方向都不吃掉余量
+        if notches:
+            self._wheel_accum -= notches * WHEEL_DELTA
+            self.folder_canvas.yview_scroll(-notches * FOLDER_WHEEL_ROWS, "units")
+        return "break"  # 不满一格也到此为止，别漏给面板内滚条的原生步长
+
+    def _wheel_in_folder_panel(self, widget) -> bool:
+        """事件控件沿 .master 上溯，看它是否属于「邮箱文件夹」面板。
+
+        画布内嵌的行控件父链是：Label → 行容器 → 节点框 → folder_inner → canvas → folder_group。
+        用控件路径比而不是对象同一性：event.widget 与 folder_group 可能是同一条路径的两个 Python
+        对象。也不用 winfo_containing：那取决于窗口位置与层叠顺序，测试里不稳。
+        """
+        panel = str(self.folder_group)
+        while widget is not None:
+            if str(widget) == panel:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
 
     def _on_open_log_dir(self) -> None:
         try:
