@@ -1153,42 +1153,71 @@ def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
     app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
 
 
-def test_log_context_menu_copies_all(app, monkeypatch):
-    """日志菜单只有「复制全部」：空日志置灰，一键把整份日志放进剪贴板；无全选也无 Ctrl+A。"""
+def test_log_context_menu_copies_selection_and_all(app, monkeypatch):
+    """日志菜单两项：「复制」划选段 + 「复制全部」整篇；无选区/空日志各自置灰；菜单里没有「全选」。"""
     assert [app._log_menu.entrycget(i, "label") for i in range(app._log_menu.index("end") + 1)] == [
-        g.MENU_COPY_ALL_LABEL]
+        g.MENU_COPY_LABEL, g.MENU_COPY_ALL_LABEL]
     assert app.log_text.bind("<Button-3>")
-    assert not app.log_text.bind("<Control-a>")
 
-    # 清空日志（应用的写入路径就是先 normal 再 disabled）：空日志时菜单项置灰
+    # 日志页签摆到前台，并让窗口先完成一次映射：合成的鼠标/按键事件要有真实窗口才派发——
+    # 孤立跑本用例（前面的用例都没跑）时少了这一步，事件会被丢掉，菜单状态停在默认值上。
+    app.notebook.select(app.log_text.master)
+    app.root.update()
+    app._pump()  # 先放完队列里排着的启动日志，断言期间不再冒新行
+
+    # 清空日志（应用的写入路径就是先 normal 再 disabled）：空日志两项都无可复制的内容
     app.log_text.configure(state="normal")
     app.log_text.delete("1.0", "end")
     app.log_text.configure(state="disabled")
 
     popups = []
     monkeypatch.setattr(app._log_menu, "tk_popup", lambda x, y: popups.append((x, y)))
-    app.log_text.event_generate("<Button-3>", x=5, y=5)
-    app.root.update()
+
+    def popup_state():
+        """走真实入口弹一次菜单，返回（复制, 复制全部）的灰化状态。"""
+        app.log_text.event_generate("<Button-3>", x=5, y=5)
+        app.root.update()
+        return (app._log_menu.entrycget(g.MENU_COPY_LABEL, "state"),
+                app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state"))
+
+    assert popup_state() == ("disabled", "disabled")
     assert len(popups) == 1, popups
-    assert app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state") == "disabled"
 
     app._append_log("第一行")
     app._append_log("第二行")
 
-    # 全选已按拍板移除：本程序不加 Ctrl+A，按下也不该出现整篇选区（Tk 8.6 的 Text 类绑定里没有它）
-    app.notebook.select(app.log_text.master)
+    # Tk 平台把 <<SelectAll>> 映射到 Ctrl+A（探针实测，issues/13）：日志上按下去会整篇选中。
+    # 这不是菜单项（菜单里没有「全选」），是平台默认；顺手用它验证「有选区 → 复制可用」
     app.log_text.focus_force()
     app.log_text.event_generate("<Control-a>")
     app.root.update()
-    assert app.log_text.tag_ranges("sel") == (), app.log_text.tag_ranges("sel")
-
-    app.log_text.event_generate("<Button-3>", x=5, y=5)
+    whole = app.log_text.get("sel.first", "sel.last")
+    assert whole.rstrip("\n").splitlines() == ["第一行", "第二行"], repr(whole)  # 选中到 end，尾部带空行
+    assert popup_state() == ("normal", "normal"), popups
+    app._log_copy_selection()
     app.root.update()
-    assert len(popups) == 2, popups
-    assert app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state") == "normal"
+    assert app.root.clipboard_get() == whole, repr(app.root.clipboard_get())
 
-    # 整份日志进剪贴板：`end-1c` 的原文以换行结尾（探针实测，issues/13），按行核对而不是逐字比对
+    # 清掉选区：「复制」回到灰，「复制全部」不受影响（`end-1c` 以换行结尾，按行核对而不是逐字比对）
+    app.log_text.tag_remove("sel", "1.0", "end")
+    app.root.update()
+    assert popup_state() == ("disabled", "normal"), popups
     app._log_copy_all()
     app.root.update()
     assert app.root.clipboard_get().splitlines() == ["第一行", "第二行"], repr(app.root.clipboard_get())
+
+    # 只读态照样能鼠标划选（探针实测，issues/13）：在第 1 行里从第 1 个字拖到第 3 个字前，
+    # 「复制」只复制这一小段——坐标用 bbox 现算，不依赖字体宽度
+    sx, sy = app.log_text.bbox("1.0")[:2]
+    ex, ey = app.log_text.bbox("1.2")[:2]
+    app.log_text.event_generate("<Button-1>", x=sx + 1, y=sy + 2)
+    app.log_text.event_generate("<B1-Motion>", x=ex - 1, y=ey + 2)
+    app.log_text.event_generate("<ButtonRelease-1>", x=ex - 1, y=ey + 2)
+    app.root.update()
+    dragged = app.log_text.get("sel.first", "sel.last")
+    assert dragged == "第一", repr(dragged)
+    assert popup_state() == ("normal", "normal"), popups
+    app._log_copy_selection()
+    app.root.update()
+    assert app.root.clipboard_get() == "第一", repr(app.root.clipboard_get())
     assert app.log_text.cget("state") == "disabled", "复制不该动到日志的只读态"

@@ -966,6 +966,7 @@ class BackupApp:
         self._tree_menu.add_command(label=MENU_COPY_LABEL, command=self._copy_menu_cell)
 
         self._log_menu = tk.Menu(self.root, tearoff=0)
+        self._log_menu.add_command(label=MENU_COPY_LABEL, command=self._log_copy_selection)
         self._log_menu.add_command(label=MENU_COPY_ALL_LABEL, command=self._log_copy_all)
 
     def _bind_context_menu(self, *widgets: tk.Widget) -> None:
@@ -1049,14 +1050,22 @@ class BackupApp:
         self._set_clipboard(str(values[col_idx - 1]))
 
     def _on_log_context(self, event) -> str:
-        """运行日志右键：弹窗只含「复制全部」，弹窗前按日志是否为空刷新灰化。"""
+        """运行日志右键：「复制」（选中段）与「复制全部」，弹窗前刷新两项灰化。"""
         self._refresh_log_menu_state()
         self._log_menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
     def _refresh_log_menu_state(self) -> None:
+        """没划选时「复制」灰；日志为空时「复制全部」灰。"""
+        has_sel = bool(self.log_text.tag_ranges("sel"))
+        self._log_menu.entryconfigure(MENU_COPY_LABEL, state="normal" if has_sel else "disabled")
         empty = self.log_text.index("end-1c") == "1.0"
         self._log_menu.entryconfigure(MENU_COPY_ALL_LABEL, state="disabled" if empty else "normal")
+
+    def _log_copy_selection(self) -> None:
+        """复制日志里划选的那一段；只读态照样能划选（探针见 issues/13）。"""
+        if sel := self.log_text.tag_ranges("sel"):
+            self._set_clipboard(self.log_text.get(sel[0], sel[1]))
 
     def _log_copy_all(self) -> None:
         self._set_clipboard(self.log_text.get("1.0", "end-1c"))
