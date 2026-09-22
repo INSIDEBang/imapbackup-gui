@@ -102,6 +102,12 @@ PROGRESS_MIN_WIDTH = 80           # 进度条地板宽度(px)：计数文字变�
 TIP_DELAY_MS = 400                # 悬停多久后弹气泡
 TIP_BG = "#ffffe0"                # 气泡底色（经典 tooltip 浅黄）
 TIP_WRAP = 600                    # 气泡内容最长宽度(px)，超出自动换行
+# 右键菜单：输入框 / 邮件列表 / 运行日志三类各一张 tk.Menu，启动时各建一次复用。
+# 三项编辑动作全部走与键盘快捷键相同的类绑定路径；不含「全选」（见 issues/13）。
+MENU_CUT_LABEL = "剪切"
+MENU_COPY_LABEL = "复制"
+MENU_PASTE_LABEL = "粘贴"
+MENU_COPY_ALL_LABEL = "复制全部"
 
 
 class QueueLogHandler(logging.Handler):
@@ -267,9 +273,12 @@ class BackupApp:
         self._tip: tk.Toplevel | None = None
         self._tip_after: str | None = None  # 待发的气泡 after id，leave 时取消
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
+        self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
+        self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
 
         self._build_config_area()
         self._build_run_area()
+        self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._apply_connect_state()
         self._update_start_state()
@@ -351,6 +360,8 @@ class BackupApp:
         self.conn_hint.grid_remove()
 
         self._bind_enter(self.user_entry, self.server_entry, self.port_entry, self.password_entry)
+        # 密码框与其他输入框同菜单同路径；show="*" 下复制走 Tk 原生导出，得到的是显示字符（星号）而非明文
+        self._bind_context_menu(self.user_entry, self.server_entry, self.port_entry, self.password_entry)
 
         for var in (self.server_var, self.user_var, self.password_var):
             var.trace_add("write", self._check_stale)
@@ -374,6 +385,7 @@ class BackupApp:
         self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var, command=self._update_start_state)).pack(side="left", padx=(12, 0))
 
         self._bind_enter(self.outdir_entry)
+        self._bind_context_menu(self.outdir_entry)
 
     def _build_folder_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="邮箱文件夹")
@@ -456,6 +468,9 @@ class BackupApp:
         # 内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview 的类绑定
         # 先完成换选，本入口识别出「是行」就放行；其余落点（列表空白、列标题、配置区……）一律清掉。
         self.root.bind("<Button-1>", self._on_click_clear_selection)
+        # 右键与左键互不干扰：点在行上弹「复制单元格」菜单（先按 Windows 惯例选中该行），
+        # 空白与列标题不弹也不动选中——判断与副作用都在 _prepare_tree_popup 里。
+        self.tree.bind("<Button-3>", self._on_tree_context)
 
         log_tab = tk.Frame(self.notebook)
         self.notebook.add(log_tab, text="运行日志")
@@ -469,6 +484,8 @@ class BackupApp:
         log_scroll = ttk.Scrollbar(log_tab, orient="vertical", command=self.log_text.yview)
         log_scroll.grid(row=1, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
+        # 日志只读但可选中：右键「复制全部」把整份日志放进剪贴板，排障转发用
+        self.log_text.bind("<Button-3>", self._on_log_context)
 
         # 按钮 side=right 钉在右端：进度条隐藏时它们也在右边，放出后位置纹丝不动
         self.count_var = tk.StringVar(value=self._count_full)
@@ -935,6 +952,126 @@ class BackupApp:
             os.startfile(str(LOG_DIR))  # type: ignore[attr-defined]
         except Exception as e:
             messagebox.showerror("无法打开", f"日志文件夹打开失败：{e}", parent=self.root)
+
+    # ------------------------------------------------------------ context menus
+
+    def _build_context_menus(self) -> None:
+        """三张右键菜单各建一次复用；不进 _register——那是配置区控件的启停跟踪名单，菜单不是控件。"""
+        self._entry_menu = tk.Menu(self.root, tearoff=0)
+        self._entry_menu.add_command(label=MENU_CUT_LABEL, command=lambda: self._entry_edit("<<Cut>>"))
+        self._entry_menu.add_command(label=MENU_COPY_LABEL, command=lambda: self._entry_edit("<<Copy>>"))
+        self._entry_menu.add_command(label=MENU_PASTE_LABEL, command=lambda: self._entry_edit("<<Paste>>"))
+
+        self._tree_menu = tk.Menu(self.root, tearoff=0)
+        self._tree_menu.add_command(label=MENU_COPY_LABEL, command=self._copy_menu_cell)
+
+        self._log_menu = tk.Menu(self.root, tearoff=0)
+        self._log_menu.add_command(label=MENU_COPY_ALL_LABEL, command=self._log_copy_all)
+
+    def _bind_context_menu(self, *widgets: tk.Widget) -> None:
+        """仿 _bind_enter：给一组输入框挂同一个右键入口。"""
+        for widget in widgets:
+            widget.bind("<Button-3>", self._on_entry_context)
+
+    def _on_entry_context(self, event) -> str:
+        """输入框右键：记下弹窗目标、按当前选区与剪贴板刷新灰化，再弹菜单。"""
+        self._entry_menu_target = event.widget
+        self._refresh_entry_menu_state(event.widget)
+        self._entry_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _refresh_entry_menu_state(self, entry: tk.Entry) -> None:
+        """弹窗前的灰化：无选中文本时剪切/复制灰；剪贴板没有文本或控件已禁用时粘贴灰。
+
+        禁用判断读控件自己的 state：备份运行中 _set_config_enabled 把配置区整片关掉，
+        禁用态的输入框做不出选区，三项自然都该灰。
+        """
+        editable = str(entry.cget("state")) != "disabled"
+        has_sel = editable and entry.selection_present()
+        for label in (MENU_CUT_LABEL, MENU_COPY_LABEL):
+            self._entry_menu.entryconfigure(label, state="normal" if has_sel else "disabled")
+        self._entry_menu.entryconfigure(MENU_PASTE_LABEL,
+                                        state="normal" if editable and self._clipboard_has_text() else "disabled")
+
+    def _entry_edit(self, event_name: str) -> None:
+        """菜单动作直通 Entry 的类绑定（<<Cut>>/<<Copy>>/<<Paste>>），与 Ctrl+X/C/V 完全同效。"""
+        if self._entry_menu_target is not None:
+            self._entry_menu_target.event_generate(event_name)
+
+    def _on_tree_context(self, event) -> str:
+        """邮件列表右键：行上弹「复制」菜单，空白与列标题不弹。"""
+        if not self._prepare_tree_popup(event):
+            return "break"
+        self._tree_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _prepare_tree_popup(self, event) -> bool:
+        """弹窗前的全部判断与副作用：定位单元格、右键先选中该行（Windows 惯例）、记下复制目标。
+
+        返回 False 表示这个落点没有可操作的内容（行下方空白、列标题、列号识别不出），
+        不弹菜单也不动选中。
+        """
+        target = self._tree_context_target(event)
+        if target is None:
+            return False
+        if target[0] not in self.tree.selection():
+            self.tree.selection_set(target[0])
+        self._tree_menu_target = target
+        return True
+
+    def _tree_context_target(self, event) -> tuple[str, int] | None:
+        """右键落点 → (行 id, 列号 1 起)；空白与无效列号返回 None。
+
+        identify 只吃控件内坐标（与 x_root/y_root 无关），测试可直接喂伪事件。
+        """
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        column = self.tree.identify_column(event.x)  # "#1"…"#5"；树列区与无效位置是 "" 或 "#0"
+        try:
+            col_idx = int(column[1:])
+        except ValueError:
+            return None
+        if not 1 <= col_idx <= len(self.tree.item(row, "values")):
+            return None
+        return row, col_idx
+
+    def _copy_menu_cell(self) -> None:
+        """邮件菜单的「复制」：复制弹窗当刻定位的单元格。"""
+        if self._tree_menu_target is not None:
+            self._copy_cell(*self._tree_menu_target)
+
+    def _copy_cell(self, row: str, col_idx: int) -> None:
+        """把某行第 col_idx 列（1 起）的文本放进剪贴板。"""
+        values = self.tree.item(row, "values")
+        if not 1 <= col_idx <= len(values):
+            return  # 菜单挂着时列表被别的事件换过内容：宁可不复制，也不抛
+        self._set_clipboard(str(values[col_idx - 1]))
+
+    def _on_log_context(self, event) -> str:
+        """运行日志右键：弹窗只含「复制全部」，弹窗前按日志是否为空刷新灰化。"""
+        self._refresh_log_menu_state()
+        self._log_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _refresh_log_menu_state(self) -> None:
+        empty = self.log_text.index("end-1c") == "1.0"
+        self._log_menu.entryconfigure(MENU_COPY_ALL_LABEL, state="disabled" if empty else "normal")
+
+    def _log_copy_all(self) -> None:
+        self._set_clipboard(self.log_text.get("1.0", "end-1c"))
+
+    def _set_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _clipboard_has_text(self) -> bool:
+        """剪贴板为空或只有非文本格式（如图片）时 clipboard_get 抛 TclError，一并视为不可粘贴。"""
+        try:
+            self.root.clipboard_get()
+        except tk.TclError:
+            return False
+        return True
 
     # ------------------------------------------------------------- run control
 

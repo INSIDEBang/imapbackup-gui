@@ -1010,3 +1010,185 @@ def test_row_selection_clears_on_click_outside(app):
     click(app, app.tree, *row_center(ids[2]))
     assert app.tree.selection() == (ids[2],), app.tree.selection()
     app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
+
+
+def test_entry_context_menu_has_three_actions(app, monkeypatch):
+    """五个输入框共用一张右键菜单：剪切/复制/粘贴，动作与快捷键同一路径；不含全选，密码框一视同仁。
+
+    菜单的 tk_popup 在测试里必须换替身：真菜单会 grab，没前台窗口的 runner 会悬死。
+    """
+    assert [app._entry_menu.entrycget(i, "label") for i in range(app._entry_menu.index("end") + 1)] == [
+        g.MENU_CUT_LABEL, g.MENU_COPY_LABEL, g.MENU_PASTE_LABEL]
+    for entry in (app.user_entry, app.server_entry, app.port_entry, app.password_entry, app.outdir_entry):
+        assert entry.bind("<Button-3>"), entry
+
+    popups = []
+    monkeypatch.setattr(app._entry_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    app.user_var.set("alice@example.com")
+    app.user_entry.select_range(0, "end")
+    app.user_entry.event_generate("<Button-3>", x=5, y=5)
+    app.root.update()
+    assert len(popups) == 1, popups
+    assert str(app._entry_menu_target) == str(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "normal"
+
+    # 剪切与粘贴走 Entry 的 <<Cut>>/<<Paste>> 类绑定，与 Ctrl+X/V 完全同效
+    app._entry_edit("<<Cut>>")
+    app.root.update()
+    assert app.user_entry.get() == "", app.user_entry.get()
+    assert app.root.clipboard_get() == "alice@example.com"
+    app._entry_edit("<<Paste>>")
+    app.root.update()
+    assert app.user_entry.get() == "alice@example.com"
+
+    # 密码框与普通输入框同菜单同路径；复制走 Tk 原生 <<Copy>>。探针实测（Tk 8.6.12，issues/13）：
+    # show="*" 的选区按显示形态导出——复制到的是星号，不是明文；框里存的仍是明文
+    app.password_var.set("hunter2")
+    app._entry_menu_target = app.password_entry
+    app.password_entry.select_range(0, "end")
+    app._entry_edit("<<Copy>>")
+    app.root.update()
+    assert app.root.clipboard_get() == "*" * len("hunter2"), app.root.clipboard_get()
+    assert app.password_entry.get() == "hunter2"
+
+
+def test_entry_context_menu_items_grey_out(app, monkeypatch):
+    """灰化口径：无选区剪切/复制灰；剪贴板为空或控件被禁用（备份运行中）时粘贴灰。"""
+    app._entry_menu_target = app.user_entry
+    app.user_entry.select_range(0, "end")
+
+    # 空剪贴板用替身触发真实的 TclError 分支，不动系统剪贴板
+    def no_text():
+        raise tk.TclError("CLIPBOARD clipboard is empty or has no text")
+
+    monkeypatch.setattr(app.root, "clipboard_get", no_text)
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "normal"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+
+    monkeypatch.undo()
+    app.root.clipboard_append("剪贴板内容")
+    app.root.update()
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "normal"
+
+    app.user_entry.select_clear()
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+
+    # 备份运行中配置区整片禁用（走真实路径 _set_config_enabled）：三项全灰
+    app._set_config_enabled(False)
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+    app._set_config_enabled(True)
+
+
+def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
+    """邮件列表右键：行上弹「复制」并复制所在单元格（点哪列复制哪格）；空白与列标题不弹。
+
+    右键先选中该行（Windows 惯例）；已在多选组里的行保留整组选中。
+    """
+    assert [app._tree_menu.entrycget(i, "label") for i in range(app._tree_menu.index("end") + 1)] == [
+        g.MENU_COPY_LABEL]
+    assert app.tree.bind("<Button-3>")
+    assert not app.folder_canvas.bind("<Button-3>"), "文件夹面板按拍板不加右键"
+
+    app._clear_message_rows()
+    for i in range(1, 3):
+        app.events.put(("message", _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 2, ids
+    values = tuple(str(v) for v in app.tree.item(ids[0], "values"))
+    assert values[1] == "主题1" and values[1] != values[4], values
+
+    popups = []
+    monkeypatch.setattr(app._tree_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+
+    def cell_center(iid, column):
+        x, y, w, h = app.tree.bbox(iid, column)
+        return x + w // 2, y + h // 2
+
+    # 主题列与大小列各右键一次：复制值随落点列走，不是整行
+    for column, col_idx in (("#2", 2), ("#5", 5)):
+        cx, cy = cell_center(ids[0], column)
+        assert app.tree.identify_column(cx) == column, (app.tree.identify_column(cx), column)
+        before = len(popups)
+        app.tree.event_generate("<Button-3>", x=cx, y=cy)
+        app.root.update()
+        assert len(popups) == before + 1, popups
+        assert app.tree.selection() == (ids[0],), app.tree.selection()
+        assert app._tree_menu_target == (ids[0], col_idx), app._tree_menu_target
+        app._copy_menu_cell()
+        app.root.update()
+        assert app.root.clipboard_get() == values[col_idx - 1], app.root.clipboard_get()
+
+    # 行下方空白与列标题：不弹，也不清选中
+    app.tree.selection_set(ids[0])
+    bx, by, _bw, bh = app.tree.bbox(ids[-1])
+    blank_y = by + bh + 4
+    assert app.tree.identify_row(blank_y) == ""
+    app.tree.event_generate("<Button-3>", x=bx, y=blank_y)
+    app.root.update()
+    head_y = 2
+    assert app.tree.identify("region", 30, head_y) == "heading"
+    app.tree.event_generate("<Button-3>", x=30, y=head_y)
+    app.root.update()
+    assert len(popups) == 2, popups
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 右键另一行：先选中它；已多选时再右键组内一行：保留整组
+    cx, cy = cell_center(ids[1], "#2")
+    app.tree.event_generate("<Button-3>", x=cx, y=cy)
+    app.root.update()
+    assert app.tree.selection() == (ids[1],), app.tree.selection()
+    app.tree.selection_set(ids[0], ids[1])
+    app.tree.event_generate("<Button-3>", x=cx, y=cy)
+    app.root.update()
+    assert set(app.tree.selection()) == {ids[0], ids[1]}, app.tree.selection()
+
+    app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
+
+
+def test_log_context_menu_copies_all(app, monkeypatch):
+    """日志菜单只有「复制全部」：空日志置灰，一键把整份日志放进剪贴板；无全选也无 Ctrl+A。"""
+    assert [app._log_menu.entrycget(i, "label") for i in range(app._log_menu.index("end") + 1)] == [
+        g.MENU_COPY_ALL_LABEL]
+    assert app.log_text.bind("<Button-3>")
+    assert not app.log_text.bind("<Control-a>")
+
+    # 清空日志（应用的写入路径就是先 normal 再 disabled）：空日志时菜单项置灰
+    app.log_text.configure(state="normal")
+    app.log_text.delete("1.0", "end")
+    app.log_text.configure(state="disabled")
+
+    popups = []
+    monkeypatch.setattr(app._log_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    app.log_text.event_generate("<Button-3>", x=5, y=5)
+    app.root.update()
+    assert len(popups) == 1, popups
+    assert app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state") == "disabled"
+
+    app._append_log("第一行")
+    app._append_log("第二行")
+
+    # 全选已按拍板移除：本程序不加 Ctrl+A，按下也不该出现整篇选区（Tk 8.6 的 Text 类绑定里没有它）
+    app.notebook.select(app.log_text.master)
+    app.log_text.focus_force()
+    app.log_text.event_generate("<Control-a>")
+    app.root.update()
+    assert app.log_text.tag_ranges("sel") == (), app.log_text.tag_ranges("sel")
+
+    app.log_text.event_generate("<Button-3>", x=5, y=5)
+    app.root.update()
+    assert len(popups) == 2, popups
+    assert app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state") == "normal"
+
+    # 整份日志进剪贴板：`end-1c` 的原文以换行结尾（探针实测，issues/13），按行核对而不是逐字比对
+    app._log_copy_all()
+    app.root.update()
+    assert app.root.clipboard_get().splitlines() == ["第一行", "第二行"], repr(app.root.clipboard_get())
+    assert app.log_text.cget("state") == "disabled", "复制不该动到日志的只读态"
