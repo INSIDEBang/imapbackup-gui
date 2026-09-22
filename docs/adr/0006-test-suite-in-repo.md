@@ -35,4 +35,4 @@ Status: accepted
 - **`logging.basicConfig` 在 root 已有 handler 时是 no-op**，这是测试里最反直觉的一层：pytest 的 `LogCaptureHandler` 占着 root，所以 `configure_logging` 里的 `basicConfig` 从不安装 stderr 的 StreamHandler，CLI 的 INFO 记录只进了 pytest 的日志缓冲，`listing()` 之类的 stderr 解析一律拿到空串。`conftest.py` 的 `clean_logging` 因此只摘 **FileHandler**、保留 pytest 自己的捕获 handler——失败时还能看到 `Captured log call`；console 输出由 `console_capture` 显式装一条 `StreamHandler` 供解析。
 - 版本号未改动，仍为 1.6.0。
 - CI 缺席期间，`AGENTS.md` 的验证顺序是本套件的唯一执行约定。
-- 本篇里的测试数、断言数与 `.scratch/` 清单都是写下时的快照（套件还在长，数字会漂）：当前数值以 `AGENTS.md` 为准，ADR 只负责记录当时的决策与代价。
+- 本篇里的测试数、断言数与 `.scratch/` 清单都是写下时的快照（套件还在长，数字会漂）：当前数值以套件实跑为准，ADR 只负责记录当时的决策与代价。

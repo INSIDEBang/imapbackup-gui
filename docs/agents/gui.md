@@ -36,6 +36,17 @@
 - `test_right_edges_share_one_baseline`
 - `test_folder_panel_wheel_covers_the_whole_panel`
 
+## 邮件列表选中
+
+- 选中高亮没有消费者（没有绑定、右键菜单或基于选中的动作），只是「刚点过哪一行」的视觉痕迹：鼠标落在邮件行之外的任何地方都清空它。
+- 入口也是窗口级：`root.bind("<Button-1>", _on_click_clear_selection)`；用 `identify_row(event.y)` 区分行与空白——空白、列标题、分隔区都返回空串，一次调用覆盖全部非行区域。
+- 例外两个：邮件行本身（换选与多选归 Treeview 类绑定，处理器不插手）与邮件列表自己的滚条（拖它多半是在查看选中行）。Alt-Tab 切窗口不清——用 `<FocusOut>` 会破坏这一点。
+- 处理器只清理、不拦截：返回 `None`，不返回 `"break"`；控件匹配用路径比较而非对象同一性，理由同滚轮入口。
+
+相关回归：
+
+- `test_row_selection_clears_on_click_outside`
+
 ## 单实例与验证
 
 `APP_MUTEX_NAME` 必须与 `packaging/imapbackup-gui.iss` 的 `AppMutex` 完全一致。修改 GUI 后至少运行：
