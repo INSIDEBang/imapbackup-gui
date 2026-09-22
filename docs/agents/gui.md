@@ -38,14 +38,31 @@
 
 ## 邮件列表选中
 
-- 选中高亮没有消费者（没有绑定、右键菜单或基于选中的动作），只是「刚点过哪一行」的视觉痕迹：鼠标落在邮件行之外的任何地方都清空它。
-- 入口也是窗口级：`root.bind("<Button-1>", _on_click_clear_selection)`；用 `identify_row(event.y)` 区分行与空白——空白、列标题、分隔区都返回空串，一次调用覆盖全部非行区域。
+- 选中高亮没有动作消费者：基于选中的操作一个也没有（右键菜单复制的是落点单元格，不是选中行），它只是「刚点过哪一行」的视觉痕迹。
+- 左键入口是窗口级：`root.bind("<Button-1>", _on_click_clear_selection)`；用 `identify_row(event.y)` 区分行与空白——空白、列标题、分隔区都返回空串，一次调用覆盖全部非行区域。
 - 例外两个：邮件行本身（换选与多选归 Treeview 类绑定，处理器不插手）与邮件列表自己的滚条（拖它多半是在查看选中行）。Alt-Tab 切窗口不清——用 `<FocusOut>` 会破坏这一点。
 - 处理器只清理、不拦截：返回 `None`，不返回 `"break"`；控件匹配用路径比较而非对象同一性，理由同滚轮入口。
+- 右键走另一条链路（Button-3）：点行时右键菜单先选中该行（Windows 惯例），点空白既不弹菜单也不动选中。
 
 相关回归：
 
 - `test_row_selection_clears_on_click_outside`
+
+## 右键菜单
+
+- 三类区域（输入框 / 邮件列表 / 运行日志）各一张 `tk.Menu`，在 `_build_context_menus` 里启动时各建一次复用；菜单不进 `_register`——那是配置区控件的启停跟踪名单。
+- 全部菜单都不含「全选」，日志也不绑 Ctrl+A（用户 2026-09-22 拍板移除）；`docs/agents/gui.md` 这张约定表是它唯一的家。
+- 输入框（含密码框，一视同仁）：三项 `剪切/复制/粘贴`，动作直通 `<<Cut>>/<<Copy>>/<<Paste>>` 虚拟事件——与 Ctrl+X/C/V 走同一条类绑定路径。弹窗前 `_refresh_entry_menu_state` 按「选区 / 剪贴板可读 / 控件 state」刷新灰化：无选区灰切复，剪贴板空或控件被 `_set_config_enabled` 关掉时灰粘贴。密码框 `show="*"` 下复制出的是显示字符（星号）而非明文——Tk 原生按显示形态导出选区（探针实测，见 issues/13）。
+- 邮件列表：`_on_tree_context` 只在行上弹「复制」，复制右键落点的那一格（`identify_row` + `identify_column`，列号 1 起），不依赖选中；空白与列标题不弹、也不动选中；落点行不在选中集里时先选中它。定位、右键选中与记下目标全在 `_prepare_tree_popup` 里，与 `tk_popup` 分离。
+- 运行日志：只有「复制全部」，取 `get("1.0", "end-1c")`（以换行结尾），日志为空时置灰。
+- 三类菜单的定位/灰化/动作 handler 都与 `tk_popup` 分离；测试里 `tk_popup` 必须换成替身——真菜单会 grab，无前台窗口的 runner 会悬死。
+
+相关回归：
+
+- `test_entry_context_menu_has_three_actions`
+- `test_entry_context_menu_items_grey_out`
+- `test_tree_context_menu_copies_the_clicked_cell`
+- `test_log_context_menu_copies_all`
 
 ## 单实例与验证
 
