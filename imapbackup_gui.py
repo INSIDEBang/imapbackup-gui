@@ -452,6 +452,10 @@ class BackupApp:
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
         self.list_ph = self._empty_hint(list_tab, LIST_PLACEHOLDER_TEXT, 0, 0)
+        # 选中高亮只有一个出口，与滚轮同一套「窗口级单入口」：绑在 root 上（root 的路径是主窗口
+        # 内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview 的类绑定
+        # 先完成换选，本入口识别出「是行」就放行；其余落点（列表空白、列标题、配置区……）一律清掉。
+        self.root.bind("<Button-1>", self._on_click_clear_selection)
 
         log_tab = tk.Frame(self.notebook)
         self.notebook.add(log_tab, text="运行日志")
@@ -907,6 +911,24 @@ class BackupApp:
                 return True
             widget = getattr(widget, "master", None)
         return False
+
+    def _on_click_clear_selection(self, event) -> None:
+        """主窗口唯一的左键入口：鼠标落在邮件行之外，就清掉邮件列表的选中高亮。
+
+        只清理、不拦截：返回 None 让 bindtag 链照常走完（点行/换选是 Treeview 类绑定的事，
+        本入口在类绑定之后执行，那时选中已就位，识别出「是行」就别动它）。例外两个：邮件列表
+        自己的滚条——拖它多半是在查看选中行，不能误伤；Alt-Tab 切窗口不产生 Button-1，天然
+        不清，与资源管理器「切走再回来高亮还在」一致。
+        """
+        if not self.tree.selection():
+            return  # 无选中是常态：提前退出，之后的点击零代价
+        widget = str(event.widget)  # 路径比较而非对象同一性，理由同 _wheel_in_folder_panel
+        if widget == str(self.tree):
+            if self.tree.identify_row(event.y):
+                return  # 点中行：换选或多选交给 Treeview 自己
+        elif widget == str(self.tree_scroll):
+            return
+        self.tree.selection_set()  # 不带参数即清空选中
 
     def _on_open_log_dir(self) -> None:
         try:

@@ -92,8 +92,10 @@ def pump(instance, n=3):
         instance.root.update_idletasks()
 
 
-def click(instance, widget):
-    widget.event_generate("<Button-1>")
+def click(instance, widget, x=None, y=None):
+    """点一下；给了坐标就点在该点（Treeview 的行与空白靠坐标区分）。"""
+    extra = {} if x is None else {"x": x, "y": y}
+    widget.event_generate("<Button-1>", **extra)
     instance.root.update()
 
 
@@ -939,3 +941,72 @@ def test_loading_buttons_keep_their_height(app):
     app._end_run_controls()
     assert_stop_button_idle(app)
     assert_start_button_idle(app)
+
+
+def test_row_selection_clears_on_click_outside(app):
+    """选中高亮只属于「刚点过的那一行」：点非行区域即清空；换选、Ctrl 多选与列表滚条是例外。
+
+    回归自：点行选中（蓝底）没问题，但点别的地方清不掉。这个用例排在全文件最后，按模块
+    docstring 的约定不打断前面那条状态链。
+    """
+    app._clear_message_rows()
+    for i in range(1, 4):
+        app.events.put(("message", _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
+                                            size=100, msg_id=f"<{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 3, len(ids)
+
+    def row_center(iid):
+        x, y, w, h = app.tree.bbox(iid)
+        return x + w // 2, y + h // 2
+
+    # 点另一行：换选是 Treeview 的原生行为，本入口不许插手
+    app.tree.selection_set(ids[0])
+    x, y = row_center(ids[1])
+    assert app.tree.identify_row(y) == ids[1], (app.tree.identify_row(y), ids[1])
+    click(app, app.tree, x, y)
+    assert app.tree.selection() == (ids[1],), app.tree.selection()
+
+    # Ctrl+点第三行：多选同样是原生行为，本入口不许把它压回单选
+    click_x, click_y = row_center(ids[2])
+    app.tree.event_generate("<Control-Button-1>", x=click_x, y=click_y)
+    app.root.update()
+    assert set(app.tree.selection()) == {ids[1], ids[2]}, app.tree.selection()
+
+    # 点最后一行下方的空白：清空
+    bx, by, _bw, bh = app.tree.bbox(ids[-1])
+    blank_y = by + bh + 4
+    assert app.tree.identify_row(blank_y) == "", app.tree.identify_row(blank_y)
+    click(app, app.tree, bx, blank_y)
+    assert app.tree.selection() == (), app.tree.selection()
+
+    # 点列标题：列标题当前没有任何功能，也算「非行区域」
+    head_y = 2
+    assert app.tree.identify("region", 30, head_y) == "heading", app.tree.identify("region", 30, head_y)
+    app.tree.selection_set(ids[0])
+    click(app, app.tree, 30, head_y)
+    assert app.tree.selection() == (), app.tree.selection()
+
+    # 点列表外的控件（配置区输入框、文件夹面板空白与其滚条）：同样清空
+    for target in (app.user_entry, app.folder_canvas, app.folder_scroll):
+        app.tree.selection_set(ids[0])
+        click(app, target)
+        assert app.tree.selection() == (), (target, app.tree.selection())
+
+    # 例外一：邮件列表自己的滚条——点击多半是在滚动查看选中行
+    app.tree.selection_set(ids[0])
+    app.tree_scroll.event_generate("<Button-1>")
+    app.tree_scroll.event_generate("<ButtonRelease-1>")
+    app.root.update()
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 例外二：滚轮滚动不是点击，同样不清
+    app.tree.event_generate("<MouseWheel>", delta=-g.WHEEL_DELTA, x=5, y=5)
+    app.root.update()
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 清过之后点行照常选中：清高亮不是关掉交互
+    click(app, app.tree, *row_center(ids[2]))
+    assert app.tree.selection() == (ids[2],), app.tree.selection()
+    app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
