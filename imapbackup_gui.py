@@ -516,13 +516,14 @@ class BackupApp:
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
         log_toolbar = tk.Frame(log_frame)
-        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=4, pady=2)
+        # 左边距与板面留白、文件夹面板的工具栏同值（6px），一行按钮与板面左缘对齐
+        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=6, pady=(2, 0))
         tk.Button(log_toolbar, text="打开日志文件夹", command=self._on_open_log_dir).pack(side="left")
-        # 与树同理：Text 自带的 1px 下沉边框会与包裹线隔 1px 成双线（探针实测，issues/15），
-        # 压平后页签里只剩包裹层一条线
-        self.log_text = tk.Text(log_frame, state="disabled", wrap="none", background="#ffffff",
-                                borderwidth=0)
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        # 日志板保留 Tk 自带的下沉边框：那圈凹陷边缘是「白色板面」的视觉标识，压平后白底与
+        # 灰底直接相接很违和（用户复核，issues/15）。四周留出灰边距，免得这圈边缘与包裹边框
+        # 贴成双线——与「邮箱文件夹」面板里画布的 6/4 留白同构；右侧贴住滚条、不留缝。
+        self.log_text = tk.Text(log_frame, state="disabled", wrap="none", background="#ffffff")
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_scroll = log_scroll
         log_scroll.grid(row=1, column=1, sticky="ns")

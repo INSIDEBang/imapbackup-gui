@@ -758,6 +758,16 @@ def test_right_edges_share_one_baseline(app):
         assert right(frame) == right(app.folder_group), (right(frame), right(app.folder_group))
         assert right(frame) - right(scroll) == border, (
             frame, right(frame), right(scroll), border)
+
+    # 日志板自己的下沉边框与四周留白：白板不能像树那样压平——去掉凹陷边缘后白底与灰底直接
+    # 相接很违和（用户复核，issues/15）；留白同时保证这圈边缘不与包裹边框贴成双线，
+    # 右侧则贴住滚条不留缝。
+    assert int(app.log_text.cget("borderwidth")) >= 1, app.log_text.cget("borderwidth")
+    assert str(app.log_text.cget("relief")) == "sunken", app.log_text.cget("relief")
+    assert left(app.log_text) > left(app.log_frame) + border, (
+        left(app.log_text), left(app.log_frame), border)
+    assert right(app.log_text) == left(app.log_scroll), (right(app.log_text), left(app.log_scroll))
+
     app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
     app.root.update()
 
