@@ -28,7 +28,8 @@
 
 - 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框。
 - 两个页签（邮件列表 / 运行日志）各有一层与「邮箱文件夹」面板同款的外包边框（`_panel_style_frame()`：groove + 面板同值 `borderwidth`）：滚条包在框内、贴着边框内侧，日志页签的工具栏也在框内，空态提示挂框内。页签内只保留这一条线——Treeview 走派生样式 `Mail.Treeview`（layout 只留 `treearea`）压平自带 field 边框，`log_text` 用 `borderwidth=0` 压平自带下沉边框（不压就是双线，探针实测，见 issues/15）。
-- 包裹边框右线与面板右线差 3px：notebook 客户区的右内缩（vista 主题实测；widget `padding`、样式 layout 与 `borderwidth` 都吃不动，见 issues/15）。视觉上两线连续，`test_right_edges_share_one_baseline` 的容差按实测留到 3px。
+- notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，且会在客户区四周自绘 1px 淡边线（原生绘制，颜色改不了：`TNotebook` 只有 `-tabmargins` 可配，换 background/bordercolor/lightcolor/darkcolor 像素纹丝不动，见 issues/15）。因此容器 `run` 的左右内边距用 7/5 把它补掉（按钮行与状态行用 `padx=(1, 3)` 保留 8px 边距），页签包裹边框的左/右线才与配置区左边线、上方面板右线**精确重合**；`tab_edge_left`/`tab_edge_right` 两条背景色窄条（1px/3px，`place` 在 notebook 上、随其几何走）盖掉客户区内缩带，页签里就只剩包裹边框这一条线。
+- `test_right_edges_share_one_baseline` 断言上述三处均为**精确相等**，并断言窄条宽度 == 实测内缩：换主题或 DPI 让内缩变了，会在这里炸出来，提醒同步改窄条宽度与容器内边距。
 - 邮箱文件夹滚轮使用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；沿事件控件的 `.master` 向上判断是否位于 `folder_group`，其他区域返回 `None` 放行。
 - 面板内滚条也调用 `_on_wheel` 并返回 `"break"`，由该入口完成滚动，避免 `TScrollbar` 默认步长覆盖统一节奏。
 - 每格滚动 `FOLDER_WHEEL_ROWS` 行；`yscrollincrement` 使用实测行距。不足一格的 delta 按 `WHEEL_DELTA` 累积，以支持高分辨率滚轮和触摸板。
