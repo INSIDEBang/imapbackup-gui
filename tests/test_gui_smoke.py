@@ -92,8 +92,10 @@ def pump(instance, n=3):
         instance.root.update_idletasks()
 
 
-def click(instance, widget):
-    widget.event_generate("<Button-1>")
+def click(instance, widget, x=None, y=None):
+    """点一下；给了坐标就点在该点（Treeview 的行与空白靠坐标区分）。"""
+    extra = {} if x is None else {"x": x, "y": y}
+    widget.event_generate("<Button-1>", **extra)
     instance.root.update()
 
 
@@ -102,6 +104,13 @@ def press_enter(instance, widget):
     widget.focus_force()
     widget.event_generate("<Return>")
     instance.root.update()
+
+
+def stub_popup(monkeypatch, menu):
+    """替掉菜单的 tk_popup（真菜单会 grab 住键盘，后续合成事件全被它吃掉），记录弹出坐标。"""
+    popups = []
+    monkeypatch.setattr(menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    return popups
 
 
 def row_by(instance, foldername):
@@ -116,6 +125,23 @@ def row_tags(instance, iid):
     """tree.item(iid, "tags") 返回类型不稳定：无 tag 是空串、有 tag 是元组，统一成 list。"""
     tags = instance.tree.item(iid, "tags")
     return tags.split() if isinstance(tags, str) else list(tags)
+
+
+def icon_rgb(color: str) -> tuple:
+    """#rrggbb → Tk 的 (r, g, b)：按钮图标就是按这个色值逐像素画上去的。"""
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def assert_start_button_idle(instance):
+    """开始按钮回到静止态：文案与绿三角图标都回位。"""
+    assert instance.start_btn.cget("text") == g.START_BTN_LABEL
+    assert instance.start_btn.cget("image") == str(instance.start_icon)
+
+
+def assert_stop_button_idle(instance):
+    """停止按钮回到静止态：文案与红方块图标都回位。"""
+    assert instance.stop_btn.cget("text") == g.STOP_BTN_LABEL
+    assert instance.stop_btn.cget("image") == str(instance.stop_icon)
 
 
 class FakeBox:
@@ -149,10 +175,36 @@ def _message(folder="INBOX", index=1, total=23, **overrides):
 def test_window_initial_state(app):
     assert app.root.title() == "IMAP Backup GUI"
     assert str(app.start_btn.cget("state")) == "disabled"
+    # 两个按钮各自挂着一枚代码画的图标，静止态文案固定（改动前开始/停止按钮都是纯文字）
+    assert app.start_btn.cget("text") == g.START_BTN_LABEL
+    assert app.stop_btn.cget("text") == g.STOP_BTN_LABEL
+    assert app.start_btn.cget("image") == str(app.start_icon)
+    assert app.stop_btn.cget("image") == str(app.stop_icon)
     assert app.folder_ph.cget("text") == g.FOLDER_PLACEHOLDER_TEXT
     assert app.folder_ph.winfo_manager() == "grid"
     assert app.list_ph.cget("text") == g.LIST_PLACEHOLDER_TEXT
     assert app.list_ph.winfo_manager() == "grid"
+    # 两个页签各有一层与「邮箱文件夹」面板同款的外包边框；空态提示挂在框内
+    # （控件同一性在 tkinter 里不稳，按路径比较，理由同滚轮入口）
+    assert str(app.list_frame.master) == str(app.list_tab)
+    assert str(app.log_frame.master) == str(app.log_tab)
+    assert str(app.list_ph.master) == str(app.list_frame)
+
+
+def test_button_icons_are_code_drawn_in_color(app):
+    """图标是代码逐像素画进 PhotoImage 的彩色图形，不是字库字形。
+
+    字形只有一种颜色、且按钮禁用时会被系统灰盖掉，所以中心像素必须正好是指定色值，
+    并且不是透明像素（透明＝那块根本没画）。
+    """
+    size = app.start_icon.width()
+    assert size == app.stop_icon.width()
+    assert size == g._icon_size()
+    for icon, color in ((app.start_icon, g.PLAY_ICON_COLOR), (app.stop_icon, g.STOP_ICON_COLOR)):
+        center = size // 2
+        assert tuple(icon.get(center, center))[:3] == icon_rgb(color), (icon.get(center, center), color)
+        assert not icon.transparency_get(center, center)
+    assert app.start_icon.get(size // 2, size // 2) != app.stop_icon.get(size // 2, size // 2)
 
 
 def test_version_is_shared_and_status_bar_starts_on_one_row(app):
@@ -625,3 +677,744 @@ def test_ellipsis_tooltip_arms_only_when_truncated(app):
     app._on_tip_enter(_Ev(), app.status_var, lambda: app._status_full)
     app._on_tip_enter(_Ev(), app.count_var, lambda: app._count_full)
     assert app._tip_after is None and app._tip is None
+
+
+def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monkeypatch):
+    """备份中开始按钮把绿三角换成透明占位、显示「⠋ 正在备份…」，与连接按钮同一套帧与节奏。
+
+    帧推进（_run_spinner_tick / _set_loading_frame）与 after 调度是分开的，所以第 i 帧长什么样
+    可以直接断言，不必 sleep 等定时器。
+    """
+    for index in (0, 3, len(g.SPINNER_FRAMES) - 1):
+        app._set_loading_frame(app.start_btn, g.RUNNING_BTN_LABEL, index)
+        assert app.start_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.RUNNING_BTN_LABEL}"
+        app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, index)
+        assert app.connect_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.CONNECTING_BTN_LABEL}"
+
+    app.running = True
+    app._begin_run_ui()
+    text = str(app.start_btn.cget("text"))
+    assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+    assert app.start_btn.cget("image") == str(app.blank_icon)  # 绿三角让位给透明占位（撤成 "" 会矮/高一截）
+    assert str(app.start_btn.cget("state")) == "disabled"
+    assert str(app.stop_btn.cget("state")) == "normal"
+
+    app._end_run_controls()
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None
+    app._apply_connect_state()  # 上面借连接按钮验了共享帧，把它的文案交回状态机
+
+    # 自愈：有的路径直接把 running 置假、不走 _end_run_controls，帧推进函数得自己复位，
+    # 否则「正在备份…」会残留在按钮上
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()  # 停掉真实帧链，下面手动推进
+    app.running = False
+    app._run_spinner_tick(2)
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None
+
+    # 失败路径同样要走复位（messagebox 换替身，否则会弹真对话框）
+    monkeypatch.setattr(g, "messagebox", FakeBox())
+    app.running = True
+    app._begin_run_ui()
+    app.events.put(("run_failed", "boom"))
+    pump(app)
+    assert_start_button_idle(app)
+    assert app._run_spinner_job is None
+
+
+def test_right_edges_share_one_baseline(app):
+    """右边界基线：内容右边距 == 左边距，「邮箱文件夹」面板与下方区域同一条右边线。
+
+    用户口径：左边留多少，右边就留多少；面板内的滚条要紧贴面板边框线。回归自：面板曾
+    单独多留 8px 右留白、滚条自己再留 6px，于是面板边框比下方窄一块、滚条比下方滚条左 13px。
+    断言全走控件之间的相对关系，不钉绝对坐标，换 DPI/主题也成立。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+
+    def left(widget):
+        return widget.winfo_rootx()
+
+    def right(widget):
+        return widget.winfo_rootx() + widget.winfo_width()
+
+    # 上半区容器的左边距 vs 面板的右边距：两边都得是 8px
+    client_left = app.root.winfo_rootx()
+    client_right = client_left + app.root.winfo_width()
+    left_margin = left(app.folder_group.master) - client_left
+    right_margin = client_right - right(app.folder_group)
+    assert left_margin == right_margin == 8, (left_margin, right_margin)
+
+    # 面板内滚条贴住面板边框线：与面板内沿只差一个 borderwidth
+    border = int(app.folder_group.cget("borderwidth"))
+    assert right(app.folder_group) - right(app.folder_scroll) == border, (
+        right(app.folder_group), right(app.folder_scroll), border)
+
+    # 两个页签的包裹层同款：与面板同值的边框宽度；左缘落在配置区的 8px 基线上，右缘与上方面板
+    # 线**精确**重合（notebook 客户区的 1px/3px 内缩已由容器内边距补掉，探针见 issues/15）；
+    # 滚条贴包裹边框内侧。
+    for tab, frame, scroll in ((app.list_tab, app.list_frame, app.tree_scroll),
+                               (app.log_tab, app.log_frame, app.log_scroll)):
+        assert int(frame.cget("borderwidth")) == border, (frame, frame.cget("borderwidth"))
+        app.notebook.select(tab)  # 非当前页签的控件未映射，量不到几何
+        app.root.update()
+        assert left(frame) == left(app.folder_group.master), (
+            left(frame), left(app.folder_group.master))
+        assert right(frame) == right(app.folder_group), (right(frame), right(app.folder_group))
+        assert right(frame) - right(scroll) == border, (
+            frame, right(frame), right(scroll), border)
+
+    # 内外边框之间的留白处处 4px（用户口径：按最短的下边距统一）。日志板保留 Tk 自带的下沉
+    # 边框——压平后白底与灰底直接相接很违和（用户复核，issues/15）；右侧贴住滚条、不留缝。
+    assert int(app.log_text.cget("borderwidth")) >= 1, app.log_text.cget("borderwidth")
+    assert str(app.log_text.cget("relief")) == "sunken", app.log_text.cget("relief")
+    lf_left, lf_top = left(app.log_frame) + border, app.log_frame.winfo_rooty() + border
+    lf_bottom = app.log_frame.winfo_rooty() + app.log_frame.winfo_height() - border
+    assert left(app.log_text) - lf_left == 4, (left(app.log_text), lf_left)
+    assert lf_bottom - (app.log_text.winfo_rooty() + app.log_text.winfo_height()) == 4, (
+        lf_bottom, app.log_text.winfo_rooty() + app.log_text.winfo_height())
+    assert right(app.log_text) == left(app.log_scroll), (right(app.log_text), left(app.log_scroll))
+    # 滚条与板面同高（都在工具栏下面那一行）
+    assert (app.log_scroll.winfo_rooty(), app.log_scroll.winfo_height()) == (
+        app.log_text.winfo_rooty(), app.log_text.winfo_height()), (
+        app.log_scroll.winfo_rooty(), app.log_scroll.winfo_height(),
+        app.log_text.winfo_rooty(), app.log_text.winfo_height())
+    log_toolbar = [w for w in app.log_frame.winfo_children() if isinstance(w, tk.Frame)][0]
+    assert left(log_toolbar) == left(app.log_text), (left(log_toolbar), left(app.log_text))
+    assert left(log_toolbar) - lf_left == 4, (left(log_toolbar), lf_left)
+    assert log_toolbar.winfo_rooty() - lf_top == 4, (log_toolbar.winfo_rooty(), lf_top)
+
+    app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
+    app.root.update()
+
+    # 邮件列表：外框与面板同款（groove）；白色表格自己带凹陷边（`tree_wrap`，白底 sunken，
+    # 与日志板同一配方），整块贴着外框内沿、不留灰边距——凹陷边本身给滚条左缘那根 1px
+    # 白色反光条做对比（用户口径，issues/15）。树自己的 vista field 边框压平。
+    assert str(app.list_frame.cget("relief")) == "groove", app.list_frame.cget("relief")
+    assert (app.tree_wrap.cget("relief"), int(app.tree_wrap.cget("borderwidth")),
+            app.tree_wrap.cget("background")) == (
+        app.log_text.cget("relief"), int(app.log_text.cget("borderwidth")),
+        app.log_text.cget("background")), (
+        app.tree_wrap.cget("relief"), app.tree_wrap.cget("borderwidth"),
+        app.tree_wrap.cget("background"))
+    li_left, li_top = left(app.list_frame) + border, app.list_frame.winfo_rooty() + border
+    li_bottom = app.list_frame.winfo_rooty() + app.list_frame.winfo_height() - border
+    li_right = left(app.list_frame) + app.list_frame.winfo_width() - border
+    assert (left(app.tree_wrap), app.tree_wrap.winfo_rooty()) == (li_left, li_top), (
+        left(app.tree_wrap), app.tree_wrap.winfo_rooty(), li_left, li_top)
+    assert app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height() == li_bottom, (
+        app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height(), li_bottom)
+    # 树用 place 往左上各溢出 1px、右下各多铺 1px：白板左/上/下三条凹陷线被树盖住（与外框合成
+    # 一条线），右边留出白板自己那条 230 高光，正对滚条左缘的反光条（用户口径，issues/15）。
+    assert (left(app.tree), app.tree.winfo_rooty()) <= (li_left, li_top), (
+        left(app.tree), app.tree.winfo_rooty(), li_left, li_top)
+    assert app.tree.winfo_rooty() + app.tree.winfo_height() >= li_bottom, (
+        app.tree.winfo_rooty() + app.tree.winfo_height(), li_bottom)
+    # 右边留 1px 不盖：那就是白板自己那条 230 高光（盖多了会把滚条的对比线也吃掉）
+    assert right(app.tree) == right(app.tree_wrap) - 1, (right(app.tree), right(app.tree_wrap))
+    assert (right(app.tree_wrap), right(app.tree_scroll)) == (left(app.tree_scroll), li_right), (
+        right(app.tree_wrap), left(app.tree_scroll), right(app.tree_scroll), li_right)
+    assert (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height()) == (
+        li_top, li_bottom - li_top), (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height())
+    assert str(app.tree.cget("style")) == "Mail.Treeview", app.tree.cget("style")
+    mail_layout = str(g.ttk.Style().layout("Mail.Treeview"))
+    assert "treearea" in mail_layout and "field" not in mail_layout, mail_layout
+    assert "Treeview.field" in str(g.ttk.Style().layout("Treeview")), "只派生，不该动全局布局"
+
+    # 三条遮盖窄条正好盖住 notebook 客户区的左 1px / 右 3px / 下 3px 内缩带（尺寸 = 实测内缩）。
+    # 底边那条的淡线压在包裹边框外侧，底边会多出一道「突出」的线，必须一并盖掉。将来换主题或
+    # DPI 让内缩变了，这里会炸出来，提醒同步改窄条尺寸与容器内边距。
+    insets = (app.list_tab.winfo_rootx() - app.notebook.winfo_rootx(),
+              right(app.notebook) - right(app.list_tab),
+              (app.notebook.winfo_rooty() + app.notebook.winfo_height())
+              - (app.list_tab.winfo_rooty() + app.list_tab.winfo_height()))
+    assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width(),
+            app.tab_edge_bottom.winfo_height()) == insets, insets
+
+
+def test_folder_panel_wheel_covers_the_whole_panel(app):
+    """「邮箱文件夹」面板整块都能用滚轮滚：一格 1 行（与下方邮件列表同节奏）、停在行边界。
+
+    回归自：滚轮只有画布自己那一小条空白和面板内滚条吃得到，文件夹名字、箭头、行容器、
+    工具栏、面板边框全无反应（Tk 把事件投给指针正下方的控件、不冒泡到画布）；面板内滚条
+    还自带 TScrollbar 一格 4 units 的更快步长；不足一格的 delta（高分辨率鼠标/触摸板）一律
+    没反应。断言走控件间的相对关系，行距现量，不钉 26 这类机器相关的像素值。
+
+    本用例会把文件夹列表换成 32 个文件夹行（要能滚出可视区），排在文件最后，不影响前面的用例。
+    """
+    many = [(f"Box{i:02d}", f"Box{i:02d}.mbox", f"Box{i:02d}", f"Box{i:02d}") for i in range(30)]
+    many += [("Group", "Group.mbox", "Group", "Group"),
+             ("Group/Leaf", "Group.Leaf.mbox", "Group/Leaf", "Group/Leaf")]
+    app.events.put(("folders_loaded", (many, V)))
+    pump(app)
+    app.root.geometry("960x736")
+    app.root.update()
+
+    canvas = app.folder_canvas
+    frames = app.folder_inner.winfo_children()          # 顶层节点框
+    pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
+    assert len(frames) > 9 and pitch > 0, (len(frames), pitch)
+    notch = g.FOLDER_WHEEL_ROWS * pitch                 # 一格该滚的距离（行距现量，不钉像素值）
+
+    def at_top():
+        canvas.yview_moveto(0)
+        app._wheel_accum = 0                            # 不把上一格没攒满的余量带进下一个子用例
+        app.root.update()
+        return canvas.canvasy(0)
+
+    def wheel(target, delta=-g.WHEEL_DELTA):
+        before = canvas.canvasy(0)
+        target.event_generate("<MouseWheel>", delta=delta, x=5, y=5)
+        app.root.update()
+        return canvas.canvasy(0) - before
+
+    toolbar = [w for w in app.folder_group.winfo_children() if isinstance(w, tk.Frame)][0]
+    assert at_top() == 0
+    for name, target in [("文件夹名字", app.folder_rows[0]["check_btn"]),
+                         ("父节点箭头", app._folder_nodes[("Group",)]["arrow"]),
+                         ("行容器", app.folder_inner),
+                         ("画布空白条", canvas),
+                         ("工具栏按钮", toolbar.winfo_children()[0]),
+                         ("面板边框", app.folder_group),
+                         ("面板内滚条", app.folder_scroll)]:
+        at_top()
+        # 面板内任何落点都是同一节奏：一格 1 行（滚条的原生 4 units 已被压掉）
+        assert wheel(target) == notch, name
+
+    # 一格滚得多远由常量定：两格一次给完就滚两倍
+    at_top()
+    assert wheel(app.folder_rows[0]["check_btn"], delta=-2 * g.WHEEL_DELTA) == 2 * notch
+
+    # 按行对齐：滚完停在行边界上
+    at_top()
+    wheel(app.folder_rows[0]["check_btn"])
+    assert canvas.canvasy(0) % pitch == 0, canvas.canvasy(0)
+
+    # 不足一格的 delta 攒够一格才滚（高分辨率鼠标/触摸板）
+    at_top()
+    for _ in range(4):
+        wheel(app.folder_rows[0]["check_btn"], delta=-g.WHEEL_DELTA // 4)
+    assert canvas.canvasy(0) == notch
+
+    # 面板外（下方两页签）的滚轮不该动到文件夹面板，且它们自己照常滚
+    app.notebook.select(app.list_tab)                   # 只有选中的页签才真的会滚
+    for _ in range(20):
+        app.tree.insert("", "end", values=("from", "主题", "2026-09-21", "INBOX", "1 KB"))
+    app.root.update()
+    for outside in (app.tree, app.log_text):
+        at_top()
+        assert wheel(outside) == 0
+    assert app.tree.yview()[0] > 0                      # 枚举没被窗口级入口吞掉：邮件列表自己滚了
+
+    # 空树把单位归回 0，别把上次的行距留给没有内容的树
+    app._rebuild_folders([])
+    app.root.update()
+    assert int(canvas.cget("yscrollincrement")) == 0
+
+
+def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
+    """「停止中」三处同时换口径：停止按钮接手转圈、开始按钮退回静止外观、状态行清空、提示改文案。
+
+    回归自：点了停止之后开始按钮还在转圈「正在备份…」、停止按钮只是变灰且文案不变、
+    第二行还写着「正在停止…」（与按钮重复）——按钮和状态行都没有「我收到了」的反应。
+    现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
+    第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
+    """
+    app.connect_state = "connected"
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始/连接按钮那套用例同法）
+    app._set_counts("已备份 3 / 10")
+    app._set_status("备份 INBOX（7 封）", error=False)
+    counts_before, progress_before = app.count_var.get(), float(app.progress["value"])
+
+    app._on_stop()
+    assert app.stopping is True and app.stop_flag.is_set()
+    text = str(app.stop_btn.cget("text"))
+    assert text.endswith(g.STOPPING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+    assert app.stop_btn.cget("image") == str(app.blank_icon)  # 红方块让位给转圈文字
+    assert str(app.stop_btn.cget("state")) == "disabled"
+    assert_start_button_idle(app)                             # 开始按钮：文案与绿三角回位
+    assert str(app.start_btn.cget("state")) == "disabled"     # 但仍不可点（运行还没真正结束）
+    assert app.status_var.get() == "" and app._status_full == ""           # 第二行清空
+    assert app._msg_bar.winfo_manager() == "pack"             # 行不收回
+    assert app.version_label.winfo_manager() == "pack"        # 版本号留在原处
+    assert app.conn_hint.cget("text") == g.STOPPING_HINT_TEXT
+    # 停止这个动作本身不动第一行计数与进度条（工作线程在途的那封照常落盘、计数据实更新，
+    # 那是有意义的真实进展，这里不冻结它）
+    assert app.count_var.get() == counts_before, app.count_var.get()
+    assert float(app.progress["value"]) == progress_before
+
+    # 帧推进落在停止按钮上，开始按钮不再被写文案（全行只剩一个转圈）——走真函数，别抄它的映射
+    for index in (2, len(g.SPINNER_FRAMES) - 1):
+        app._run_spinner_tick(index)
+        assert app.stop_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.STOPPING_BTN_LABEL}"
+        assert_start_button_idle(app)
+
+    # 运行真正结束：按钮、状态行、提示全部回位，不残留「正在停止…」
+    app.events.put(("run_done", 5, 100, 9.0, True, 20))
+    pump(app)
+    assert app.running is False and app.stopping is False
+    assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)
+    assert app.conn_hint.cget("text") == "", app.conn_hint.cget("text")
+
+    # 不在运行时按停止（那时按钮本就禁用）不产生任何变化
+    app._on_stop()
+    assert app.stopping is False
+    assert_stop_button_idle(app)
+
+
+def test_stopping_then_failing_restores_the_controls(app, monkeypatch):
+    """停止中撞上运行失败：除弹窗外按钮与状态行也要完整复位（messagebox 换替身，别弹真框）。"""
+    monkeypatch.setattr(g, "messagebox", FakeBox())
+    app.connect_state = "connected"
+    app.running = True
+    app._begin_run_ui()
+    app._on_stop()
+    assert app.stopping is True
+
+    app.events.put(("run_failed", "boom"))
+    pump(app)
+    assert app.running is False and app.stopping is False
+    assert app._run_spinner_job is None
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)
+    assert app.status_var.get() == "备份失败，详见运行日志", app.status_var.get()
+
+
+def test_loading_buttons_keep_their_height(app):
+    """加载态不许改按钮高度：开始/停止/连接三颗按钮在加载与非加载之间高度一致。
+
+    回归自：用户看到运行中的开始按钮比旁边的停止按钮高一块。探针量出的根因不是盲文帧，
+    而是加载态把 image 撤成 ""——Tk 的按钮请求高度取决于「有没有 image」（同一按钮实测
+    有图 28px / 无图 30px，与文案是中文还是盲文帧无关）。修法是加载态换一枚全透明占位图
+    （blank_icon）：照旧占着「有 image」这个高度前提，宽度只留 1px——转圈符贴近左边框、
+    左右留白与静止态一样对称（回归自：占位按整图标宽时左边一大块空白、左松右紧）。
+    断言只比同一颗按钮的前后高度，不钉绝对像素值（异 DPI/主题下数字会变）。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+    idle = (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+    assert idle[0] == idle[1], idle                    # 同一行两颗按钮本就该等高
+    connect_idle = app.connect_btn.winfo_reqheight()
+
+    # 连接按钮：加载态只换文案（它本来就没有图标），高度不变
+    app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, 0)
+    app.root.update()
+    assert app.connect_btn.winfo_reqheight() == connect_idle
+    app._apply_connect_state()                         # 文案交回连接状态机
+
+    # 运行中：开始按钮的图标槽换成透明占位，高度与静止态一致，同行的停止按钮不被顶高
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()                            # 停掉真实帧链，免得它把文案改回别的帧
+    app.root.update()
+    assert app.start_btn.cget("image") == str(app.blank_icon), app.start_btn.cget("image")
+    # 占位只借高度、不占宽：1px 宽 × 图标高，转圈符才贴近左边框
+    assert (app.blank_icon.width(), app.blank_icon.height()) == (1, g._icon_size()), (
+        app.blank_icon.width(), app.blank_icon.height())
+    assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
+        app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+
+    # 停止中：转圈换到停止按钮上，两颗按钮的高度仍然一致
+    app._on_stop()
+    app.root.update()
+    assert app.stop_btn.cget("image") == str(app.blank_icon)
+    assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
+        app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
+
+    app._end_run_controls()
+    assert_stop_button_idle(app)
+    assert_start_button_idle(app)
+
+
+def test_row_selection_clears_on_click_outside(app):
+    """选中高亮只属于「刚点过的那一行」：点非行区域即清空；换选、Ctrl 多选与列表滚条是例外。
+
+    回归自：点行选中（蓝底）没问题，但点别的地方清不掉。这个用例排在全文件最后，按模块
+    docstring 的约定不打断前面那条状态链。
+    """
+    app._clear_message_rows()
+    for i in range(1, 4):
+        app.events.put(("message", _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
+                                            size=100, msg_id=f"<{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 3, len(ids)
+
+    def row_center(iid):
+        x, y, w, h = app.tree.bbox(iid)
+        return x + w // 2, y + h // 2
+
+    # 点另一行：换选是 Treeview 的原生行为，本入口不许插手
+    app.tree.selection_set(ids[0])
+    x, y = row_center(ids[1])
+    assert app.tree.identify_row(y) == ids[1], (app.tree.identify_row(y), ids[1])
+    click(app, app.tree, x, y)
+    assert app.tree.selection() == (ids[1],), app.tree.selection()
+
+    # Ctrl+点第三行：多选同样是原生行为，本入口不许把它压回单选
+    click_x, click_y = row_center(ids[2])
+    app.tree.event_generate("<Control-Button-1>", x=click_x, y=click_y)
+    app.root.update()
+    assert set(app.tree.selection()) == {ids[1], ids[2]}, app.tree.selection()
+
+    # 点最后一行下方的空白：清空
+    bx, by, _bw, bh = app.tree.bbox(ids[-1])
+    blank_y = by + bh + 4
+    assert app.tree.identify_row(blank_y) == "", app.tree.identify_row(blank_y)
+    click(app, app.tree, bx, blank_y)
+    assert app.tree.selection() == (), app.tree.selection()
+
+    # 点列标题：列标题当前没有任何功能，也算「非行区域」
+    head_y = 2
+    assert app.tree.identify("region", 30, head_y) == "heading", app.tree.identify("region", 30, head_y)
+    app.tree.selection_set(ids[0])
+    click(app, app.tree, 30, head_y)
+    assert app.tree.selection() == (), app.tree.selection()
+
+    # 点列表外的控件（配置区输入框、文件夹面板空白与其滚条）：同样清空
+    for target in (app.user_entry, app.folder_canvas, app.folder_scroll):
+        app.tree.selection_set(ids[0])
+        click(app, target)
+        assert app.tree.selection() == (), (target, app.tree.selection())
+
+    # 例外一：邮件列表自己的滚条——点击多半是在滚动查看选中行
+    app.tree.selection_set(ids[0])
+    app.tree_scroll.event_generate("<Button-1>")
+    app.tree_scroll.event_generate("<ButtonRelease-1>")
+    app.root.update()
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 例外二：滚轮滚动不是点击，同样不清
+    app.tree.event_generate("<MouseWheel>", delta=-g.WHEEL_DELTA, x=5, y=5)
+    app.root.update()
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 清过之后点行照常选中：清高亮不是关掉交互
+    click(app, app.tree, *row_center(ids[2]))
+    assert app.tree.selection() == (ids[2],), app.tree.selection()
+    app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
+
+
+def test_entry_context_menu_has_three_actions(app, monkeypatch):
+    """五个输入框共用一张右键菜单：剪切/复制/粘贴，动作与快捷键同一路径；不含全选，密码框一视同仁。
+
+    菜单的 tk_popup 在测试里必须换替身：真菜单会 grab，没前台窗口的 runner 会悬死。
+    """
+    assert [app._entry_menu.entrycget(i, "label") for i in range(app._entry_menu.index("end") + 1)] == [
+        g.MENU_CUT_LABEL, g.MENU_COPY_LABEL, g.MENU_PASTE_LABEL]
+    for entry in (app.user_entry, app.server_entry, app.port_entry, app.password_entry, app.outdir_entry):
+        assert entry.bind("<Button-3>"), entry
+
+    popups = stub_popup(monkeypatch, app._entry_menu)
+    app.user_var.set("alice@example.com")
+    app.user_entry.select_range(0, "end")
+    app.user_entry.event_generate("<Button-3>", x=5, y=5)
+    app.root.update()
+    assert len(popups) == 1, popups
+    assert str(app._entry_menu_target) == str(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "normal"
+
+    # 剪切与粘贴走 Entry 的 <<Cut>>/<<Paste>> 类绑定，与 Ctrl+X/V 完全同效
+    app._entry_edit("<<Cut>>")
+    app.root.update()
+    assert app.user_entry.get() == "", app.user_entry.get()
+    assert app.root.clipboard_get() == "alice@example.com"
+    app._entry_edit("<<Paste>>")
+    app.root.update()
+    assert app.user_entry.get() == "alice@example.com"
+
+    # 密码框与普通输入框同菜单同路径；复制走 Tk 原生 <<Copy>>。探针实测（Tk 8.6.12，issues/13）：
+    # show="*" 的选区按显示形态导出——复制到的是星号，不是明文；框里存的仍是明文
+    app.password_var.set("hunter2")
+    app._entry_menu_target = app.password_entry
+    app.password_entry.select_range(0, "end")
+    app._entry_edit("<<Copy>>")
+    app.root.update()
+    assert app.root.clipboard_get() == "*" * len("hunter2"), app.root.clipboard_get()
+    assert app.password_entry.get() == "hunter2"
+
+
+def test_entry_context_menu_items_grey_out(app, monkeypatch):
+    """灰化口径：无选区剪切/复制灰；剪贴板为空或控件被禁用（备份运行中）时粘贴灰。"""
+    app._entry_menu_target = app.user_entry
+    app.user_entry.select_range(0, "end")
+
+    # 空剪贴板用替身触发真实的 TclError 分支，不动系统剪贴板
+    def no_text():
+        raise tk.TclError("CLIPBOARD clipboard is empty or has no text")
+
+    monkeypatch.setattr(app.root, "clipboard_get", no_text)
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "normal"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+
+    monkeypatch.undo()
+    app.root.clipboard_append("剪贴板内容")
+    app.root.update()
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "normal"
+
+    app.user_entry.select_clear()
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+
+    # 备份运行中配置区整片禁用（走真实路径 _set_config_enabled）：三项全灰
+    app._set_config_enabled(False)
+    app._refresh_entry_menu_state(app.user_entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+    app._set_config_enabled(True)
+
+
+def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
+    """邮件列表右键：行上弹「复制」并复制所在单元格（点哪列复制哪格）；空白与列标题不弹。
+
+    右键先选中该行（Windows 惯例）；已在多选组里的行保留整组选中。
+    """
+    assert [app._tree_menu.entrycget(i, "label") for i in range(app._tree_menu.index("end") + 1)] == [
+        g.MENU_COPY_LABEL]
+    assert app.tree.bind("<Button-3>")
+    assert not app.folder_canvas.bind("<Button-3>"), "文件夹面板按拍板不加右键"
+
+    app._clear_message_rows()
+    for i in range(1, 3):
+        app.events.put(("message", _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 2, ids
+    values = tuple(str(v) for v in app.tree.item(ids[0], "values"))
+    assert values[1] == "主题1" and values[1] != values[4], values
+
+    popups = stub_popup(monkeypatch, app._tree_menu)
+
+    def cell_center(iid, column):
+        x, y, w, h = app.tree.bbox(iid, column)
+        return x + w // 2, y + h // 2
+
+    # 主题列与大小列各右键一次：复制值随落点列走，不是整行
+    for column, col_idx in (("#2", 2), ("#5", 5)):
+        cx, cy = cell_center(ids[0], column)
+        assert app.tree.identify_column(cx) == column, (app.tree.identify_column(cx), column)
+        before = len(popups)
+        app.tree.event_generate("<Button-3>", x=cx, y=cy)
+        app.root.update()
+        assert len(popups) == before + 1, popups
+        assert app.tree.selection() == (ids[0],), app.tree.selection()
+        assert app._tree_menu_target == (ids[0], col_idx), app._tree_menu_target
+        app._copy_menu_cell()
+        app.root.update()
+        assert app.root.clipboard_get() == values[col_idx - 1], app.root.clipboard_get()
+
+    # 行下方空白与列标题：不弹，也不清选中
+    app.tree.selection_set(ids[0])
+    bx, by, _bw, bh = app.tree.bbox(ids[-1])
+    blank_y = by + bh + 4
+    assert app.tree.identify_row(blank_y) == ""
+    app.tree.event_generate("<Button-3>", x=bx, y=blank_y)
+    app.root.update()
+    head_y = 2
+    assert app.tree.identify("region", 30, head_y) == "heading"
+    app.tree.event_generate("<Button-3>", x=30, y=head_y)
+    app.root.update()
+    assert len(popups) == 2, popups
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+
+    # 右键另一行：先选中它；已多选时再右键组内一行：保留整组
+    cx, cy = cell_center(ids[1], "#2")
+    app.tree.event_generate("<Button-3>", x=cx, y=cy)
+    app.root.update()
+    assert app.tree.selection() == (ids[1],), app.tree.selection()
+    app.tree.selection_set(ids[0], ids[1])
+    app.tree.event_generate("<Button-3>", x=cx, y=cy)
+    app.root.update()
+    assert set(app.tree.selection()) == {ids[0], ids[1]}, app.tree.selection()
+
+    app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
+
+
+def test_log_context_menu_copies_selection_and_all(app, monkeypatch):
+    """日志菜单两项：「复制」划选段 + 「复制全部」整篇；无选区/空日志各自置灰；菜单里没有「全选」。"""
+    assert [app._log_menu.entrycget(i, "label") for i in range(app._log_menu.index("end") + 1)] == [
+        g.MENU_COPY_LABEL, g.MENU_COPY_ALL_LABEL]
+    assert app.log_text.bind("<Button-3>")
+
+    # 日志页签摆到前台，并让窗口先完成一次映射：合成的鼠标/按键事件要有真实窗口才派发——
+    # 孤立跑本用例（前面的用例都没跑）时少了这一步，事件会被丢掉，菜单状态停在默认值上。
+    app.notebook.select(app.log_tab)
+    app.root.update()
+    app._pump()  # 先放完队列里排着的启动日志，断言期间不再冒新行
+
+    # 清空日志（应用的写入路径就是先 normal 再 disabled）：空日志两项都无可复制的内容
+    app.log_text.configure(state="normal")
+    app.log_text.delete("1.0", "end")
+    app.log_text.configure(state="disabled")
+
+    popups = stub_popup(monkeypatch, app._log_menu)
+
+    def popup_state():
+        """走真实入口弹一次菜单，返回（复制, 复制全部）的灰化状态。"""
+        app.log_text.event_generate("<Button-3>", x=5, y=5)
+        app.root.update()
+        return (app._log_menu.entrycget(g.MENU_COPY_LABEL, "state"),
+                app._log_menu.entrycget(g.MENU_COPY_ALL_LABEL, "state"))
+
+    assert popup_state() == ("disabled", "disabled")
+    assert len(popups) == 1, popups
+
+    app._append_log("第一行")
+    app._append_log("第二行")
+
+    # Tk 平台把 <<SelectAll>> 映射到 Ctrl+A（探针实测，issues/13）：日志上按下去会整篇选中。
+    # 这不是菜单项（菜单里没有「全选」），是平台默认；顺手用它验证「有选区 → 复制可用」
+    app.log_text.focus_force()
+    app.log_text.event_generate("<Control-a>")
+    app.root.update()
+    whole = app.log_text.get("sel.first", "sel.last")
+    assert whole.rstrip("\n").splitlines() == ["第一行", "第二行"], repr(whole)  # 选中到 end，尾部带空行
+    assert popup_state() == ("normal", "normal"), popups
+    app._log_copy_selection()
+    app.root.update()
+    assert app.root.clipboard_get() == whole, repr(app.root.clipboard_get())
+
+    # 清掉选区：「复制」回到灰，「复制全部」不受影响（`end-1c` 以换行结尾，按行核对而不是逐字比对）
+    app.log_text.tag_remove("sel", "1.0", "end")
+    app.root.update()
+    assert popup_state() == ("disabled", "normal"), popups
+    app._log_copy_all()
+    app.root.update()
+    assert app.root.clipboard_get().splitlines() == ["第一行", "第二行"], repr(app.root.clipboard_get())
+
+    # 只读态照样能鼠标划选（探针实测，issues/13）：在第 1 行里从第 1 个字拖到第 3 个字前，
+    # 「复制」只复制这一小段——坐标用 bbox 现算，不依赖字体宽度
+    sx, sy = app.log_text.bbox("1.0")[:2]
+    ex, ey = app.log_text.bbox("1.2")[:2]
+    app.log_text.event_generate("<Button-1>", x=sx + 1, y=sy + 2)
+    app.log_text.event_generate("<B1-Motion>", x=ex - 1, y=ey + 2)
+    app.log_text.event_generate("<ButtonRelease-1>", x=ex - 1, y=ey + 2)
+    app.root.update()
+    dragged = app.log_text.get("sel.first", "sel.last")
+    assert dragged == "第一", repr(dragged)
+    assert popup_state() == ("normal", "normal"), popups
+    app._log_copy_selection()
+    app.root.update()
+    assert app.root.clipboard_get() == "第一", repr(app.root.clipboard_get())
+    assert app.log_text.cget("state") == "disabled", "复制不该动到日志的只读态"
+
+
+def test_entry_focus_clears_on_click_outside(app, monkeypatch):
+    """输入框焦点与邮件选中同一口径：点非输入框的开阔地（标签、面板空白、滚条）即收归主窗口；
+    输入框自身与邮件列表滚条是例外。
+
+    回归自：点别处焦点留在输入框，只有点邮件列表区才走得掉（探针实测，issues/14）。
+
+    焦点断言分两路：`focus_set` 是「非强制」的——测试窗口被外部抢走前台时请求会被推迟，
+    focus_get() 停在原处（全量偶发失败就是它）。所以「收归主窗口」用替身盯住处理器有没有
+    发出请求（确定性契约），焦点去向只做宽松校验：前台在时立即落到主窗口，被抢时仍停在
+    输入框，两种都算过；没发请求才失败。点可聚焦控件（另一个输入框、列表）时 Tk 类绑定
+    完成自然转移，本入口不插手也不抢占——同样允许它的 focus 请求被推迟。
+    """
+    def focus_path():
+        f = app.root.focus_get()
+        return None if f is None else str(f)
+
+    def walk(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from walk(child)
+
+    label = next(w for w in walk(app.root)
+                 if isinstance(w, tk.Label) and w.cget("text") == "帐号：")
+
+    app._clear_message_rows()
+    for i in range(1, 3):
+        app.events.put(("message", _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 2, len(ids)
+
+    # focus_set 的替身：数「处理器有没有发出收归请求」——这是不依赖前台归属的确定性契约
+    asked = []
+    monkeypatch.setattr(app.root, "focus_set", lambda *a, **k: asked.append(1))
+
+    def click_expecting_clear(target, x=None, y=None):
+        before = len(asked)
+        click(app, target, x, y)
+        if len(asked) == before:
+            # 合成的鼠标事件偶发被丢弃（窗口尚未完成映射 / 系统繁忙，见 issues/13 的教训），
+            # 重发一次再判：真回归会两次都不响应，仍会失败。
+            click(app, target, x, y)
+        assert len(asked) == before + 1, (target, "处理器应把焦点收归主窗口")
+        # 前台在：立即落到主窗口；被抢前台：请求被推迟、focus_get() 仍停在输入框
+        assert focus_path() in (str(app.root), str(app.user_entry)), (target, focus_path())
+
+    # 点不可聚焦的标签：选中与焦点一次点击各归各位
+    app.tree.selection_set(ids[0])
+    app.user_entry.focus_force()
+    app.root.update()
+    assert focus_path() == str(app.user_entry), focus_path()
+    click_expecting_clear(label)
+    assert app.tree.selection() == (), app.tree.selection()
+
+    # 文件夹面板空白与其滚条：同为「别处」，焦点同样收归主窗口
+    for target in (app.folder_canvas, app.folder_scroll):
+        app.user_entry.focus_force()
+        app.root.update()
+        click_expecting_clear(target)
+
+    # 点输入框自身：正常编辑焦点保持，且不该发收归请求
+    app.user_entry.focus_force()
+    app.root.update()
+    before = len(asked)
+    click(app, app.user_entry, 5, 5)
+    assert len(asked) == before, "点输入框自身不该发收归请求"
+    assert focus_path() == str(app.user_entry), focus_path()
+    # 点另一个输入框：类绑定自然转移，本入口不许抢占（前台被抢时类绑定的请求也会被推迟）
+    click(app, app.server_entry, 5, 5)
+    assert len(asked) == before, "点另一个输入框时焦点归类绑定，本入口不插手"
+    assert focus_path() in (str(app.server_entry), str(app.user_entry)), focus_path()
+
+    # 备份运行中配置区整片禁用：禁用输入框不接焦点（探针实测，issues/14），
+    # 点它不算「点了那个框」，旧焦点同样要收走，不能滞留在框里
+    app._set_config_enabled(False)
+    app.user_entry.focus_force()
+    app.root.update()
+    assert focus_path() == str(app.user_entry), focus_path()
+    click_expecting_clear(app.server_entry, 5, 5)
+    app._set_config_enabled(True)
+
+    # 点邮件列表（列标题区域）：Treeview 类绑定拿焦点，本入口不插手。
+    # 列表页签要摆到前台：上一用例把 notebook 留在了日志页签，不可映射的控件拿不到焦点
+    app.notebook.select(app.list_tab)
+    app.root.update()
+    app.user_entry.focus_force()
+    app.root.update()
+    before = len(asked)
+    click(app, app.tree, 30, 2)
+    got = focus_path()
+    assert got in (str(app.tree), str(app.user_entry)), got
+    if got == str(app.user_entry):
+        # 前台被抢、类绑定的 focus 请求被推迟时，处理器会补发一次收归主窗口的请求
+        assert len(asked) > before, "焦点停在输入框时应补发收归请求"
+
+    # 例外：邮件列表自己的滚条——滚动查看时的点击，选中与焦点都保持，也不发收归请求
+    app.tree.selection_set(ids[0])
+    app.user_entry.focus_force()
+    app.root.update()
+    before = len(asked)
+    app.tree_scroll.event_generate("<Button-1>")
+    app.tree_scroll.event_generate("<ButtonRelease-1>")
+    app.root.update()
+    assert len(asked) == before, "点列表滚条不该发收归请求"
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+    assert focus_path() == str(app.user_entry), focus_path()
+
+    app.root.focus_set()  # 收尾：不把聚焦与选中态留给后续用例
+    app.tree.selection_set()
