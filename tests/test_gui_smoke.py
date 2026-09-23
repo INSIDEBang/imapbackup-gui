@@ -782,27 +782,27 @@ def test_right_edges_share_one_baseline(app):
     app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
     app.root.update()
 
-    # 邮件列表：外框与面板同款（groove），表格的左右下三边直接贴着它、页签里没有第二圈线；
-    # 表格与滚条之间留一条 2px 凹陷浅线（`tree_edge`，白底 sunken：153 阴影 / 230 高光，
-    # 与日志板右缘同一配方）——滚条左缘那根 1px 白色反光条靠它显形（用户口径，issues/15）。
+    # 邮件列表：外框与面板同款（groove）；白色表格自己带凹陷边（`tree_wrap`，白底 sunken，
+    # 与日志板同一配方），整块贴着外框内沿、不留灰边距——凹陷边本身给滚条左缘那根 1px
+    # 白色反光条做对比（用户口径，issues/15）。树自己的 vista field 边框压平。
     assert str(app.list_frame.cget("relief")) == "groove", app.list_frame.cget("relief")
+    assert (app.tree_wrap.cget("relief"), int(app.tree_wrap.cget("borderwidth")),
+            app.tree_wrap.cget("background")) == (
+        app.log_text.cget("relief"), int(app.log_text.cget("borderwidth")),
+        app.log_text.cget("background")), (
+        app.tree_wrap.cget("relief"), app.tree_wrap.cget("borderwidth"),
+        app.tree_wrap.cget("background"))
     li_left, li_top = left(app.list_frame) + border, app.list_frame.winfo_rooty() + border
     li_bottom = app.list_frame.winfo_rooty() + app.list_frame.winfo_height() - border
     li_right = left(app.list_frame) + app.list_frame.winfo_width() - border
-    assert (left(app.tree), app.tree.winfo_rooty()) == (li_left, li_top), (
+    assert (left(app.tree_wrap), app.tree_wrap.winfo_rooty()) == (li_left, li_top), (
+        left(app.tree_wrap), app.tree_wrap.winfo_rooty(), li_left, li_top)
+    assert app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height() == li_bottom, (
+        app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height(), li_bottom)
+    assert (left(app.tree), app.tree.winfo_rooty()) == (li_left + 1, li_top + 1), (
         left(app.tree), app.tree.winfo_rooty(), li_left, li_top)
-    assert app.tree.winfo_rooty() + app.tree.winfo_height() == li_bottom, (
-        app.tree.winfo_rooty() + app.tree.winfo_height(), li_bottom)
-    assert (app.tree_edge.cget("relief"), int(app.tree_edge.cget("borderwidth")),
-            app.tree_edge.cget("background")) == (
-        app.log_text.cget("relief"), int(app.log_text.cget("borderwidth")),
-        app.log_text.cget("background")), (
-        app.tree_edge.cget("relief"), app.tree_edge.cget("borderwidth"),
-        app.tree_edge.cget("background"))
-    assert (right(app.tree), left(app.tree_scroll), right(app.tree_scroll)) == (
-        left(app.tree_edge), right(app.tree_edge), li_right), (
-        right(app.tree), left(app.tree_scroll), right(app.tree_scroll),
-        left(app.tree_edge), right(app.tree_edge), li_right)
+    assert (right(app.tree_wrap), right(app.tree_scroll)) == (left(app.tree_scroll), li_right), (
+        right(app.tree_wrap), left(app.tree_scroll), right(app.tree_scroll), li_right)
     assert (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height()) == (
         li_top, li_bottom - li_top), (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height())
     assert str(app.tree.cget("style")) == "Mail.Treeview", app.tree.cget("style")
