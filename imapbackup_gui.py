@@ -473,9 +473,19 @@ class BackupApp:
         list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        # 表格保留 vista 主题自带的 field 边框（不压平）：它现在与包裹边框隔着灰边距、不再贴成
-        # 双线，白底表格因此有自己的轮廓——与日志板的下沉边缘同一口径（用户复核，issues/15）。
-        self.tree = ttk.Treeview(list_frame,
+        # 表格的内沿以日志板为准：日志板是 Tk 经典的下沉边框（bd=1），而 Treeview 在 vista 主题
+        # 自带的是平的 field 边框（用户复核，issues/15）。这里套一层 tk.Frame(relief="sunken")，
+        # 用与 Text 同一套经典绘制给出同一圈凹陷边缘；树自己的 field 边框相应压平（只留 treearea，
+        # 表头与内容不受影响）。
+        ttk.Style().layout("Mail.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        # 底色用白：Tk 经典 3D 边框的深浅由控件背景推出，白底才能和日志板的边框同色（探针实测，
+        # issues/15）；树铺满框内，这层底色只在边框那一圈上色。
+        tree_wrap = self.tree_wrap = tk.Frame(list_frame, relief="sunken", borderwidth=1,
+                                              background="#ffffff")
+        tree_wrap.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        tree_wrap.columnconfigure(0, weight=1)
+        tree_wrap.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(tree_wrap, style="Mail.Treeview",
                                  columns=("from", "subject", "when", "folder", "size"), show="headings")
         self.tree.heading("from", text="发件人")
         self.tree.heading("subject", text="主题")
@@ -491,8 +501,8 @@ class BackupApp:
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
-        # 四周留 4px 灰边距（右缘贴滚条、不留缝），边框与内容之间处处等距（用户口径：按下边距统一）
-        self.tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        # 4px 灰边距挂在凹陷边框那一层（右缘贴滚条、不留缝），树在框内贴边不给留白
+        self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns", pady=4)
         self.list_ph = self._empty_hint(list_frame, LIST_PLACEHOLDER_TEXT, 0, 0)
         # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的

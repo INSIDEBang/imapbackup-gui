@@ -782,17 +782,28 @@ def test_right_edges_share_one_baseline(app):
     app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
     app.root.update()
 
-    # 邮件列表的表格同样带 4px 灰边距，并保留 vista 自带的 field 边框（style 用默认值）：
-    # 隔着灰边距它不再与包裹边框贴成双线，白底表格因此有自己的轮廓。
-    assert str(app.tree.cget("style")) == "", app.tree.cget("style")  # 空 = 默认 "Treeview"
-    assert "Treeview.field" in str(g.ttk.Style().layout("Treeview")), g.ttk.Style().layout("Treeview")
+    # 邮件列表：表格的内沿以日志板为准——同一圈经典下沉边框（同 relief / 同 borderwidth），
+    # 边缘挂在 `tree_wrap` 上；树自己的 vista field 边框压平（只留 treearea，走派生样式，
+    # 全局 `Treeview` 布局不动）。4px 灰边距在同一层，树在框内贴边。
+    assert (app.tree_wrap.cget("relief"), int(app.tree_wrap.cget("borderwidth"))) == (
+        app.log_text.cget("relief"), int(app.log_text.cget("borderwidth"))), (
+        app.tree_wrap.cget("relief"), app.tree_wrap.cget("borderwidth"),
+        app.log_text.cget("relief"), app.log_text.cget("borderwidth"))
+    # 底色也一致：经典 3D 边框的深浅由控件背景推出，白底才与日志板同色
+    assert app.tree_wrap.cget("background") == app.log_text.cget("background"), (
+        app.tree_wrap.cget("background"), app.log_text.cget("background"))
+    assert str(app.tree.cget("style")) == "Mail.Treeview", app.tree.cget("style")
+    mail_layout = str(g.ttk.Style().layout("Mail.Treeview"))
+    assert "treearea" in mail_layout and "field" not in mail_layout, mail_layout
+    assert "Treeview.field" in str(g.ttk.Style().layout("Treeview")), "只派生，不该动全局布局"
     li_left, li_top = left(app.list_frame) + border, app.list_frame.winfo_rooty() + border
     li_bottom = app.list_frame.winfo_rooty() + app.list_frame.winfo_height() - border
-    assert left(app.tree) - li_left == 4, (left(app.tree), li_left)
-    assert app.tree.winfo_rooty() - li_top == 4, (app.tree.winfo_rooty(), li_top)
-    assert li_bottom - (app.tree.winfo_rooty() + app.tree.winfo_height()) == 4, (
-        li_bottom, app.tree.winfo_rooty() + app.tree.winfo_height())
-    assert right(app.tree) == left(app.tree_scroll), (right(app.tree), left(app.tree_scroll))
+    assert left(app.tree_wrap) - li_left == 4, (left(app.tree_wrap), li_left)
+    assert app.tree_wrap.winfo_rooty() - li_top == 4, (app.tree_wrap.winfo_rooty(), li_top)
+    assert li_bottom - (app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height()) == 4, (
+        li_bottom, app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height())
+    assert right(app.tree_wrap) == left(app.tree_scroll), (right(app.tree_wrap), left(app.tree_scroll))
+    assert left(app.tree) == left(app.tree_wrap) + 1, (left(app.tree), left(app.tree_wrap))
     assert app.tree_scroll.winfo_rooty() - li_top == 4, (app.tree_scroll.winfo_rooty(), li_top)
 
     # 两条遮盖窄条正好盖住 notebook 客户区的 1px/3px 内缩带（宽 = 实测内缩）。将来换主题或
