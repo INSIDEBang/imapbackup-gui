@@ -15,7 +15,7 @@
 - 保持改动聚焦；同步更新受影响的测试、用户文档和调用点。用户可见行为、CLI 参数或安装行为变化时，更新 `README.md` 的 Fork Notes。
 - 默认使用假服务器和占位账号。未经用户明确授权，不连接真实 IMAP 服务，也不读取凭证、真实 `.eml`/`.mbox`、运行日志或真实账号探针。
 - 可重复的回归断言放入 `tests/`；`.scratch/` 只存本地 issue、一次性探针和人工观察材料，正常开发与验证不得依赖其中的文件。
-- 不提交凭证、邮件、备份、运行日志、构建产物或探针产物。示例统一使用虚构账号与路径。
+- 不提交凭证、邮件、备份、运行日志、构建产物或探针产物，也不把真实账号、邮件内容、个人绝对路径或本机配置写入仓库文档；示例统一使用虚构账号与路径。
 
 ## 核心不变量
 
@@ -26,19 +26,10 @@
 - 保持现有 CLI 参数、退出码及 quiet/console 行为，除非用户明确要求破坏性变更。`main(argv)` 返回整数退出码。
 - 卸载与清理逻辑不得触碰用户选择的备份目录。应用数据目录新增非日志内容时，必须同步修改卸载文案或收窄删除范围。
 
-## 按任务读取
-
-- 修改 eml/mbox 布局、账号目录、消息标识或判重：读取 `CONTEXT.md` 和 ADR 0001、0002、0004。
-- 修改 `report`、`should_stop` 或核心与 GUI 的接缝：读取 ADR 0003。
-- 修改任何 GUI 行为：读取 `docs/agents/gui.md` 和相关 `tests/test_gui_smoke.py` 用例。
-- 修改日志路径、级别、handler 或失败记录：读取 ADR 0005 和 `tests/test_cli_file_logging.py`。
-- 修改 pytest 配置、fixture 或测试组织：读取 ADR 0006、`pytest.ini` 和 `tests/conftest.py`。
-- 修改安装、卸载、AppId 或应用数据删除行为：读取 ADR 0007、`CONTEXT.md` 和 `packaging/imapbackup-gui.iss`。
-- 创建或更新本地 issue/spec：读取 `docs/agents/issue-tracker.md`；执行 triage 时再读取 `docs/agents/triage-labels.md`。
-
 ## 跨文件一致性
 
 - `imapbackup_gui.py` 的 `APP_MUTEX_NAME` 必须与 `packaging/imapbackup-gui.iss` 的 `AppMutex` 完全一致。
+- `packaging/imapbackup-gui.iss` 的正式 `AppId` 是升级与卸载身份，必须保持不变；测试安装器或探针必须使用独立的 `AppId`，不得复用正式值。
 - 版本变更须经用户明确批准，并同步 `imapbackup312.py`、`imapbackup_gui.py`、`packaging/imapbackup-gui.iss` 和 `packaging/build.bat`。
 - 保留已有许可证头；新增入口脚本时参考相邻入口文件的头部风格。
 

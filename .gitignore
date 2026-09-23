@@ -40,3 +40,12 @@ nosetests.xml
 *.mbox
 secret.txt
 *.eml
+
+# IDEs
+.vscode/
+.agents/
+.claude/
+.zcode/
+.codebuddy/
+.codeartsdoer/
+.arts/
