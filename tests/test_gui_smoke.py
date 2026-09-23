@@ -799,8 +799,13 @@ def test_right_edges_share_one_baseline(app):
         left(app.tree_wrap), app.tree_wrap.winfo_rooty(), li_left, li_top)
     assert app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height() == li_bottom, (
         app.tree_wrap.winfo_rooty() + app.tree_wrap.winfo_height(), li_bottom)
-    assert (left(app.tree), app.tree.winfo_rooty()) == (li_left + 1, li_top + 1), (
+    # 树用 place 往左上各溢出 1px、右下各多铺 1px：白板左/上/下三条凹陷线被树盖住（与外框合成
+    # 一条线），右边留出白板自己那条 230 高光，正对滚条左缘的反光条（用户口径，issues/15）。
+    assert (left(app.tree), app.tree.winfo_rooty()) <= (li_left, li_top), (
         left(app.tree), app.tree.winfo_rooty(), li_left, li_top)
+    assert app.tree.winfo_rooty() + app.tree.winfo_height() >= li_bottom, (
+        app.tree.winfo_rooty() + app.tree.winfo_height(), li_bottom)
+    assert right(app.tree) < li_right, (right(app.tree), li_right)
     assert (right(app.tree_wrap), right(app.tree_scroll)) == (left(app.tree_scroll), li_right), (
         right(app.tree_wrap), left(app.tree_scroll), right(app.tree_scroll), li_right)
     assert (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height()) == (
