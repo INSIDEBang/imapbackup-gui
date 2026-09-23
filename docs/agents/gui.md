@@ -13,7 +13,7 @@
 
 - 开始与停止图标由 `PhotoImage` 在代码中生成，不增加图片资产；Python 侧必须持有引用，避免图标被垃圾回收。
 - 连接与备份共用 `SPINNER_FRAMES`、`SPINNER_INTERVAL_MS` 和 `_set_loading_frame()`。修改帧或节奏时同时覆盖 `_connect_spinner_tick` 与 `_run_spinner_tick` 两条调度链。
-- 开始和停止按钮不设置固定 `width`。加载态使用 `_blank_icon()` 占住图标槽，不把 `image` 设为 `""`，避免按钮高度变化。
+- 开始和停止按钮不设置固定 `width`。加载态使用 `_blank_icon()` 占住「有 image」这个高度前提，不把 `image` 设为 `""`，避免按钮高度变化；占位是 1px 宽 × 图标高——只借高度不占宽，转圈符贴近左边框、左右留白与静止态对称（回归自：整图标宽的占位让左边一大块空白、左松右紧）。宽度在加载/静止之间会随文案与图标槽变化，不再是「只随文案走」。
 - 点击停止后，转圈移到停止按钮；开始按钮恢复静止外观但保持禁用；状态行只清除文案而不收回布局；配置区显示停止提示。
 - 完成、停止、失败以及帧链自愈路径都必须恢复两颗按钮和配置区提示。
 
@@ -26,7 +26,9 @@
 
 ## 布局与滚轮
 
-- 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框，并与下方区域右边线对齐。
+- 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框。
+- 两个页签（邮件列表 / 运行日志）各有一层与「邮箱文件夹」面板同款的外包边框（`_panel_style_frame()`：groove + 面板同值 `borderwidth`）：滚条包在框内、贴着边框内侧，日志页签的工具栏也在框内，空态提示挂框内。页签内只保留这一条线——Treeview 走派生样式 `Mail.Treeview`（layout 只留 `treearea`）压平自带 field 边框，`log_text` 用 `borderwidth=0` 压平自带下沉边框（不压就是双线，探针实测，见 issues/15）。
+- 包裹边框右线与面板右线差 3px：notebook 客户区的右内缩（vista 主题实测；widget `padding`、样式 layout 与 `borderwidth` 都吃不动，见 issues/15）。视觉上两线连续，`test_right_edges_share_one_baseline` 的容差按实测留到 3px。
 - 邮箱文件夹滚轮使用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；沿事件控件的 `.master` 向上判断是否位于 `folder_group`，其他区域返回 `None` 放行。
 - 面板内滚条也调用 `_on_wheel` 并返回 `"break"`，由该入口完成滚动，避免 `TScrollbar` 默认步长覆盖统一节奏。
 - 每格滚动 `FOLDER_WHEEL_ROWS` 行；`yscrollincrement` 使用实测行距。不足一格的 delta 按 `WHEEL_DELTA` 累积，以支持高分辨率滚轮和触摸板。
