@@ -805,7 +805,8 @@ def test_right_edges_share_one_baseline(app):
         left(app.tree), app.tree.winfo_rooty(), li_left, li_top)
     assert app.tree.winfo_rooty() + app.tree.winfo_height() >= li_bottom, (
         app.tree.winfo_rooty() + app.tree.winfo_height(), li_bottom)
-    assert right(app.tree) < li_right, (right(app.tree), li_right)
+    # 右边留 1px 不盖：那就是白板自己那条 230 高光（盖多了会把滚条的对比线也吃掉）
+    assert right(app.tree) == right(app.tree_wrap) - 1, (right(app.tree), right(app.tree_wrap))
     assert (right(app.tree_wrap), right(app.tree_scroll)) == (left(app.tree_scroll), li_right), (
         right(app.tree_wrap), left(app.tree_scroll), right(app.tree_scroll), li_right)
     assert (app.tree_scroll.winfo_rooty(), app.tree_scroll.winfo_height()) == (
@@ -815,11 +816,15 @@ def test_right_edges_share_one_baseline(app):
     assert "treearea" in mail_layout and "field" not in mail_layout, mail_layout
     assert "Treeview.field" in str(g.ttk.Style().layout("Treeview")), "只派生，不该动全局布局"
 
-    # 两条遮盖窄条正好盖住 notebook 客户区的 1px/3px 内缩带（宽 = 实测内缩）。将来换主题或
-    # DPI 让内缩变了，这里会炸出来，提醒同步改窄条宽度与容器内边距。
+    # 三条遮盖窄条正好盖住 notebook 客户区的左 1px / 右 3px / 下 3px 内缩带（尺寸 = 实测内缩）。
+    # 底边那条的淡线压在包裹边框外侧，底边会多出一道「突出」的线，必须一并盖掉。将来换主题或
+    # DPI 让内缩变了，这里会炸出来，提醒同步改窄条尺寸与容器内边距。
     insets = (app.list_tab.winfo_rootx() - app.notebook.winfo_rootx(),
-              right(app.notebook) - right(app.list_tab))
-    assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width()) == insets, insets
+              right(app.notebook) - right(app.list_tab),
+              (app.notebook.winfo_rooty() + app.notebook.winfo_height())
+              - (app.list_tab.winfo_rooty() + app.list_tab.winfo_height()))
+    assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width(),
+            app.tab_edge_bottom.winfo_height()) == insets, insets
 
 
 def test_folder_panel_wheel_covers_the_whole_panel(app):

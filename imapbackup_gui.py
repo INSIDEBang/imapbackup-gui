@@ -462,6 +462,10 @@ class BackupApp:
         edge_left.place(x=0, y=0, width=1, relheight=1.0)
         self.tab_edge_right = edge_right = tk.Frame(self.notebook)
         edge_right.place(relx=1.0, x=0, y=0, width=3, relheight=1.0, anchor="ne")
+        # 底边还有一条 3px 内缩带：它的淡线压在包裹边框外侧，底边就多出一道「突出」的线，
+        # 一并盖掉（用户复核，issues/15）
+        self.tab_edge_bottom = edge_bottom = tk.Frame(self.notebook)
+        edge_bottom.place(relx=0.0, rely=1.0, x=0, y=0, relwidth=1.0, height=3, anchor="sw")
 
         list_tab = self.list_tab = tk.Frame(self.notebook)
         self.notebook.add(list_tab, text="邮件列表")
@@ -498,7 +502,8 @@ class BackupApp:
         self.tree.configure(yscrollcommand=tree_scroll.set)
         # 树只用 place 铺满白板并往左上各溢出 1px、右下各多铺 1px：左/上/下三条凹陷线被树自己
         # 盖住（与外框合成一条线），只剩右边那条 230 高光。滚条紧贴白板右缘，反光条正对着它。
-        self.tree.place(x=-1, y=-1, relwidth=1.0, relheight=1.0, height=2)
+        # 宽多铺 1px 是为了吃掉顶边最后一个像素（不然会在白板右上角留下一个深色点）。
+        self.tree.place(x=-1, y=-1, relwidth=1.0, relheight=1.0, width=1, height=2)
         tree_scroll.grid(row=0, column=1, sticky="ns")
         self.list_ph = self._empty_hint(list_frame, LIST_PLACEHOLDER_TEXT, 0, 0)
         # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的
