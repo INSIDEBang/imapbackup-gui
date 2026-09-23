@@ -46,7 +46,7 @@ python imapbackup312.py \
 Key options (3.12 script):
 
 * `--folders` and `--exclude-folders` are mutually exclusive. Each takes a comma-separated list of folder display names, matched either exactly or as a path prefix, so `Archive` also covers every folder nested under it (`INBOX` does not catch `INBOX/archive`). Chinese names as printed after connecting work as-is; a value that matches nothing exits with the account's folder list instead of backing up an empty selection.
-* `--icloud` forces BODY.PEEK fetches (works around certain providers that otherwise re-flag messages).
+* Full-message downloads always use read-only `BODY.PEEK[]`. `--icloud` remains accepted for command-line compatibility but no longer changes the fetch command.
 * `--thunderbird` creates Thunderbird-style directory layout (.sbd folders instead of dotted names).
 * `--eml-dir DIR` additionally writes each message as an individual `.eml` file (see Fork Notes below); combine with `--mbox-dir` to write both formats from a single fetch.
 * `--yes-overwrite-mboxes` will delete existing local mbox files before writing (default is incremental append logic).

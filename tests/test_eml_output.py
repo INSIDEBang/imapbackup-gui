@@ -197,7 +197,8 @@ def test_synthetic_id_fallback_fetch_is_read_only():
     assert "(BODY[HEADER.FIELDS" not in src
 
     fetch_src = inspect.getsource(m.download_messages)
-    assert "(INTERNALDATE RFC822)" in fetch_src and "(INTERNALDATE BODY.PEEK[])" in fetch_src
+    assert "(INTERNALDATE BODY.PEEK[])" in fetch_src
+    assert "(INTERNALDATE RFC822)" not in fetch_src
 
 
 def test_log_level_names_are_not_abbreviated():
@@ -211,7 +212,7 @@ def test_download_messages_writes_both_formats(tmp_path):
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX", verbose=0)
 
-    assert all(items == "(INTERNALDATE RFC822)" for _, items in server.fetches), server.fetches
+    assert all(items == "(INTERNALDATE BODY.PEEK[])" for _, items in server.fetches), server.fetches
 
     mbox_bytes = (tmp_path / "mbox" / "INBOX.mbox").read_bytes()
     assert b"From nobody " in mbox_bytes
@@ -259,12 +260,13 @@ def test_overwrite_wipes_both_sinks_then_redownloads(tmp_path):
     assert not junk.exists() and len(list((tmp_path / "eml" / "INBOX").rglob("*.eml"))) == 1
 
 
-def test_icloud_uses_body_peek_fetch_items(tmp_path):
-    server = FetchServer({1: RESP1})
-    m.download_messages(server, "INBOX.mbox", {"<aaa@x>": 1}, False, True, False,
-                        tmp_path / "mbox", True, True, NullLog(),
-                        eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX")
-    assert server.fetches[0][1] == "(INTERNALDATE BODY.PEEK[])", server.fetches
+def test_download_uses_body_peek_fetch_items_for_all_servers(tmp_path):
+    for icloud in (False, True):
+        server = FetchServer({1: RESP1})
+        m.download_messages(server, "INBOX.mbox", {"<aaa@x>": 1}, False, True, False,
+                            tmp_path / f"mbox-{icloud}", icloud, True, NullLog(),
+                            eml_dir=tmp_path / f"eml-{icloud}" / "INBOX", foldername="INBOX")
+        assert server.fetches[0][1] == "(INTERNALDATE BODY.PEEK[])", server.fetches
 
 
 def test_zero_new_messages_creates_no_directories(tmp_path):

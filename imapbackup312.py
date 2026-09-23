@@ -468,7 +468,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
             if should_stop is not None and should_stop():
                 if not quiet: log.info("%s: stopped by request after %d/%d messages", display, idx - 1, count)
                 break
-            fetch_cmd = "(INTERNALDATE BODY.PEEK[])" if icloud else "(INTERNALDATE RFC822)"
+            fetch_cmd = "(INTERNALDATE BODY.PEEK[])"
             typ, data = server.fetch(str(seq), fetch_cmd)
             if typ != 'OK':
                 raise RuntimeError(f"FETCH failed for UID {seq}: {data}")
