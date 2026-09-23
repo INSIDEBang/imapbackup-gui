@@ -740,29 +740,32 @@ def test_right_edges_share_one_baseline(app):
     right_margin = client_right - right(app.folder_group)
     assert left_margin == right_margin == 8, (left_margin, right_margin)
 
-    # 面板右边界 == 下方区域（Notebook）右边界
-    assert right(app.folder_group) == right(app.notebook), (
-        right(app.folder_group), right(app.notebook))
-
     # 面板内滚条贴住面板边框线：与面板内沿只差一个 borderwidth
     border = int(app.folder_group.cget("borderwidth"))
     assert right(app.folder_group) - right(app.folder_scroll) == border, (
         right(app.folder_group), right(app.folder_scroll), border)
 
-    # 两个页签的包裹层同款：与面板同值的边框宽度，滚条贴包裹边框内侧、右缘与上方面板右缘
-    # 同一条基线。差 3px = notebook 客户区的右内缩（vista 主题实测；padding 与样式 layout 都
-    # 吃不动，探针见 issues/15），视觉上两条线连续；容差就按实测的 3px 留。
+    # 两个页签的包裹层同款：与面板同值的边框宽度；左缘落在配置区的 8px 基线上，右缘与上方面板
+    # 线**精确**重合（notebook 客户区的 1px/3px 内缩已由容器内边距补掉，探针见 issues/15）；
+    # 滚条贴包裹边框内侧。
     for tab, frame, scroll in ((app.list_tab, app.list_frame, app.tree_scroll),
                                (app.log_tab, app.log_frame, app.log_scroll)):
         assert int(frame.cget("borderwidth")) == border, (frame, frame.cget("borderwidth"))
         app.notebook.select(tab)  # 非当前页签的控件未映射，量不到几何
         app.root.update()
+        assert left(frame) == left(app.folder_group.master), (
+            left(frame), left(app.folder_group.master))
+        assert right(frame) == right(app.folder_group), (right(frame), right(app.folder_group))
         assert right(frame) - right(scroll) == border, (
             frame, right(frame), right(scroll), border)
-        gap = right(app.folder_group) - right(frame)
-        assert 0 <= gap <= 3, (frame, gap)
     app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
     app.root.update()
+
+    # 两条遮盖窄条正好盖住 notebook 客户区的 1px/3px 内缩带（宽 = 实测内缩）。将来换主题或
+    # DPI 让内缩变了，这里会炸出来，提醒同步改窄条宽度与容器内边距。
+    insets = (app.list_tab.winfo_rootx() - app.notebook.winfo_rootx(),
+              right(app.notebook) - right(app.list_tab))
+    assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width()) == insets, insets
 
 
 def test_folder_panel_wheel_covers_the_whole_panel(app):

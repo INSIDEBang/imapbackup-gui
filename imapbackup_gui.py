@@ -441,17 +441,27 @@ class BackupApp:
 
     def _build_run_area(self) -> None:
         run = tk.Frame(self.root)
-        run.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        # 左右内边距是 7/5 而不是 8：notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，
+        # 先把它补掉，页签包裹边框的左右线才能与上方面板线、下方按钮行落在同一条 8px 基线上
+        # （探针实测，issues/15）；按钮行与状态行再用 padx=(1, 3) 把自己的 8px 边距补回去。
+        run.pack(fill="both", expand=True, padx=(7, 5), pady=(2, 8))
 
         # 两行状态条都先于 Notebook 以 side=bottom 打包，Notebook 的 expand 才不会挤掉它们。
         # msg_bar 先打包所以落在最底。初始只显示一行（未开始备份时没有进度与状态可显示），
         # 首次开始备份时 _ensure_status_rows 放出进度条与第二行，之后不再收回。
         self._msg_bar = msg_bar = tk.Frame(run)
-        msg_bar.pack(side="bottom", fill="x", pady=(4, 0))
+        msg_bar.pack(side="bottom", fill="x", pady=(4, 0), padx=(1, 3))
         self._bar = bar = tk.Frame(run)
-        bar.pack(side="bottom", fill="x", pady=(6, 0))
+        bar.pack(side="bottom", fill="x", pady=(6, 0), padx=(1, 3))
         self.notebook = ttk.Notebook(run)
         self.notebook.pack(fill="both", expand=True)
+        # notebook 会在自己客户区四周自绘 1px 淡边线（vista 主题原生绘制，颜色改不了，issues/15）；
+        # 页签包裹边框在客户区内侧，两者并排就是用户看到的「两条边框线」。用两条背景色窄条把
+        # 客户区的 1px/3px 内缩带盖掉，页签里只剩包裹边框那一条与面板完全重合的线。
+        self.tab_edge_left = edge_left = tk.Frame(self.notebook)
+        edge_left.place(x=0, y=0, width=1, relheight=1.0)
+        self.tab_edge_right = edge_right = tk.Frame(self.notebook)
+        edge_right.place(relx=1.0, x=0, y=0, width=3, relheight=1.0, anchor="ne")
 
         list_tab = self.list_tab = tk.Frame(self.notebook)
         self.notebook.add(list_tab, text="邮件列表")
