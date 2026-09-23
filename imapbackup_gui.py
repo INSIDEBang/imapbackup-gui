@@ -430,13 +430,13 @@ class BackupApp:
 
     # --------------------------------------------------------------- run area
 
-    def _panel_style_frame(self, parent: tk.Widget) -> tk.Frame:
-        """与「邮箱文件夹」面板同款的外包边框：groove + 面板同值的边框宽度。
+    def _panel_style_frame(self, parent: tk.Widget, relief: str = "groove") -> tk.Frame:
+        """页签外包边框：边框宽度取「邮箱文件夹」面板同值（两处永远同款）。
 
-        取面板的 borderwidth 而不是写死常数，是为了两处永远同款；面板先于本区构建
-        （_build_config_area 在前），这里能安全读到。
+        relief 默认 groove（与面板同款）；列表页签传 sunken——它只有这一圈线，凹陷边才带出
+        滚条左高光的对比（用户口径，issues/15）。面板先于本区构建，这里能安全读到它的值。
         """
-        return tk.Frame(parent, relief="groove",
+        return tk.Frame(parent, relief=relief,
                         borderwidth=int(self.folder_group.cget("borderwidth")))
 
     def _build_run_area(self) -> None:
@@ -467,25 +467,16 @@ class BackupApp:
         self.notebook.add(list_tab, text="邮件列表")
         list_tab.columnconfigure(0, weight=1)
         list_tab.rowconfigure(0, weight=1)
-        # 页签内容套一层与「邮箱文件夹」面板同款的外包边框：滚条包在框内、贴着边框内侧，
-        # 右缘才与上方面板线落在同一条线上。页签容器只做占位。
+        # 外框仍与「邮箱文件夹」面板同款（groove）；表格的左右下三边直接贴着它，页签里不再有
+        # 第二圈线（用户复核，issues/15）。页签容器只做占位。
         list_frame = self.list_frame = self._panel_style_frame(list_tab)
         list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        # 表格的内沿以日志板为准：日志板是 Tk 经典的下沉边框（bd=1），而 Treeview 在 vista 主题
-        # 自带的是平的 field 边框（用户复核，issues/15）。这里套一层 tk.Frame(relief="sunken")，
-        # 用与 Text 同一套经典绘制给出同一圈凹陷边缘；树自己的 field 边框相应压平（只留 treearea，
-        # 表头与内容不受影响）。
+        # 树自己的 vista field 边框压平（不然与外框再次贴成双线）：派生样式只留 treearea，
+        # 表头与内容不受影响，全局 Treeview 布局不动。
         ttk.Style().layout("Mail.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        # 底色用白：Tk 经典 3D 边框的深浅由控件背景推出，白底才能和日志板的边框同色（探针实测，
-        # issues/15）；树铺满框内，这层底色只在边框那一圈上色。
-        tree_wrap = self.tree_wrap = tk.Frame(list_frame, relief="sunken", borderwidth=1,
-                                              background="#ffffff")
-        tree_wrap.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
-        tree_wrap.columnconfigure(0, weight=1)
-        tree_wrap.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(tree_wrap, style="Mail.Treeview",
+        self.tree = ttk.Treeview(list_frame, style="Mail.Treeview",
                                  columns=("from", "subject", "when", "folder", "size"), show="headings")
         self.tree.heading("from", text="发件人")
         self.tree.heading("subject", text="主题")
@@ -501,9 +492,14 @@ class BackupApp:
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
-        # 4px 灰边距挂在凹陷边框那一层（右缘贴滚条、不留缝），树在框内贴边不给留白
+        # 表格与滚条之间留一条 2px 的凹陷浅线（白底 sunken：左 153 阴影、右 230 高光，与日志板
+        # 右缘同一配方）：滚条左缘那根 1px 白色反光条要有对比才看得出来，白对白会糊成一片；
+        # 这条线既给出凹陷质感，又让反光条显形（用户口径，issues/15）。
+        self.tree_edge = tree_edge = tk.Frame(list_frame, width=2, relief="sunken", borderwidth=1,
+                                              background="#ffffff")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        tree_scroll.grid(row=0, column=1, sticky="ns", pady=4)
+        tree_edge.grid(row=0, column=1, sticky="ns")
+        tree_scroll.grid(row=0, column=2, sticky="ns")
         self.list_ph = self._empty_hint(list_frame, LIST_PLACEHOLDER_TEXT, 0, 0)
         # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的
         # 路径是主窗口内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview
