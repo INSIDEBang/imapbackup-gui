@@ -28,7 +28,7 @@
 
 - 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框。
 - 两个页签（邮件列表 / 运行日志）各有一层与「邮箱文件夹」面板同款的外包边框（`_panel_style_frame()`：groove + 面板同值 `borderwidth`）：滚条包在框内、贴着边框内侧，日志页签的工具栏也在框内，空态提示挂框内。
-- 邮件列表：外框与面板同款（groove）；白色表格**自己带凹陷边**（`tree_wrap`：`tk.Frame(relief="sunken", borderwidth=1, background="#ffffff")`，Tk 经典 3D 绘制——左/上 153 阴影、右/下 230 高光），整块贴着外框内沿、不留灰边距；滚条紧贴白板右缘，那根 230 高光正好给滚条左缘的 1px 白色反光条做对比（白对白会糊成一片，用户口径，探针见 issues/15）。白底是必需的：3D 色阶由控件背景推出，白底才与日志板同色。树自己的 vista field 边框走派生样式 `Mail.Treeview`（layout 只留 `treearea`，全局 `Treeview` 布局不动）压平。
+- 邮件列表：外框与面板同款（groove）；白色表格**自己带凹陷边**（`tree_wrap`：`tk.Frame(relief="sunken", borderwidth=1, background="#ffffff")`，Tk 经典 3D 绘制——左/上 153 阴影、右/下 230 高光），整块贴着外框内沿、不留灰边距。**只保留右侧那条凹陷线**：树用 `place(x=-1, y=-1, relwidth=1.0, relheight=1.0, height=2)` 往左上各溢出 1px、右下各多铺 1px，把白板的左/上/下三条线盖住（与外框合成一条线），右边留出的 230 高光正对滚条左缘的 1px 白色反光条（没有对比时白对白会糊成一片，用户口径，探针见 issues/15）。白底是必需的：3D 色阶由控件背景推出，白底才与日志板同色。树自己的 vista field 边框走派生样式 `Mail.Treeview`（layout 只留 `treearea`，全局 `Treeview` 布局不动）压平。
 - 运行日志：板面与「打开日志文件夹」按钮同外框之间处处留 **4px** 灰边距（以最短的下边距统一，按钮与板面左缘同一竖线），板面保留 Tk 自带下沉边框、右侧贴住滚条；滚条也带 4px 上下边距（与文件夹面板的滚条同款）。
 - 回归：`test_right_edges_share_one_baseline` 断言这些边框 / 留白 / 凹陷边 / 滚条对齐。
 - notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，且会在客户区四周自绘 1px 淡边线（原生绘制，颜色改不了：`TNotebook` 只有 `-tabmargins` 可配，换 background/bordercolor/lightcolor/darkcolor 像素纹丝不动，见 issues/15）。因此容器 `run` 的左右内边距用 7/5 把它补掉（按钮行与状态行用 `padx=(1, 3)` 保留 8px 边距），页签包裹边框的左/右线才与配置区左边线、上方面板右线**精确重合**；`tab_edge_left`/`tab_edge_right` 两条背景色窄条（1px/3px，`place` 在 notebook 上、随其几何走）盖掉客户区内缩带，页签里就只剩包裹边框这一条线。
