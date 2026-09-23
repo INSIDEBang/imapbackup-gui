@@ -106,6 +106,13 @@ def press_enter(instance, widget):
     instance.root.update()
 
 
+def stub_popup(monkeypatch, menu):
+    """替掉菜单的 tk_popup（真菜单会 grab 住键盘，后续合成事件全被它吃掉），记录弹出坐标。"""
+    popups = []
+    monkeypatch.setattr(menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    return popups
+
+
 def row_by(instance, foldername):
     return [r for r in instance.folder_rows if r["foldername"] == foldername][0]
 
@@ -1104,8 +1111,7 @@ def test_entry_context_menu_has_three_actions(app, monkeypatch):
     for entry in (app.user_entry, app.server_entry, app.port_entry, app.password_entry, app.outdir_entry):
         assert entry.bind("<Button-3>"), entry
 
-    popups = []
-    monkeypatch.setattr(app._entry_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    popups = stub_popup(monkeypatch, app._entry_menu)
     app.user_var.set("alice@example.com")
     app.user_entry.select_range(0, "end")
     app.user_entry.event_generate("<Button-3>", x=5, y=5)
@@ -1187,8 +1193,7 @@ def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
     values = tuple(str(v) for v in app.tree.item(ids[0], "values"))
     assert values[1] == "主题1" and values[1] != values[4], values
 
-    popups = []
-    monkeypatch.setattr(app._tree_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    popups = stub_popup(monkeypatch, app._tree_menu)
 
     def cell_center(iid, column):
         x, y, w, h = app.tree.bbox(iid, column)
@@ -1252,8 +1257,7 @@ def test_log_context_menu_copies_selection_and_all(app, monkeypatch):
     app.log_text.delete("1.0", "end")
     app.log_text.configure(state="disabled")
 
-    popups = []
-    monkeypatch.setattr(app._log_menu, "tk_popup", lambda x, y: popups.append((x, y)))
+    popups = stub_popup(monkeypatch, app._log_menu)
 
     def popup_state():
         """走真实入口弹一次菜单，返回（复制, 复制全部）的灰化状态。"""

@@ -276,7 +276,6 @@ class BackupApp:
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
         self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
         self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
-        self._entry_widget_paths_cache: frozenset[str] | None = None  # 5 个输入框的控件路径；左键入口首用构建
 
         self._build_config_area()
         self._build_run_area()
@@ -430,13 +429,12 @@ class BackupApp:
 
     # --------------------------------------------------------------- run area
 
-    def _panel_style_frame(self, parent: tk.Widget, relief: str = "groove") -> tk.Frame:
-        """页签外包边框：边框宽度取「邮箱文件夹」面板同值（两处永远同款）。
+    def _panel_style_frame(self, parent: tk.Widget) -> tk.Frame:
+        """页签外包边框：与「邮箱文件夹」面板同款（groove + 面板同值 borderwidth，两处永远一致）。
 
-        relief 默认 groove（与面板同款）；列表页签传 sunken——它只有这一圈线，凹陷边才带出
-        滚条左高光的对比（用户口径，issues/15）。面板先于本区构建，这里能安全读到它的值。
+        面板先于本区构建，这里能安全读到它的值。
         """
-        return tk.Frame(parent, relief=relief,
+        return tk.Frame(parent, relief="groove",
                         borderwidth=int(self.folder_group.cget("borderwidth")))
 
     def _build_run_area(self) -> None:
@@ -984,12 +982,10 @@ class BackupApp:
         return False
 
     def _entry_widget_paths(self) -> frozenset[str]:
-        """5 个输入框的控件路径（首用构建后缓存）：焦点归属判定用。"""
-        if self._entry_widget_paths_cache is None:
-            self._entry_widget_paths_cache = frozenset(
-                str(w) for w in (self.user_entry, self.server_entry, self.port_entry,
-                                 self.password_entry, self.outdir_entry))
-        return self._entry_widget_paths_cache
+        """5 个输入框的控件路径：焦点归属判定用。"""
+        return frozenset(
+            str(w) for w in (self.user_entry, self.server_entry, self.port_entry,
+                             self.password_entry, self.outdir_entry))
 
     def _on_click_clear_selection_and_focus(self, event) -> None:
         """主窗口唯一的左键入口：清邮件列表选中高亮，并把输入框焦点收归主窗口。
