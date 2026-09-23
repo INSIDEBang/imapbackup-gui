@@ -495,6 +495,10 @@ class BackupApp:
         self.tree.column("folder", width=140, stretch=False)
         self.tree.column("size", width=90, anchor="e", stretch=False)
         self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
+        self._tree_resize = None
+        self.tree.bind("<Button-1>", self._on_tree_resize_start, add="+")
+        self.tree.bind("<B1-Motion>", self._on_tree_resize_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_resize_end, add="+")
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
@@ -1069,6 +1073,56 @@ class BackupApp:
         if not self._prepare_tree_popup(event):
             return "break"
         self._tree_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _on_tree_resize_start(self, event) -> str | None:
+        if self.tree.identify_region(event.x, event.y) != "separator":
+            return None
+        columns = tuple(self.tree["columns"])
+        column = self.tree.identify_column(event.x)
+        try:
+            index = int(column[1:]) - 1
+        except (ValueError, IndexError):
+            return None
+        if not 0 <= index < len(columns) - 1:
+            return "break"
+        left, right = columns[index:index + 2]
+        subject_stretch = bool(self.tree.column("subject", "stretch"))
+        if subject_stretch:
+            # A stretch column otherwise grows while the fixed pair is
+            # resized, moving the separator being dragged.
+            self.tree.column("subject", stretch=False)
+        self._tree_resize = (event.x, left, right,
+                             int(self.tree.column(left, "width")),
+                             int(self.tree.column(right, "width")),
+                             subject_stretch)
+        return "break"
+
+    def _on_tree_resize_motion(self, event) -> str | None:
+        if self._tree_resize is None:
+            return None
+        start_x, left, right, left_width, right_width, _ = self._tree_resize
+        delta = event.x - start_x
+        left_min = int(self.tree.column(left, "minwidth"))
+        right_min = int(self.tree.column(right, "minwidth"))
+        delta = max(left_min - left_width, min(delta, right_width - right_min))
+        new_left = left_width + delta
+        new_right = right_width - delta
+        unchanged = {name: int(self.tree.column(name, "width"))
+                     for name in self.tree["columns"] if name not in (left, right)}
+        self.tree.column(left, width=new_left)
+        self.tree.column(right, width=new_right)
+        for name, width in unchanged.items():
+            self.tree.column(name, width=width)
+        return "break"
+
+    def _on_tree_resize_end(self, _event) -> str | None:
+        if self._tree_resize is None:
+            return None
+        _, left, right, _, _, subject_stretch = self._tree_resize
+        if subject_stretch:
+            self.tree.column("subject", stretch=True)
+        self._tree_resize = None
         return "break"
 
     def _prepare_tree_popup(self, event) -> bool:

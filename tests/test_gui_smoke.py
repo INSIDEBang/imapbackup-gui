@@ -11,6 +11,7 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 """
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -1099,6 +1100,77 @@ def test_row_selection_clears_on_click_outside(app):
     click(app, app.tree, *row_center(ids[2]))
     assert app.tree.selection() == (ids[2],), app.tree.selection()
     app.tree.selection_set()  # 收尾：别把选中态留给后面的用例
+
+
+def test_mail_column_resize_only_redistributes_adjacent_columns(app, monkeypatch):
+    """四条可拖分隔线只改相邻列，拖动时冻结 subject stretch，释放后恢复。"""
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    for separator in range(1, 5):
+        before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+        monkeypatch.setattr(app.tree, "identify_column", lambda _x, n=separator: f"#{n}")
+        event = SimpleNamespace(x=100, y=2)
+        assert app._on_tree_resize_start(event) == "break"
+        assert int(app.tree.column("subject", "stretch")) == 0
+        assert app._on_tree_resize_motion(SimpleNamespace(x=110)) == "break"
+        after = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+        left, right = app.tree["columns"][separator - 1:separator + 1]
+        assert after[left] != before[left]
+        assert after[right] != before[right]
+        for name in app.tree["columns"]:
+            if name not in (left, right):
+                assert after[name] == before[name], (separator, name)
+        app._on_tree_resize_end(event)
+        assert int(app.tree.column("subject", "stretch")) == 1
+
+
+def test_mail_size_column_stays_inside_tree_boundary(app, monkeypatch):
+    """大小列不能被拖到邮件表格右侧滚条之外，且仍尊重最小宽度。"""
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#4")
+    widths = [int(app.tree.column(name, "width")) for name in app.tree["columns"]]
+    boundary = sum(widths) + 5
+    monkeypatch.setattr(app.tree, "winfo_width", lambda: boundary)
+    event = SimpleNamespace(x=100, y=2)
+    app._on_tree_resize_start(event)
+    app._on_tree_resize_motion(SimpleNamespace(x=0))
+    final = sum(int(app.tree.column(name, "width")) for name in app.tree["columns"])
+    assert final <= boundary
+    assert int(app.tree.column("size", "width")) >= int(app.tree.column("size", "minwidth"))
+    app._on_tree_resize_end(event)
+
+
+def test_mail_size_column_can_grow_when_dragging_left_boundary_left(app, monkeypatch):
+    """大小列左缘向左拖时，大小变宽且邮箱文件夹等量变窄。"""
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#4")
+    widths = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    monkeypatch.setattr(app.tree, "winfo_width", lambda: sum(widths.values()))
+    event = SimpleNamespace(x=100, y=2)
+    assert app._on_tree_resize_start(event) == "break"
+    assert app._on_tree_resize_motion(SimpleNamespace(x=90)) == "break"
+    assert int(app.tree.column("size", "width")) == widths["size"] + 10
+    assert int(app.tree.column("folder", "width")) == widths["folder"] - 10
+    app._on_tree_resize_end(event)
+
+
+def test_mail_size_right_boundary_is_not_draggable(app, monkeypatch):
+    """大小列右缘不可拖，但 folder|size 左缘仍可进入拖拽。"""
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#5")
+    assert app._on_tree_resize_start(SimpleNamespace(x=100, y=2)) == "break"
+
+
+def test_mail_column_resize_uses_treeview_native_minwidth(app, monkeypatch):
+    """拖拽下限读取 Treeview 的原生 minwidth，而不是 GUI 常量。"""
+    native_minwidth = int(app.tree.column("from", "minwidth"))
+    app.tree.column("from", minwidth=native_minwidth)
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#1")
+    event = SimpleNamespace(x=100, y=2)
+    assert app._on_tree_resize_start(event) == "break"
+    app._on_tree_resize_motion(SimpleNamespace(x=-100))
+    assert int(app.tree.column("from", "width")) == native_minwidth
+    app._on_tree_resize_end(event)
 
 
 def test_entry_context_menu_has_three_actions(app, monkeypatch):
