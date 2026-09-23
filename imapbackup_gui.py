@@ -473,11 +473,9 @@ class BackupApp:
         list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        # 页签的边框由包裹层统一提供；Treeview 在 vista 主题自带 field 边框，与包裹线隔 2px 相望
-        # 成「双线」（探针实测，issues/15）。这里用派生样式只压平它的外框（表头与内容不受影响），
-        # 页签里就只剩包裹层一条线，与「邮箱文件夹」面板的单线观感一致。
-        ttk.Style().layout("Mail.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        self.tree = ttk.Treeview(list_frame, style="Mail.Treeview",
+        # 表格保留 vista 主题自带的 field 边框（不压平）：它现在与包裹边框隔着灰边距、不再贴成
+        # 双线，白底表格因此有自己的轮廓——与日志板的下沉边缘同一口径（用户复核，issues/15）。
+        self.tree = ttk.Treeview(list_frame,
                                  columns=("from", "subject", "when", "folder", "size"), show="headings")
         self.tree.heading("from", text="发件人")
         self.tree.heading("subject", text="主题")
@@ -493,8 +491,9 @@ class BackupApp:
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        tree_scroll.grid(row=0, column=1, sticky="ns")
+        # 四周留 4px 灰边距（右缘贴滚条、不留缝），边框与内容之间处处等距（用户口径：按下边距统一）
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        tree_scroll.grid(row=0, column=1, sticky="ns", pady=4)
         self.list_ph = self._empty_hint(list_frame, LIST_PLACEHOLDER_TEXT, 0, 0)
         # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的
         # 路径是主窗口内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview
@@ -516,17 +515,17 @@ class BackupApp:
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
         log_toolbar = tk.Frame(log_frame)
-        # 左边距与板面留白、文件夹面板的工具栏同值（6px），一行按钮与板面左缘对齐
-        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=6, pady=(2, 0))
+        # 按钮与板面同一竖线；左/上留白与板面一样按 4px 统一（用户口径：按下边距统一）
+        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=4, pady=(4, 0))
         tk.Button(log_toolbar, text="打开日志文件夹", command=self._on_open_log_dir).pack(side="left")
         # 日志板保留 Tk 自带的下沉边框：那圈凹陷边缘是「白色板面」的视觉标识，压平后白底与
         # 灰底直接相接很违和（用户复核，issues/15）。四周留出灰边距，免得这圈边缘与包裹边框
-        # 贴成双线——与「邮箱文件夹」面板里画布的 6/4 留白同构；右侧贴住滚条、不留缝。
+        # 贴成双线；右侧贴住滚条、不留缝。边距一律 4px：以原本最短的下边距为准（用户口径）。
         self.log_text = tk.Text(log_frame, state="disabled", wrap="none", background="#ffffff")
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=(4, 0), pady=4)
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_scroll = log_scroll
-        log_scroll.grid(row=1, column=1, sticky="ns")
+        log_scroll.grid(row=1, column=1, sticky="ns", pady=4)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         # 日志只读但可选中：右键「复制全部」把整份日志放进剪贴板，排障转发用
         self.log_text.bind("<Button-3>", self._on_log_context)

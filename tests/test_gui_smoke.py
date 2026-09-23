@@ -759,17 +759,41 @@ def test_right_edges_share_one_baseline(app):
         assert right(frame) - right(scroll) == border, (
             frame, right(frame), right(scroll), border)
 
-    # 日志板自己的下沉边框与四周留白：白板不能像树那样压平——去掉凹陷边缘后白底与灰底直接
-    # 相接很违和（用户复核，issues/15）；留白同时保证这圈边缘不与包裹边框贴成双线，
-    # 右侧则贴住滚条不留缝。
+    # 内外边框之间的留白处处 4px（用户口径：按最短的下边距统一）。日志板保留 Tk 自带的下沉
+    # 边框——压平后白底与灰底直接相接很违和（用户复核，issues/15）；右侧贴住滚条、不留缝。
     assert int(app.log_text.cget("borderwidth")) >= 1, app.log_text.cget("borderwidth")
     assert str(app.log_text.cget("relief")) == "sunken", app.log_text.cget("relief")
-    assert left(app.log_text) > left(app.log_frame) + border, (
-        left(app.log_text), left(app.log_frame), border)
+    lf_left, lf_top = left(app.log_frame) + border, app.log_frame.winfo_rooty() + border
+    lf_bottom = app.log_frame.winfo_rooty() + app.log_frame.winfo_height() - border
+    assert left(app.log_text) - lf_left == 4, (left(app.log_text), lf_left)
+    assert lf_bottom - (app.log_text.winfo_rooty() + app.log_text.winfo_height()) == 4, (
+        lf_bottom, app.log_text.winfo_rooty() + app.log_text.winfo_height())
     assert right(app.log_text) == left(app.log_scroll), (right(app.log_text), left(app.log_scroll))
+    # 滚条与板面同高（都在工具栏下面那一行）
+    assert (app.log_scroll.winfo_rooty(), app.log_scroll.winfo_height()) == (
+        app.log_text.winfo_rooty(), app.log_text.winfo_height()), (
+        app.log_scroll.winfo_rooty(), app.log_scroll.winfo_height(),
+        app.log_text.winfo_rooty(), app.log_text.winfo_height())
+    log_toolbar = [w for w in app.log_frame.winfo_children() if isinstance(w, tk.Frame)][0]
+    assert left(log_toolbar) == left(app.log_text), (left(log_toolbar), left(app.log_text))
+    assert left(log_toolbar) - lf_left == 4, (left(log_toolbar), lf_left)
+    assert log_toolbar.winfo_rooty() - lf_top == 4, (log_toolbar.winfo_rooty(), lf_top)
 
     app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
     app.root.update()
+
+    # 邮件列表的表格同样带 4px 灰边距，并保留 vista 自带的 field 边框（style 用默认值）：
+    # 隔着灰边距它不再与包裹边框贴成双线，白底表格因此有自己的轮廓。
+    assert str(app.tree.cget("style")) == "", app.tree.cget("style")  # 空 = 默认 "Treeview"
+    assert "Treeview.field" in str(g.ttk.Style().layout("Treeview")), g.ttk.Style().layout("Treeview")
+    li_left, li_top = left(app.list_frame) + border, app.list_frame.winfo_rooty() + border
+    li_bottom = app.list_frame.winfo_rooty() + app.list_frame.winfo_height() - border
+    assert left(app.tree) - li_left == 4, (left(app.tree), li_left)
+    assert app.tree.winfo_rooty() - li_top == 4, (app.tree.winfo_rooty(), li_top)
+    assert li_bottom - (app.tree.winfo_rooty() + app.tree.winfo_height()) == 4, (
+        li_bottom, app.tree.winfo_rooty() + app.tree.winfo_height())
+    assert right(app.tree) == left(app.tree_scroll), (right(app.tree), left(app.tree_scroll))
+    assert app.tree_scroll.winfo_rooty() - li_top == 4, (app.tree_scroll.winfo_rooty(), li_top)
 
     # 两条遮盖窄条正好盖住 notebook 客户区的 1px/3px 内缩带（宽 = 实测内缩）。将来换主题或
     # DPI 让内缩变了，这里会炸出来，提醒同步改窄条宽度与容器内边距。
