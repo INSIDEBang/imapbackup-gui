@@ -275,6 +275,7 @@ class BackupApp:
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
         self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
         self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
+        self._entry_widget_paths_cache: frozenset[str] | None = None  # 5 个输入框的控件路径；左键入口首用构建
 
         self._build_config_area()
         self._build_run_area()
@@ -464,10 +465,12 @@ class BackupApp:
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
         self.list_ph = self._empty_hint(list_tab, LIST_PLACEHOLDER_TEXT, 0, 0)
-        # 选中高亮只有一个出口，与滚轮同一套「窗口级单入口」：绑在 root 上（root 的路径是主窗口
-        # 内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview 的类绑定
-        # 先完成换选，本入口识别出「是行」就放行；其余落点（列表空白、列标题、配置区……）一律清掉。
-        self.root.bind("<Button-1>", self._on_click_clear_selection)
+        # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的
+        # 路径是主窗口内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview
+        # 的类绑定先完成换选，本入口识别出「是行」就放行；其余落点（列表空白、列标题、配置区……）
+        # 一律清掉选中。焦点收尾只看一种情况：点击落在不接焦点的控件（标签、空白、按钮、文件夹行、
+        # 禁用中的输入框）时，把焦点从输入框收归主窗口——点输入框/列表/日志文本时类绑定已转走焦点。
+        self.root.bind("<Button-1>", self._on_click_clear_selection_and_focus)
         # 右键与左键互不干扰：点在行上弹「复制单元格」菜单（先按 Windows 惯例选中该行），
         # 空白与列标题不弹也不动选中——判断与副作用都在 _prepare_tree_popup 里。
         self.tree.bind("<Button-3>", self._on_tree_context)
@@ -929,23 +932,38 @@ class BackupApp:
             widget = getattr(widget, "master", None)
         return False
 
-    def _on_click_clear_selection(self, event) -> None:
-        """主窗口唯一的左键入口：鼠标落在邮件行之外，就清掉邮件列表的选中高亮。
+    def _entry_widget_paths(self) -> frozenset[str]:
+        """5 个输入框的控件路径（首用构建后缓存）：焦点归属判定用。"""
+        if self._entry_widget_paths_cache is None:
+            self._entry_widget_paths_cache = frozenset(
+                str(w) for w in (self.user_entry, self.server_entry, self.port_entry,
+                                 self.password_entry, self.outdir_entry))
+        return self._entry_widget_paths_cache
+
+    def _on_click_clear_selection_and_focus(self, event) -> None:
+        """主窗口唯一的左键入口：清邮件列表选中高亮，并把输入框焦点收归主窗口。
 
         只清理、不拦截：返回 None 让 bindtag 链照常走完（点行/换选是 Treeview 类绑定的事，
-        本入口在类绑定之后执行，那时选中已就位，识别出「是行」就别动它）。例外两个：邮件列表
-        自己的滚条——拖它多半是在查看选中行，不能误伤；Alt-Tab 切窗口不产生 Button-1，天然
-        不清，与资源管理器「切走再回来高亮还在」一致。
+        本入口在类绑定之后执行，那时选中已就位，识别出「是行」就别动它）。选中与焦点共用两个
+        例外：邮件列表自己的滚条——拖它多半是在查看选中行，不能误伤，焦点也一并保留；Alt-Tab
+        切窗口不产生 Button-1，天然不清，与资源管理器「切走再回来高亮还在」一致。焦点只在
+        「点击后焦点仍在某个输入框、且落点不是这个框」时收归主窗口：Tk 只让输入框、列表、日志
+        文本在点击时接焦（禁用中的输入框不接），其余落点（标签、空白、按钮、勾选框）焦点原地
+        不动，正需要这里收走。
         """
-        if not self.tree.selection():
-            return  # 无选中是常态：提前退出，之后的点击零代价
+        entry_paths = self._entry_widget_paths()
+        focused = self.root.focus_get()
+        focused_in_entry = focused is not None and str(focused) in entry_paths
+        if not self.tree.selection() and not focused_in_entry:
+            return  # 无选中且焦点不在输入框是常态：提前退出，之后的点击零代价
         widget = str(event.widget)  # 路径比较而非对象同一性，理由同 _wheel_in_folder_panel
-        if widget == str(self.tree):
-            if self.tree.identify_row(event.y):
-                return  # 点中行：换选或多选交给 Treeview 自己
-        elif widget == str(self.tree_scroll):
-            return
+        if widget == str(self.tree_scroll):
+            return  # 列表滚条：查看选中行用的，选中与焦点都不动
+        if widget == str(self.tree) and self.tree.identify_row(event.y):
+            return  # 点中行：换选或多选交给 Treeview 自己
         self.tree.selection_set()  # 不带参数即清空选中
+        if focused_in_entry and widget != str(focused):
+            self.root.focus_set()  # 焦点收归主窗口：输入框光标消失，Tab 从第一个控件重新开始
 
     def _on_open_log_dir(self) -> None:
         try:

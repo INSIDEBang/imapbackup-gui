@@ -1221,3 +1221,86 @@ def test_log_context_menu_copies_selection_and_all(app, monkeypatch):
     app.root.update()
     assert app.root.clipboard_get() == "第一", repr(app.root.clipboard_get())
     assert app.log_text.cget("state") == "disabled", "复制不该动到日志的只读态"
+
+
+def test_entry_focus_clears_on_click_outside(app):
+    """输入框焦点与邮件选中同一口径：点非输入框的开阔地（标签、面板空白、滚条）即收归主窗口；
+    输入框自身与邮件列表滚条是例外。
+
+    回归自：点别处焦点留在输入框，只有点邮件列表区才走得掉（探针实测，issues/14）。收归后
+    focus_get() 是主窗口路径（'.'）；点可聚焦控件（另一个输入框、列表）时 Tk 类绑定完成自然
+    转移，本入口不插手也不抢占。测试窗口非前台，先 focus_force 立起「焦点在框里」这个前提。
+    """
+    def focus_path():
+        f = app.root.focus_get()
+        return None if f is None else str(f)
+
+    def walk(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from walk(child)
+
+    label = next(w for w in walk(app.root)
+                 if isinstance(w, tk.Label) and w.cget("text") == "帐号：")
+
+    app._clear_message_rows()
+    for i in range(1, 3):
+        app.events.put(("message", _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>")))
+    pump(app)
+    ids = app.tree.get_children()
+    assert len(ids) == 2, len(ids)
+
+    # 点不可聚焦的标签：选中与焦点一次点击各归各位
+    app.tree.selection_set(ids[0])
+    app.user_entry.focus_force()
+    app.root.update()
+    assert focus_path() == str(app.user_entry), focus_path()
+    click(app, label)
+    assert app.tree.selection() == (), app.tree.selection()
+    assert focus_path() == str(app.root), focus_path()
+
+    # 文件夹面板空白与其滚条：同为「别处」，焦点同样收归主窗口
+    for target in (app.folder_canvas, app.folder_scroll):
+        app.user_entry.focus_force()
+        app.root.update()
+        click(app, target)
+        assert focus_path() == str(app.root), (target, focus_path())
+
+    # 点输入框自身：正常编辑焦点保持；点另一个输入框：类绑定自然转移，本入口不许抢占
+    app.user_entry.focus_force()
+    app.root.update()
+    click(app, app.user_entry, 5, 5)
+    assert focus_path() == str(app.user_entry), focus_path()
+    click(app, app.server_entry, 5, 5)
+    assert focus_path() == str(app.server_entry), focus_path()
+
+    # 备份运行中配置区整片禁用：禁用输入框不接焦点（探针实测，issues/14），
+    # 点它不算「点了那个框」，旧焦点同样要收走，不能滞留在框里
+    app._set_config_enabled(False)
+    app.user_entry.focus_force()
+    app.root.update()
+    click(app, app.server_entry, 5, 5)
+    assert focus_path() == str(app.root), focus_path()
+    app._set_config_enabled(True)
+
+    # 点邮件列表（列标题区域）：Treeview 类绑定拿焦点，本入口不插手。
+    # 列表页签要摆到前台：上一用例把 notebook 留在了日志页签，不可映射的控件拿不到焦点
+    app.notebook.select(app.tree.master)
+    app.root.update()
+    app.user_entry.focus_force()
+    app.root.update()
+    click(app, app.tree, 30, 2)
+    assert focus_path() == str(app.tree), focus_path()
+
+    # 例外：邮件列表自己的滚条——滚动查看时的点击，选中与焦点都保持
+    app.tree.selection_set(ids[0])
+    app.user_entry.focus_force()
+    app.root.update()
+    app.tree_scroll.event_generate("<Button-1>")
+    app.tree_scroll.event_generate("<ButtonRelease-1>")
+    app.root.update()
+    assert app.tree.selection() == (ids[0],), app.tree.selection()
+    assert focus_path() == str(app.user_entry), focus_path()
+
+    app.root.focus_set()  # 收尾：不把聚焦与选中态留给后续用例
+    app.tree.selection_set()
