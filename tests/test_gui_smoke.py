@@ -177,6 +177,11 @@ def test_window_initial_state(app):
     assert app.folder_ph.winfo_manager() == "grid"
     assert app.list_ph.cget("text") == g.LIST_PLACEHOLDER_TEXT
     assert app.list_ph.winfo_manager() == "grid"
+    # 两个页签各有一层与「邮箱文件夹」面板同款的外包边框；空态提示挂在框内
+    # （控件同一性在 tkinter 里不稳，按路径比较，理由同滚轮入口）
+    assert str(app.list_frame.master) == str(app.list_tab)
+    assert str(app.log_frame.master) == str(app.log_tab)
+    assert str(app.list_ph.master) == str(app.list_frame)
 
 
 def test_button_icons_are_code_drawn_in_color(app):
@@ -744,9 +749,20 @@ def test_right_edges_share_one_baseline(app):
     assert right(app.folder_group) - right(app.folder_scroll) == border, (
         right(app.folder_group), right(app.folder_scroll), border)
 
-    # 跨面板观感：文件夹滚条与邮件列表滚条的右边线差 ≤ 2px（实测 1px，差在 ttk 主题内边距）
-    assert abs(right(app.folder_scroll) - right(app.tree_scroll)) <= 2, (
-        right(app.folder_scroll), right(app.tree_scroll))
+    # 两个页签的包裹层同款：与面板同值的边框宽度，滚条贴包裹边框内侧、右缘与上方面板右缘
+    # 同一条基线。差 3px = notebook 客户区的右内缩（vista 主题实测；padding 与样式 layout 都
+    # 吃不动，探针见 issues/15），视觉上两条线连续；容差就按实测的 3px 留。
+    for tab, frame, scroll in ((app.list_tab, app.list_frame, app.tree_scroll),
+                               (app.log_tab, app.log_frame, app.log_scroll)):
+        assert int(frame.cget("borderwidth")) == border, (frame, frame.cget("borderwidth"))
+        app.notebook.select(tab)  # 非当前页签的控件未映射，量不到几何
+        app.root.update()
+        assert right(frame) - right(scroll) == border, (
+            frame, right(frame), right(scroll), border)
+        gap = right(app.folder_group) - right(frame)
+        assert 0 <= gap <= 3, (frame, gap)
+    app.notebook.select(app.list_tab)  # 复位：后续用例默认在列表页签上
+    app.root.update()
 
 
 def test_folder_panel_wheel_covers_the_whole_panel(app):
@@ -814,7 +830,7 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
     assert canvas.canvasy(0) == notch
 
     # 面板外（下方两页签）的滚轮不该动到文件夹面板，且它们自己照常滚
-    app.notebook.select(app.tree.master)                # 只有选中的页签才真的会滚
+    app.notebook.select(app.list_tab)                   # 只有选中的页签才真的会滚
     for _ in range(20):
         app.tree.insert("", "end", values=("from", "主题", "2026-09-21", "INBOX", "1 KB"))
     app.root.update()
@@ -906,8 +922,9 @@ def test_loading_buttons_keep_their_height(app):
 
     回归自：用户看到运行中的开始按钮比旁边的停止按钮高一块。探针量出的根因不是盲文帧，
     而是加载态把 image 撤成 ""——Tk 的按钮请求高度取决于「有没有 image」（同一按钮实测
-    有图 28px / 无图 30px，与文案是中文还是盲文帧无关）。修法是加载态换一枚同尺寸的
-    全透明占位图（blank_icon），图标槽一直占着、只换里面的像素。
+    有图 28px / 无图 30px，与文案是中文还是盲文帧无关）。修法是加载态换一枚全透明占位图
+    （blank_icon）：照旧占着「有 image」这个高度前提，宽度只留 1px——转圈符贴近左边框、
+    左右留白与静止态一样对称（回归自：占位按整图标宽时左边一大块空白、左松右紧）。
     断言只比同一颗按钮的前后高度，不钉绝对像素值（异 DPI/主题下数字会变）。
     """
     app.root.geometry("960x736")
@@ -928,6 +945,9 @@ def test_loading_buttons_keep_their_height(app):
     app._stop_run_spinner()                            # 停掉真实帧链，免得它把文案改回别的帧
     app.root.update()
     assert app.start_btn.cget("image") == str(app.blank_icon), app.start_btn.cget("image")
+    # 占位只借高度、不占宽：1px 宽 × 图标高，转圈符才贴近左边框
+    assert (app.blank_icon.width(), app.blank_icon.height()) == (1, g._icon_size()), (
+        app.blank_icon.width(), app.blank_icon.height())
     assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
         app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
 
@@ -1161,7 +1181,7 @@ def test_log_context_menu_copies_selection_and_all(app, monkeypatch):
 
     # 日志页签摆到前台，并让窗口先完成一次映射：合成的鼠标/按键事件要有真实窗口才派发——
     # 孤立跑本用例（前面的用例都没跑）时少了这一步，事件会被丢掉，菜单状态停在默认值上。
-    app.notebook.select(app.log_text.master)
+    app.notebook.select(app.log_tab)
     app.root.update()
     app._pump()  # 先放完队列里排着的启动日志，断言期间不再冒新行
 
@@ -1275,17 +1295,20 @@ def test_entry_focus_clears_on_click_outside(app):
     assert focus_path() == str(app.server_entry), focus_path()
 
     # 备份运行中配置区整片禁用：禁用输入框不接焦点（探针实测，issues/14），
-    # 点它不算「点了那个框」，旧焦点同样要收走，不能滞留在框里
+    # 点它不算「点了那个框」，旧焦点同样要收走，不能滞留在框里。
+    # 前提断言先立住：focus_set 是「非强制」的，若测试窗口在点击当刻失去了前台
+    # （外部抢焦点，偶发），断言失败会变成一笔糊涂账——先确认焦点真的在框里。
     app._set_config_enabled(False)
     app.user_entry.focus_force()
     app.root.update()
+    assert focus_path() == str(app.user_entry), focus_path()
     click(app, app.server_entry, 5, 5)
     assert focus_path() == str(app.root), focus_path()
     app._set_config_enabled(True)
 
     # 点邮件列表（列标题区域）：Treeview 类绑定拿焦点，本入口不插手。
     # 列表页签要摆到前台：上一用例把 notebook 留在了日志页签，不可映射的控件拿不到焦点
-    app.notebook.select(app.tree.master)
+    app.notebook.select(app.list_tab)
     app.root.update()
     app.user_entry.focus_force()
     app.root.update()

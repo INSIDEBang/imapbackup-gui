@@ -211,14 +211,15 @@ def _stop_icon(color: str, size: int) -> tk.PhotoImage:
     return img
 
 
-def _blank_icon(size: int) -> tk.PhotoImage:
-    """与彩色图标同尺寸的全透明位图（一个像素都不画）。
+def _blank_icon(height: int) -> tk.PhotoImage:
+    """高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
 
     加载态不能把 image 撤成 ""：Tk 的按钮请求高度取决于「有没有 image」——实测同一按钮
-    带图 28px、撤图 30px，与文案是中文还是盲文帧无关。撤图换成它，图标槽的宽高照旧占着，
-    按钮高度在加载/静止之间不动（宽度只随文案走），换的只是槽里的像素。
+    带图 28px、撤图 30px，与文案是中文还是盲文帧无关。保留一枚 1px 宽的占位只借它的高度：
+    按钮高度在加载/静止之间不动，而图标槽不再占宽——转圈符贴近左边框，左右留白与静止态
+    一样对称。
     """
-    return tk.PhotoImage(width=size, height=size)
+    return tk.PhotoImage(width=1, height=height)
 
 
 def _another_instance_running() -> bool:
@@ -429,6 +430,15 @@ class BackupApp:
 
     # --------------------------------------------------------------- run area
 
+    def _panel_style_frame(self, parent: tk.Widget) -> tk.Frame:
+        """与「邮箱文件夹」面板同款的外包边框：groove + 面板同值的边框宽度。
+
+        取面板的 borderwidth 而不是写死常数，是为了两处永远同款；面板先于本区构建
+        （_build_config_area 在前），这里能安全读到。
+        """
+        return tk.Frame(parent, relief="groove",
+                        borderwidth=int(self.folder_group.cget("borderwidth")))
+
     def _build_run_area(self) -> None:
         run = tk.Frame(self.root)
         run.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -443,11 +453,22 @@ class BackupApp:
         self.notebook = ttk.Notebook(run)
         self.notebook.pack(fill="both", expand=True)
 
-        list_tab = tk.Frame(self.notebook)
+        list_tab = self.list_tab = tk.Frame(self.notebook)
         self.notebook.add(list_tab, text="邮件列表")
         list_tab.columnconfigure(0, weight=1)
         list_tab.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(list_tab, columns=("from", "subject", "when", "folder", "size"), show="headings")
+        # 页签内容套一层与「邮箱文件夹」面板同款的外包边框：滚条包在框内、贴着边框内侧，
+        # 右缘才与上方面板线落在同一条线上。页签容器只做占位。
+        list_frame = self.list_frame = self._panel_style_frame(list_tab)
+        list_frame.grid(row=0, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        # 页签的边框由包裹层统一提供；Treeview 在 vista 主题自带 field 边框，与包裹线隔 2px 相望
+        # 成「双线」（探针实测，issues/15）。这里用派生样式只压平它的外框（表头与内容不受影响），
+        # 页签里就只剩包裹层一条线，与「邮箱文件夹」面板的单线观感一致。
+        ttk.Style().layout("Mail.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        self.tree = ttk.Treeview(list_frame, style="Mail.Treeview",
+                                 columns=("from", "subject", "when", "folder", "size"), show="headings")
         self.tree.heading("from", text="发件人")
         self.tree.heading("subject", text="主题")
         self.tree.heading("when", text="时间")
@@ -459,12 +480,12 @@ class BackupApp:
         self.tree.column("folder", width=140, stretch=False)
         self.tree.column("size", width=90, anchor="e", stretch=False)
         self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
-        tree_scroll = ttk.Scrollbar(list_tab, orient="vertical", command=self.tree.yview)
+        tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
-        self.list_ph = self._empty_hint(list_tab, LIST_PLACEHOLDER_TEXT, 0, 0)
+        self.list_ph = self._empty_hint(list_frame, LIST_PLACEHOLDER_TEXT, 0, 0)
         # 选中高亮与输入框焦点共用同一个「窗口级单入口」，与滚轮同一套路：绑在 root 上（root 的
         # 路径是主窗口内所有控件的 toplevel bindtag），任何控件上的左键都流经这里。点行时 Treeview
         # 的类绑定先完成换选，本入口识别出「是行」就放行；其余落点（列表空白、列标题、配置区……）
@@ -475,16 +496,25 @@ class BackupApp:
         # 空白与列标题不弹也不动选中——判断与副作用都在 _prepare_tree_popup 里。
         self.tree.bind("<Button-3>", self._on_tree_context)
 
-        log_tab = tk.Frame(self.notebook)
+        log_tab = self.log_tab = tk.Frame(self.notebook)
         self.notebook.add(log_tab, text="运行日志")
         log_tab.columnconfigure(0, weight=1)
-        log_tab.rowconfigure(1, weight=1)
-        log_toolbar = tk.Frame(log_tab)
+        log_tab.rowconfigure(0, weight=1)
+        # 与邮件列表同一套外包边框：工具栏一起包进去，与文件夹面板「工具钮在框内」同构
+        log_frame = self.log_frame = self._panel_style_frame(log_tab)
+        log_frame.grid(row=0, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+        log_toolbar = tk.Frame(log_frame)
         log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=4, pady=2)
         tk.Button(log_toolbar, text="打开日志文件夹", command=self._on_open_log_dir).pack(side="left")
-        self.log_text = tk.Text(log_tab, state="disabled", wrap="none", background="#ffffff")
+        # 与树同理：Text 自带的 1px 下沉边框会与包裹线隔 1px 成双线（探针实测，issues/15），
+        # 压平后页签里只剩包裹层一条线
+        self.log_text = tk.Text(log_frame, state="disabled", wrap="none", background="#ffffff",
+                                borderwidth=0)
         self.log_text.grid(row=1, column=0, sticky="nsew")
-        log_scroll = ttk.Scrollbar(log_tab, orient="vertical", command=self.log_text.yview)
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_scroll = log_scroll
         log_scroll.grid(row=1, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
         # 日志只读但可选中：右键「复制全部」把整份日志放进剪贴板，排障转发用
