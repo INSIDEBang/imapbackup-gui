@@ -103,6 +103,11 @@ LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封�
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui"
 COLUMN_CONFIG_PATH = APP_DATA_DIR / "treeview-columns.json"
 MAIL_COLUMNS = ("from", "subject", "when", "folder", "size")
+UI_SETTINGS_VERSION = 1
+DEFAULT_WINDOW_WIDTH = 960
+DEFAULT_WINDOW_HEIGHT = 736
+MIN_WINDOW_WIDTH = 800
+MIN_WINDOW_HEIGHT = 620
 ELLIPSIS = "…"                    # 截断省略号，与「正在连接…」同一字符
 PROGRESS_MIN_WIDTH = 80           # 进度条地板宽度(px)：计数文字变长先压进度条，触底才开始截断文字
 TIP_DELAY_MS = 400                # 悬停多久后弹气泡
@@ -250,13 +255,15 @@ class BackupApp:
             except tk.TclError:
                 pass  # 非 Windows 平台没有 iconbitmap，或图标不可读时退回 Tk 默认图标
         self.root.title("IMAP Backup GUI")
-        self.root.geometry("960x736")
-        self.root.minsize(800, 620)
+        self.root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.events: queue.Queue[tuple] = queue.Queue()
         self.stop_flag = threading.Event()
         self.log = logging.getLogger("gui")
         self._setup_logging()
+        self._ui_settings = self._read_ui_settings()
+        self._normal_geometry = self._restore_window_settings()
 
         # ---- state ----
         self.connect_state = "idle"  # idle | connecting | connected | stale
@@ -290,6 +297,7 @@ class BackupApp:
         self._build_run_area()
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._apply_connect_state()
         self._update_start_state()
 
@@ -1054,29 +1062,90 @@ class BackupApp:
         for widget in widgets:
             widget.bind("<Button-3>", self._on_entry_context)
 
-    def _load_column_config(self) -> None:
-        """Load only the five column widths; credentials and other UI state never enter this file."""
+    def _read_ui_settings(self) -> dict:
         try:
             with COLUMN_CONFIG_PATH.open(encoding="utf-8") as stream:
                 raw = json.load(stream)
-            if (not isinstance(raw, dict) or set(raw) != set(MAIL_COLUMNS)
-                    or any(isinstance(raw[name], bool) or not isinstance(raw[name], int)
-                           for name in MAIL_COLUMNS)
-                    or any(raw[name] < int(self.tree.column(name, "minwidth"))
-                           for name in MAIL_COLUMNS)):
-                raise ValueError("invalid or incomplete column widths")
-            self.tree.column("subject", stretch=False)
-            for name in MAIL_COLUMNS:
-                self.tree.column(name, width=raw[name])
-            self._column_config_loaded = True
+            if (isinstance(raw, dict) and set(raw) == set(MAIL_COLUMNS)
+                    and all(isinstance(raw[name], int) and not isinstance(raw[name], bool)
+                            for name in MAIL_COLUMNS)):
+                return {"version": UI_SETTINGS_VERSION, "columns": raw}
+            if not isinstance(raw, dict) or raw.get("version") != UI_SETTINGS_VERSION:
+                raise ValueError("unsupported UI settings format")
+            columns = raw.get("columns")
+            if columns is not None and not isinstance(columns, dict):
+                raise ValueError("invalid columns section")
+            return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window")}
         except FileNotFoundError:
-            return
+            return {"version": UI_SETTINGS_VERSION}
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            self.log.warning("忽略无效的邮件列表列宽配置 %s: %s", COLUMN_CONFIG_PATH, exc)
+            self.log.warning("忽略无效的界面设置 %s: %s", COLUMN_CONFIG_PATH, exc)
+            return {"version": UI_SETTINGS_VERSION}
+
+    def _restore_window_settings(self) -> tuple[int, int, int, int]:
+        window = self._ui_settings.get("window")
+        if window is None:
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        if not isinstance(window, dict):
+            self.log.warning("忽略无效的窗口状态配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        geometry = window.get("normal_geometry")
+        if not isinstance(geometry, dict):
+            self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        values = tuple(geometry.get(name) for name in ("width", "height", "x", "y"))
+        if (any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+                or values[0] < MIN_WINDOW_WIDTH or values[1] < MIN_WINDOW_HEIGHT):
+            self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        width, height, x, y = values
+        maximized = window.get("maximized", False)
+        if not isinstance(maximized, bool):
+            self.log.warning("忽略无效的窗口最大化配置 %s", COLUMN_CONFIG_PATH)
+            maximized = False
+        self.root.geometry(f"{width}x{height}")
+        if self._window_position_visible(width, height, x, y):
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        else:
+            self.log.warning("窗口位置不在当前显示器范围内，使用默认位置")
+        self.root.update_idletasks()
+        if maximized:
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                self.log.warning("无法恢复窗口最大化状态")
+        return values
+
+    def _window_position_visible(self, width: int, height: int, x: int, y: int) -> bool:
+        left = self.root.winfo_vrootx()
+        top = self.root.winfo_vrooty()
+        right = left + self.root.winfo_vrootwidth()
+        bottom = top + self.root.winfo_vrootheight()
+        return x < right and x + width > left and y < bottom and y + height > top
+
+    def _load_column_config(self) -> None:
+        """Load five widths while allowing window settings to be invalid independently."""
+        self._ui_settings = self._read_ui_settings()
+        raw = self._ui_settings.get("columns")
+        if (not isinstance(raw, dict) or set(raw) != set(MAIL_COLUMNS)
+                or any(isinstance(raw[name], bool) or not isinstance(raw[name], int)
+                       for name in MAIL_COLUMNS)
+                or any(raw[name] < int(self.tree.column(name, "minwidth"))
+                       for name in MAIL_COLUMNS)):
+            if raw is not None:
+                self.log.warning("忽略无效的邮件列表列宽配置 %s", COLUMN_CONFIG_PATH)
+            return
+        self.tree.column("subject", stretch=False)
+        for name in MAIL_COLUMNS:
+            self.tree.column(name, width=raw[name])
+        self._column_config_loaded = True
 
     def _save_column_config(self) -> None:
-        """Atomically persist widths, leaving the live layout untouched on any failure."""
+        """Atomically persist all UI settings, leaving the live layout untouched on failure."""
         widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        self._ui_settings["version"] = UI_SETTINGS_VERSION
+        self._ui_settings["columns"] = widths
+        self._ui_settings["window"] = self._window_settings()
         temporary: Path | None = None
         try:
             COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1084,7 +1153,7 @@ class BackupApp:
                                              prefix=f".{COLUMN_CONFIG_PATH.name}.",
                                              suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
-                json.dump(widths, stream, ensure_ascii=False, separators=(",", ":"))
+                json.dump(self._ui_settings, stream, ensure_ascii=False, separators=(",", ":"))
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, COLUMN_CONFIG_PATH)
@@ -1095,7 +1164,21 @@ class BackupApp:
                     temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-            self.log.warning("保存邮件列表列宽配置失败 %s: %s", COLUMN_CONFIG_PATH, exc)
+            self.log.warning("保存界面设置失败 %s: %s", COLUMN_CONFIG_PATH, exc)
+
+    def _window_settings(self) -> dict:
+        width, height, x, y = self._normal_geometry
+        return {
+            "normal_geometry": {"width": width, "height": height, "x": x, "y": y},
+            "maximized": self.root.state() == "zoomed",
+        }
+
+    def _on_root_configure(self, _event) -> None:
+        if self.root.state() == "zoomed":
+            return
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        if width >= MIN_WINDOW_WIDTH and height >= MIN_WINDOW_HEIGHT:
+            self._normal_geometry = (width, height, self.root.winfo_x(), self.root.winfo_y())
 
     def _on_tree_configure(self, _event) -> None:
         if (not self._column_config_loaded or self._column_reflowing
@@ -1725,6 +1808,7 @@ class BackupApp:
     def _on_close(self) -> None:
         if self.running and not messagebox.askokcancel("退出", "备份正在进行中，确定要退出吗？", parent=self.root):
             return
+        self._save_column_config()
         self.root.destroy()
 
     def run(self) -> None:

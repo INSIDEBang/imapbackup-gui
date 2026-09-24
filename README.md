@@ -117,7 +117,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 **GUI settings and recovery contract**
 
-* UI settings are global to the Windows user, not keyed by account, folder or backup root. Window geometry, recoverable UI state and mail-list column widths use built-in defaults when absent or invalid.
+* UI settings are global to the Windows user, not keyed by account, folder or backup root. The versioned settings file stores normal window geometry, maximized state, and mail-list column widths; it restores normal geometry before maximization, keeps the last normal geometry while maximized, and falls back to the default position if a saved position is entirely off the current displays.
 * The settings file never contains passwords, server credentials, session tokens or message content. A missing, corrupt, incompatible or unwritable settings file must not block the GUI, connection or backup: recover with defaults or the last successfully saved values, keep the current process state, and report a diagnostic warning through the run log (or the existing console/status fallback when logging is unavailable).
 
 **Windows installer**

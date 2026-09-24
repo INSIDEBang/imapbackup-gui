@@ -1215,8 +1215,11 @@ def test_mail_column_config_save_is_atomic_and_excludes_credentials(app, monkeyp
     app.password_var.set("secret")
     app._save_column_config()
     assert app._column_config_loaded
-    assert json.loads(config.read_text(encoding="utf-8")) == {
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["version"] == g.UI_SETTINGS_VERSION
+    assert saved["columns"] == {
         name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    assert "window" in saved
     assert "secret" not in config.read_text(encoding="utf-8")
     before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
     warnings = []
@@ -1236,6 +1239,52 @@ def test_mail_column_release_saves_immediately(app, monkeypatch):
     app._on_tree_resize_start(event)
     app._on_tree_resize_end(event)
     assert saved == [True]
+
+
+def test_ui_settings_accept_legacy_columns_and_restore_window(app, monkeypatch, tmp_path):
+    config = tmp_path / "treeview-columns.json"
+    widths = {name: int(app.tree.column(name, "minwidth")) + 19 for name in app.tree["columns"]}
+    config.write_text(json.dumps(widths), encoding="utf-8")
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+    app._ui_settings = app._read_ui_settings()
+    assert app._ui_settings["columns"] == widths
+
+    app._ui_settings = {
+        "version": g.UI_SETTINGS_VERSION,
+        "columns": widths,
+        "window": {
+            "normal_geometry": {"width": 900, "height": 700, "x": 20, "y": 30},
+            "maximized": False,
+        },
+    }
+    monkeypatch.setattr(app, "_window_position_visible", lambda *_args: True)
+    app._normal_geometry = app._restore_window_settings()
+    assert app._normal_geometry == (900, 700, 20, 30)
+    assert app.root.geometry().startswith("900x700+20+30")
+
+
+def test_invalid_window_settings_do_not_discard_columns(app, monkeypatch, tmp_path):
+    config = tmp_path / "treeview-columns.json"
+    widths = {name: int(app.tree.column(name, "minwidth")) + 19 for name in app.tree["columns"]}
+    config.write_text(json.dumps({
+        "version": g.UI_SETTINGS_VERSION,
+        "columns": widths,
+        "window": {"normal_geometry": {"width": 1}, "maximized": True},
+    }), encoding="utf-8")
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+    app._ui_settings = app._read_ui_settings()
+    app._column_config_loaded = False
+    app._load_column_config()
+    assert {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]} == widths
+
+
+def test_close_saves_window_settings_before_destroy(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, "_save_column_config", lambda: calls.append("save"))
+    monkeypatch.setattr(app.root, "destroy", lambda: calls.append("destroy"))
+    app.running = False
+    app._on_close()
+    assert calls == ["save", "destroy"]
 
 
 def test_mail_column_restore_shrinks_proportionally_but_keeps_native_minwidth(app, monkeypatch):
