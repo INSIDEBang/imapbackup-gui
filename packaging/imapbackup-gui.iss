@@ -61,6 +61,7 @@ const
 
 var
   DeleteLogs: Boolean;
+  DeleteSettings: Boolean;
 
 // 命令行是否带 /NOSTYLE 标记。该开关本是官方惰性开关（禁用自定义样式，本脚本没定义
 // 样式，等于无副作用），由安装后钩子把它追加进 UninstallString（见 CurStepChanged），
@@ -155,12 +156,13 @@ function InitializeUninstall(): Boolean;
 var
   Form: TSetupForm;
   ContentTop: Integer;
-  DeleteLogsBox: TNewCheckBox;
+  DeleteLogsBox, DeleteSettingsBox: TNewCheckBox;
   HintLabel: TLabel;
   UninstallButton, CancelButton: TNewButton;
 begin
   Result := True;
   DeleteLogs := True;   // 默认＝删：真静默直接沿用，交互模式被窗体结果覆盖
+  DeleteSettings := True;
 
   if UninstallSilent() and (not ArpWizardMode()) then
     Exit;
@@ -180,10 +182,19 @@ begin
     DeleteLogsBox.Caption := '同时删除运行日志（含服务器地址与账号名，不含密码）';
     DeleteLogsBox.Checked := True;
 
+    DeleteSettingsBox := TNewCheckBox.Create(Form);
+    DeleteSettingsBox.Parent := Form;
+    DeleteSettingsBox.Left := DeleteLogsBox.Left;
+    DeleteSettingsBox.Top := DeleteLogsBox.Top + DeleteLogsBox.Height;
+    DeleteSettingsBox.Width := DeleteLogsBox.Width;
+    DeleteSettingsBox.Height := DeleteLogsBox.Height;
+    DeleteSettingsBox.Caption := '同时删除界面设置';
+    DeleteSettingsBox.Checked := True;
+
     HintLabel := TLabel.Create(Form);
     HintLabel.Parent := Form;
     HintLabel.Left := ScaleX(40);
-    HintLabel.Top := DeleteLogsBox.Top + DeleteLogsBox.Height + ScaleY(12);
+    HintLabel.Top := DeleteSettingsBox.Top + DeleteSettingsBox.Height + ScaleY(12);
     HintLabel.Transparent := True;
     HintLabel.Caption := '准备好后，单击「卸载(U)」开始卸载。';
 
@@ -210,7 +221,10 @@ begin
     UninstallButton.Left := CancelButton.Left - ScaleX(10) - UninstallButton.Width;
 
     if Form.ShowModal = mrOk then
-      DeleteLogs := DeleteLogsBox.Checked
+    begin
+      DeleteLogs := DeleteLogsBox.Checked;
+      DeleteSettings := DeleteSettingsBox.Checked;
+    end
     else
       Result := False;   // 取消/关窗/Esc：中止整个卸载，什么都不动
   finally
@@ -261,19 +275,25 @@ begin
 end;
 
 // 删除决策已在向导首页点「卸载」时锁定。挂 usPostUninstall（官方定义：卸载刚完成、
-// 文件已删；进度中途点「取消」走不到这里，日志自然保留的既有行为不变）。
+// 文件已删；进度中途点「取消」走不到这里，日志和设置自然保留）。
 // DelTree 的四个开关都要 True：日志目录有子目录，也可能有只读或隐藏文件。
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  AppDataDir: String;
+  LogDir, SettingsFile: String;
 begin
   if CurUninstallStep <> usPostUninstall then
     Exit;
 
   if DeleteLogs then begin
-    AppDataDir := ExpandConstant('{localappdata}\imapbackup-gui');
-    if DirExists(AppDataDir) then
-      DelTree(AppDataDir, True, True, True);
+    LogDir := ExpandConstant('{localappdata}\imapbackup-gui\log');
+    if DirExists(LogDir) then
+      DelTree(LogDir, True, True, True);
+  end;
+
+  if DeleteSettings then begin
+    SettingsFile := ExpandConstant('{localappdata}\imapbackup-gui\treeview-columns.json');
+    if FileExists(SettingsFile) then
+      DeleteFile(SettingsFile);
   end;
 
   // 完成对话框只在 ARP 向导模式补位——该路径的原生「已顺利移除」弹窗已被 /SILENT

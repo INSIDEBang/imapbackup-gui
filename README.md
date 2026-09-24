@@ -64,7 +64,7 @@ python imapbackup312.py --help
 python imapbackup_gui.py
 ```
 
-A single-window front-end for people who would rather not use a terminal: fill in the server, account and password, connect to load the account's folder tree (collapsible, with cascade-selectable checkboxes), pick a backup folder and the mbox/eml output, then start the backup and watch each message appear in the table with live server/pending/backed counts. Stop is cooperative (it finishes the current message), reruns are incremental, and the logs go to `%LOCALAPPDATA%\imapbackup-gui\log\` — one file per day, so an uninstaller can simply delete the folder. It runs the same backup code as the CLI above, so the two never drift apart. The interface text is Chinese.
+A single-window front-end for people who would rather not use a terminal: fill in the server, account and password, connect to load the account's folder tree (collapsible, with cascade-selectable checkboxes), pick a backup folder and the mbox/eml output, then start the backup and watch each message appear in the table with live server/pending/backed counts. Stop is cooperative (it finishes the current message), reruns are incremental, and the app data goes to `%LOCALAPPDATA%\imapbackup-gui\`: daily logs under `log\` plus per-user UI settings, including global mail-list column widths. Passwords and other credentials are never saved. It runs the same backup code as the CLI above, so the two never drift apart. The interface text is Chinese.
 
 ## What Changed in 1.5.2 (Experimental Python 3.12 modernization)
 
@@ -115,11 +115,16 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * Synthetic-ID fallback header fetch now uses `BODY.PEEK` (read-only invariant).
 * Console-stream guards so a future `--windowed` build cannot crash on missing stdin/stdout.
 
+**GUI settings and recovery contract**
+
+* UI settings are global to the Windows user, not keyed by account, folder or backup root. Window geometry, recoverable UI state and mail-list column widths use built-in defaults when absent or invalid.
+* The settings file never contains passwords, server credentials, session tokens or message content. A missing, corrupt, incompatible or unwritable settings file must not block the GUI, connection or backup: recover with defaults or the last successfully saved values, keep the current process state, and report a diagnostic warning through the run log (or the existing console/status fallback when logging is unavailable).
+
 **Windows installer**
 
 * `packaging\build.bat` runs PyInstaller (GUI and CLI executables sharing one runtime directory) and then Inno Setup, producing `dist\installer\imapbackup-gui-setup-<version>.exe`. The wizard is in Chinese, installs per-user (no administrator), and creates Start-menu entries for both executables; the desktop icon is an optional task.
 * The GUI is single-instance — a second launch exits with a message instead of opening a second window; the installer and uninstaller detect a running instance through the same mutex.
-* The uninstaller removes program files, shortcuts and registry entries by itself. When launched from Control Panel or Windows "Settings → Apps", it runs as a small wizard: the first page carries a pre-checked checkbox for deleting the run-log directory under `%LOCALAPPDATA%\imapbackup-gui\` (it holds server addresses and account names, never passwords) — uncheck it to keep the logs, or cancel the wizard to abort the uninstall entirely; a final dialog confirms completion. (The stock confirmation and completion message boxes are suppressed by launching the uninstaller silently through a rewritten `UninstallString`; running `unins000.exe` directly keeps them.) Silent uninstalls with plain `/SILENT` (automation) stay fully unattended and delete the logs by default. Backups are never touched. The CLI executable is `imapbackup-gui-cli.exe`; adding it to `PATH` is deliberately not done — it is reachable from the Start menu.
+* The uninstaller removes program files, shortcuts and registry entries by itself. When launched from Control Panel or Windows "Settings → Apps", it runs as a small wizard: the first page carries separate, pre-checked checkboxes for deleting run logs and UI settings under `%LOCALAPPDATA%\imapbackup-gui\` (the logs hold server addresses and account names, never passwords) — uncheck either one to keep it, or cancel the wizard to abort the uninstall entirely; a final dialog confirms completion. (The stock confirmation and completion message boxes are suppressed by launching the uninstaller silently through a rewritten `UninstallString`; running `unins000.exe` directly keeps them.) Silent uninstalls with plain `/SILENT` (automation) stay fully unattended and delete both by default. Backups are never touched. The CLI executable is `imapbackup-gui-cli.exe`; adding it to `PATH` is deliberately not done — it is reachable from the Start menu.
 
 ### One-time migration for backups made before the account layer
 

@@ -12,8 +12,9 @@ Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
    cooperative should_stop hook (ADR 0003).
  - The core's Spinner auto-disables and nospinner=True is passed anyway: nothing
    is ever written to stdout.
- - Logs go to %LOCALAPPDATA%\\imapbackup-gui\\log\\run-YYYY-MM-DD.log (daily file;
-   the whole directory is the uninstaller's cleanup target).
+ - Logs go to %LOCALAPPDATA%\\imapbackup-gui\\log\\run-YYYY-MM-DD.log (daily file);
+   mail-list column widths go to the same app-data directory and are independently
+   removable by the uninstaller.
 
 Original contributors (abridged): Rui Carmo and the upstream imapbackup
 contributors listed in imapbackup312.py.
@@ -29,6 +30,8 @@ import email.utils
 import logging
 import os
 import queue
+import json
+import tempfile
 import sys
 import threading
 import time
@@ -97,6 +100,9 @@ FOLDER_WHEEL_ROWS = 1  # 一格滚轮滚几行：与下方「邮件列表」的 
 EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
 FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
 LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
+APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui"
+COLUMN_CONFIG_PATH = APP_DATA_DIR / "treeview-columns.json"
+MAIL_COLUMNS = ("from", "subject", "when", "folder", "size")
 ELLIPSIS = "…"                    # 截断省略号，与「正在连接…」同一字符
 PROGRESS_MIN_WIDTH = 80           # 进度条地板宽度(px)：计数文字变长先压进度条，触底才开始截断文字
 TIP_DELAY_MS = 400                # 悬停多久后弹气泡
@@ -276,6 +282,9 @@ class BackupApp:
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
         self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
         self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
+        self._column_config_loaded = False
+        self._column_config_fitted = False
+        self._column_reflowing = False
 
         self._build_config_area()
         self._build_run_area()
@@ -494,6 +503,8 @@ class BackupApp:
         self.tree.column("when", width=110, stretch=False)
         self.tree.column("folder", width=140, stretch=False)
         self.tree.column("size", width=90, anchor="e", stretch=False)
+        self._load_column_config()
+        self.tree.bind("<Configure>", self._on_tree_configure, add="+")
         self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
         self._tree_resize = None
         self.tree.bind("<Button-1>", self._on_tree_resize_start, add="+")
@@ -1043,6 +1054,86 @@ class BackupApp:
         for widget in widgets:
             widget.bind("<Button-3>", self._on_entry_context)
 
+    def _load_column_config(self) -> None:
+        """Load only the five column widths; credentials and other UI state never enter this file."""
+        try:
+            with COLUMN_CONFIG_PATH.open(encoding="utf-8") as stream:
+                raw = json.load(stream)
+            if (not isinstance(raw, dict) or set(raw) != set(MAIL_COLUMNS)
+                    or any(isinstance(raw[name], bool) or not isinstance(raw[name], int)
+                           for name in MAIL_COLUMNS)
+                    or any(raw[name] < int(self.tree.column(name, "minwidth"))
+                           for name in MAIL_COLUMNS)):
+                raise ValueError("invalid or incomplete column widths")
+            self.tree.column("subject", stretch=False)
+            for name in MAIL_COLUMNS:
+                self.tree.column(name, width=raw[name])
+            self._column_config_loaded = True
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.log.warning("忽略无效的邮件列表列宽配置 %s: %s", COLUMN_CONFIG_PATH, exc)
+
+    def _save_column_config(self) -> None:
+        """Atomically persist widths, leaving the live layout untouched on any failure."""
+        widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        temporary: Path | None = None
+        try:
+            COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=COLUMN_CONFIG_PATH.parent,
+                                             prefix=f".{COLUMN_CONFIG_PATH.name}.",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(widths, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, COLUMN_CONFIG_PATH)
+            self._column_config_loaded = True
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.log.warning("保存邮件列表列宽配置失败 %s: %s", COLUMN_CONFIG_PATH, exc)
+
+    def _on_tree_configure(self, _event) -> None:
+        if (not self._column_config_loaded or self._column_reflowing
+                or self.tree.winfo_width() <= 1):
+            return
+        widths = [int(self.tree.column(name, "width")) for name in MAIL_COLUMNS]
+        if not self._column_config_fitted or sum(widths) != self.tree.winfo_width():
+            self._fit_loaded_columns()
+
+    def _fit_loaded_columns(self) -> None:
+        available = self.tree.winfo_width()
+        widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        if available <= 1 or not widths:
+            return
+        minimums = {name: int(self.tree.column(name, "minwidth")) for name in MAIL_COLUMNS}
+        total = sum(widths.values())
+        if total <= 0:
+            return
+        scale = available / total
+        fitted = {name: max(minimums[name], round(width * scale))
+                  for name, width in widths.items()}
+        excess = sum(fitted.values()) - available
+        if excess > 0:
+            for name in sorted(MAIL_COLUMNS, key=lambda item: fitted[item] - minimums[item],
+                               reverse=True):
+                reduction = min(excess, fitted[name] - minimums[name])
+                fitted[name] -= reduction
+                excess -= reduction
+                if excess == 0:
+                    break
+        self._column_reflowing = True
+        try:
+            for name, width in fitted.items():
+                self.tree.column(name, stretch=False, width=width)
+        finally:
+            self._column_reflowing = False
+        self._column_config_fitted = True
+
     def _on_entry_context(self, event) -> str:
         """输入框右键：记下弹窗目标、按当前选区与剪贴板刷新灰化，再弹菜单。"""
         self._entry_menu_target = event.widget
@@ -1123,6 +1214,7 @@ class BackupApp:
         if subject_stretch:
             self.tree.column("subject", stretch=True)
         self._tree_resize = None
+        self._save_column_config()
         return "break"
 
     def _prepare_tree_popup(self, event) -> bool:

@@ -10,6 +10,7 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 `pytest -m "not gui"` 跳过。
 """
 import logging
+import json
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -64,6 +65,14 @@ def _redirect_log_dir(tmp_path_factory):
     patch.setattr(g.core, "LOG_DIR", log_dir)
     patch.setattr(g, "LOG_DIR", log_dir)
     yield log_dir
+    patch.undo()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _redirect_column_config(tmp_path_factory):
+    patch = MonkeyPatch()
+    patch.setattr(g, "COLUMN_CONFIG_PATH", tmp_path_factory.mktemp("columns") / "treeview-columns.json")
+    yield
     patch.undo()
 
 
@@ -1171,6 +1180,115 @@ def test_mail_column_resize_uses_treeview_native_minwidth(app, monkeypatch):
     app._on_tree_resize_motion(SimpleNamespace(x=-100))
     assert int(app.tree.column("from", "width")) == native_minwidth
     app._on_tree_resize_end(event)
+
+
+def test_mail_column_config_loads_only_complete_valid_widths(app, monkeypatch, tmp_path):
+    config = tmp_path / "treeview-columns.json"
+    widths = {name: int(app.tree.column(name, "minwidth")) + 17 for name in app.tree["columns"]}
+    config.write_text(json.dumps(widths), encoding="utf-8")
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+    app._column_config_loaded = False
+    app._load_column_config()
+    assert {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]} == widths
+
+    config.write_text(json.dumps({"from": widths["from"]}), encoding="utf-8")
+    before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    app._load_column_config()
+    assert {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]} == before
+
+    warnings = []
+    monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
+    config.write_text("{broken", encoding="utf-8")
+    app._load_column_config()
+    config.write_text(json.dumps({name: 1 for name in app.tree["columns"]}), encoding="utf-8")
+    app._load_column_config()
+    assert len(warnings) == 2
+    for name, width in {"from": 200, "subject": 320, "when": 110, "folder": 140, "size": 90}.items():
+        app.tree.column(name, width=width)
+    app.tree.column("subject", stretch=True)
+
+
+def test_mail_column_config_save_is_atomic_and_excludes_credentials(app, monkeypatch, tmp_path):
+    config = tmp_path / "treeview-columns.json"
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+    app.user_var.set("not persisted")
+    app.password_var.set("secret")
+    app._save_column_config()
+    assert app._column_config_loaded
+    assert json.loads(config.read_text(encoding="utf-8")) == {
+        name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    assert "secret" not in config.read_text(encoding="utf-8")
+    before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    warnings = []
+    monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(g.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("nope")))
+    app._save_column_config()
+    assert {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]} == before
+    assert warnings
+
+
+def test_mail_column_release_saves_immediately(app, monkeypatch):
+    saved = []
+    monkeypatch.setattr(app, "_save_column_config", lambda: saved.append(True))
+    monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
+    monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#1")
+    event = SimpleNamespace(x=100, y=2)
+    app._on_tree_resize_start(event)
+    app._on_tree_resize_end(event)
+    assert saved == [True]
+
+
+def test_mail_column_restore_shrinks_proportionally_but_keeps_native_minwidth(app, monkeypatch):
+    app._column_config_loaded = True
+    app._column_config_fitted = False
+    monkeypatch.setattr(app.tree, "winfo_width", lambda: 300)
+    app._fit_loaded_columns()
+    assert sum(int(app.tree.column(name, "width")) for name in app.tree["columns"]) <= 300
+    assert all(int(app.tree.column(name, "width")) >= int(app.tree.column(name, "minwidth"))
+               for name in app.tree["columns"])
+
+
+def test_mail_columns_reflow_again_when_window_shrinks_after_widening(app, monkeypatch):
+    """全屏时放宽非主题列后缩窗，所有列都应按比例回收而不被顶出范围。"""
+    available = [2000]
+    monkeypatch.setattr(app.tree, "winfo_width", lambda: available[0])
+    app._column_config_loaded = True
+    app._column_config_fitted = False
+    app.tree.column("from", width=500)
+    app.tree.column("subject", width=700)
+    app.tree.column("when", width=300)
+    app.tree.column("folder", width=350)
+    app.tree.column("size", width=150)
+    app._on_tree_configure(None)
+    assert sum(int(app.tree.column(name, "width")) for name in g.MAIL_COLUMNS) <= 2000
+
+    available[0] = 800
+    app._on_tree_configure(None)
+    widths = {name: int(app.tree.column(name, "width")) for name in g.MAIL_COLUMNS}
+    assert sum(widths.values()) <= 800
+    assert all(widths[name] >= int(app.tree.column(name, "minwidth")) for name in g.MAIL_COLUMNS)
+
+
+def test_mail_columns_expand_proportionally_when_window_grows(app, monkeypatch):
+    """窗口放大时，各列按比例增长，而不是只让主题列吸收剩余宽度。"""
+    available = [800]
+    monkeypatch.setattr(app.tree, "winfo_width", lambda: available[0])
+    app._column_config_loaded = True
+    app._column_config_fitted = False
+    for name, width in {"from": 120, "subject": 240, "when": 90, "folder": 200, "size": 70}.items():
+        app.tree.column(name, width=width)
+    app._on_tree_configure(None)
+    before = {name: int(app.tree.column(name, "width")) for name in g.MAIL_COLUMNS}
+
+    available[0] = 1600
+    app._on_tree_configure(None)
+    after = {name: int(app.tree.column(name, "width")) for name in g.MAIL_COLUMNS}
+    assert after["from"] > before["from"]
+    assert after["when"] > before["when"]
+    assert after["folder"] > before["folder"]
+    assert after["size"] > before["size"]
+    assert after["subject"] > before["subject"]
+    assert sum(after.values()) <= 1600
 
 
 def test_entry_context_menu_has_three_actions(app, monkeypatch):
