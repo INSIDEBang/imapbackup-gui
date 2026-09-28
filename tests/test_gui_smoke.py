@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """GUI 无头冒烟：实例化真实的 BackupApp，喂合成队列事件，断言 UI 状态。不联网。
 
 整套用例共享同一个 module 级 app 实例，**pytest 按定义顺序执行**，所以前一节留下的
@@ -9,8 +8,8 @@
 winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示环境的 runner 用
 `pytest -m "not gui"` 跳过。
 """
-import logging
 import json
+import logging
 import sys
 from datetime import datetime
 from types import SimpleNamespace
@@ -125,7 +124,7 @@ def stub_popup(monkeypatch, menu):
 
 
 def row_by(instance, foldername):
-    return [r for r in instance.folder_rows if r["foldername"] == foldername][0]
+    return next(r for r in instance.folder_rows if r["foldername"] == foldername)
 
 
 def is_open(instance, key):
@@ -792,7 +791,7 @@ def test_right_edges_share_one_baseline(app):
         app.log_text.winfo_rooty(), app.log_text.winfo_height()), (
         app.log_scroll.winfo_rooty(), app.log_scroll.winfo_height(),
         app.log_text.winfo_rooty(), app.log_text.winfo_height())
-    log_toolbar = [w for w in app.log_frame.winfo_children() if isinstance(w, tk.Frame)][0]
+    log_toolbar = next(w for w in app.log_frame.winfo_children() if isinstance(w, tk.Frame))
     assert left(log_toolbar) == left(app.log_text), (left(log_toolbar), left(app.log_text))
     assert left(log_toolbar) - lf_left == 4, (left(log_toolbar), lf_left)
     assert log_toolbar.winfo_rooty() - lf_top == 4, (log_toolbar.winfo_rooty(), lf_top)
@@ -881,7 +880,7 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
         app.root.update()
         return canvas.canvasy(0) - before
 
-    toolbar = [w for w in app.folder_group.winfo_children() if isinstance(w, tk.Frame)][0]
+    toolbar = next(w for w in app.folder_group.winfo_children() if isinstance(w, tk.Frame))
     assert at_top() == 0
     for name, target in [("文件夹名字", app.folder_rows[0]["check_btn"]),
                          ("父节点箭头", app._folder_nodes[("Group",)]["arrow"]),
@@ -1201,7 +1200,7 @@ def test_mail_column_config_loads_only_complete_valid_widths(app, monkeypatch, t
     monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
     config.write_text("{broken", encoding="utf-8")
     app._load_column_config()
-    config.write_text(json.dumps({name: 1 for name in app.tree["columns"]}), encoding="utf-8")
+    config.write_text(json.dumps(dict.fromkeys(app.tree["columns"], 1)), encoding="utf-8")
     app._load_column_config()
     assert len(warnings) == 2
     for name, width in {"from": 200, "subject": 320, "when": 110, "folder": 140, "size": 90}.items():

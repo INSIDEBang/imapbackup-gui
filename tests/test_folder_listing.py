@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """连接后的文件夹列表，以及 --folders / --exclude-folders 的匹配语义。
 
 用假 IMAP 服务器驱动 main() 跑完全流程，不联网。两条核心规则：
@@ -15,7 +14,6 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 import imapbackup312 as core
-
 from fakes import ListServer, imap_utf7_encode
 
 SEP_RE = re.compile(r"^─+\s+\[(\d+)/(\d+)\]\s+(.*?)\s+─+\s*$", re.MULTILINE)

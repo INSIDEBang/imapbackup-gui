@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """按输出格式独立判重（ADR 0004）。
 
 任一**已选**格式缺这封就算待备份，写盘时只写还缺它的那个格式，每封只 fetch 一次。
@@ -11,7 +10,6 @@
 import mailbox
 
 import imapbackup312 as core
-
 from fakes import FetchServer, NullLog
 
 LOG = NullLog()
@@ -61,7 +59,12 @@ def mbox_ids(td):
     """Every Message-Id in the mbox, duplicates included (scan_file would hide them)."""
     mb = mailbox.mbox(td / "acct" / "INBOX.mbox")
     try:
-        return [m.get("Message-Id") for m in mb]
+        ids = []
+        for msg in mb:
+            mid = msg.get("Message-Id")
+            assert mid is not None   # 夹具每封都带 Message-Id；混进 None 时 sorted() 会直接崩
+            ids.append(mid)
+        return ids
     finally:
         mb.close()
 
@@ -80,6 +83,7 @@ def test_eml_complete_mbox_absent_is_not_all_backed_up(tmp_path):
 
     local_mbox, local_eml = scan(tmp_path)
     assert local_mbox == {}, local_mbox
+    assert local_eml is not None
     assert set(local_eml) == set(REMOTE), sorted(local_eml)
     new = core.pending_messages(REMOTE, local_mbox, local_eml)
     # 这个曾经返回 {}，整轮被读成「已是最新，无待备份邮件」
@@ -101,6 +105,7 @@ def test_mbox_complete_eml_absent_is_not_all_backed_up(tmp_path):
     assert sorted(mbox_ids(tmp_path)) == IDS
     assert not (tmp_path / "acct" / "INBOX").exists()
     local_mbox, local_eml = scan(tmp_path)
+    assert local_mbox is not None
     assert set(local_mbox) == set(REMOTE)
     assert local_eml == {}
     new = core.pending_messages(REMOTE, local_mbox, local_eml)

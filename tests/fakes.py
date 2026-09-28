@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """测试用的假 IMAP 服务器与替身。
 
 全部是进程内的 imaplib.IMAP4 替身：不起 socket、不联网、不需要凭证。每个类只实现
@@ -8,7 +7,9 @@
 （4 种 FakeServer 形态、3 份 NullLog、2 份 modified UTF-7 编码器）；迁移后只留一份。
 """
 import base64
+import imaplib
 import logging
+from builtins import list as _list  # 类内定义 list 方法会遮蔽内置名，注解里用 _list（同类型桩）
 from logging import NullHandler
 
 
@@ -49,7 +50,10 @@ def imap_utf7_encode(text: str) -> str:
     return "".join(out)
 
 
-class ListServer:
+# 四个服务器替身都继承 imaplib.IMAP4（core 各入口的 server 形参就是这个类型），只为过
+# 类型检查：不调 super().__init__、不起 socket。覆写方法的形参名/默认值照抄类型桩，
+# 返回标注 tuple[str, _list]（即 list[Any]）与 IMAP4 各命令的返回形状协变兼容。
+class ListServer(imaplib.IMAP4):
     """只有 LIST 的服务器：枚举文件夹用的最小替身。
 
     display_names 是已解码的显示名，list() 会编码回 modified UTF-7 再返回，
@@ -59,18 +63,18 @@ class ListServer:
         self.display_names = list(display_names)
         self.delim = delim
 
-    def list(self):
+    def list(self, directory='""', pattern="*") -> tuple[str, _list]:
         rows = [f'(\\HasNoChildren) "{self.delim}" "{imap_utf7_encode(n)}"' for n in self.display_names]
         return "OK", [r.encode("utf-8") for r in rows]
 
-    def select(self, quoted, readonly=False):
+    def select(self, mailbox="INBOX", readonly=False) -> tuple[str, _list]:
         return "OK", [b"0"]
 
-    def logout(self):
+    def logout(self) -> tuple[str, _list]:
         return "OK", [b"bye"]
 
 
-class MainServer:
+class MainServer(imaplib.IMAP4):
     """能驱动 main() 跑完全流程的服务器：LIST / SELECT / FETCH / LOGOUT。
 
     fail_fetch / interrupt_fetch 用来注入失败路径，验证 main() 的顶层捕获。
@@ -80,25 +84,25 @@ class MainServer:
         self.fail_fetch = fail_fetch
         self.interrupt_fetch = interrupt_fetch
 
-    def list(self):
+    def list(self, directory='""', pattern="*") -> tuple[str, _list]:
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
 
-    def select(self, quoted, readonly=False):
+    def select(self, mailbox="INBOX", readonly=False) -> tuple[str, _list]:
         return "OK", [str(self.messages).encode()]
 
-    def fetch(self, seq, items):
+    def fetch(self, message_set, message_parts) -> tuple[str, _list]:
         if self.interrupt_fetch:
             raise KeyboardInterrupt
         if self.fail_fetch:
-            raise RuntimeError(f"FETCH failed for UID {seq}: {self.fail_fetch}")
+            raise RuntimeError(f"FETCH failed for UID {message_set}: {self.fail_fetch}")
         raw = b"Message-Id: <aaa@x>\r\n\r\nbody\r\n"
-        return "OK", [(f"{seq} (RFC822 {len(raw)})".encode(), raw)]
+        return "OK", [(f"{message_set} (RFC822 {len(raw)})".encode(), raw)]
 
-    def logout(self):
+    def logout(self) -> tuple[str, _list]:
         return "OK", [b"bye"]
 
 
-class FetchServer:
+class FetchServer(imaplib.IMAP4):
     """按序号返回预置响应的服务器，记录每次 FETCH 请求的 items。
 
     responses 是 {seq: (metadata_with_length_prefix, raw_bytes)}；fetch() 把它拼成
@@ -108,20 +112,23 @@ class FetchServer:
         self.responses = dict(responses)
         self.fetches = []
 
-    def fetch(self, seq, items):
-        self.fetches.append((seq, items))
-        return "OK", [self.responses[int(seq)], b")"]
+    def fetch(self, message_set, message_parts) -> tuple[str, _list]:
+        self.fetches.append((message_set, message_parts))
+        return "OK", [self.responses[int(message_set)], b")"]
 
 
-class HeaderServer:
+class HeaderServer(imaplib.IMAP4):
     """SELECT 出一封消息，FETCH 只回 MESSAGE-ID header。
 
     给 scan_folder 的合成 ID 兜底路径（缺 Message-Id 时抓 header）用。
     """
-    def select(self, quoted, readonly=False):
+    def __init__(self):
+        pass   # 不调 super().__init__：那会真的去连 socket（其余三个替身有自己的 __init__）
+
+    def select(self, mailbox="INBOX", readonly=False) -> tuple[str, _list]:
         return "OK", [b"1"]
 
-    def fetch(self, seq, items):
+    def fetch(self, message_set, message_parts) -> tuple[str, _list]:
         return "OK", [(b'1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {20}', b'Message-Id: <r1@x>\r\n'), b")"]
 
 

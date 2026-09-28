@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CLI 当日运行日志（ADR 0005）。
 
 CLI 与 GUI 共用同一日文件，共享构造不共享安装。这里用假 IMAP 服务器驱动 main() 跑全
@@ -16,7 +15,6 @@ from datetime import datetime
 import pytest
 
 import imapbackup312 as core
-
 from fakes import MainServer
 
 # 共享日志格式：时间 | 级别 | 来源 | 函数:行号 | 内容
@@ -125,7 +123,7 @@ def test_successful_run_writes_a_formatted_daily_log(run_main):
     res = run_main(connect_like(MainServer()), "--folders", "INBOX")
     lines = log_lines(res.log_dir)
     parsed = records(lines)
-    ts_lines = [l for l in lines if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| ", l)]
+    ts_lines = [line for line in lines if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| ", line)]
 
     assert res.outcome == "returned" and res.code == 0, f"{res.outcome} {res.code}"
     assert len(lines) > 0, lines
@@ -228,7 +226,7 @@ def test_configuring_twice_in_one_process_cannot_write_twice(tmp_path, monkeypat
     logging.getLogger("imapbackup").info("marker")
     logging.getLogger(core.RUN_LOG_LOGGER).warning("marker")
     lines = log_lines(log_dir)
-    assert sum(1 for l in lines if "marker" in l) == 2, lines
+    assert sum(1 for line in lines if "marker" in line) == 2, lines
 
 
 def test_exit_codes_unchanged(run_main, tmp_path, monkeypatch, console_capture):

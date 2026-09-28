@@ -2,7 +2,7 @@
     // basedpyright 配置：开发期静态检查（uv tool install basedpyright）。
     // 遗留版本不在此检查；imapbackup38.py 如需检查用
     // `basedpyright --pythonversion 3.8 imapbackup38.py` 单独跑（pyright 不支持按文件设版本）。
-    "include": ["imapbackup_gui.py", "imapbackup312.py"],
+    "include": ["imapbackup_gui.py", "imapbackup312.py", "tests"],
     "exclude": ["imapbackup.py", "imapbackup38.py", "**/__pycache__", "build", "dist", ".scratch", ".venv"],
     "pythonVersion": "3.12",
     "typeCheckingMode": "standard"

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """eml 输出切片及其依赖的核心接缝。
 
 覆盖 sanitize / 目标路径预算 / 唯一化命名 / INTERNALDATE 与 Date header 时间戳 /
@@ -9,15 +8,14 @@ import inspect
 import shutil
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import imapbackup312 as m
-
 from fakes import FetchServer, HeaderServer, ListServer, NullLog, recording_spinner
 
 TS = datetime(2024, 5, 12, 10, 15, 30)
-DATE_HEADER_INSTANT = datetime(2024, 5, 12, 2, 15, 30, tzinfo=timezone.utc)
+DATE_HEADER_INSTANT = datetime(2024, 5, 12, 2, 15, 30, tzinfo=UTC)
 
 # 缺 Message-Id 的合成 ID：UUID salt + 随机尾。改 m.UUID 会破坏既有备份的增量行为。
 SYNTHETIC = "<" + m.UUID + "." + uuid.uuid4().hex[:12] + ">"
@@ -82,9 +80,9 @@ def test_unique_eml_path(tmp_path):
 
 def test_parse_internaldate():
     dt = m.parse_internaldate("12-May-2024 10:15:30 +0800")
-    assert dt is not None and dt.utcoffset().total_seconds() == 8 * 3600 and dt.day == 12 and dt.month == 5
+    assert dt is not None and dt.utcoffset() == timedelta(hours=8) and dt.day == 12 and dt.month == 5
     dt2 = m.parse_internaldate("1-Jan-2024 00:00:00 -0500")
-    assert dt2 is not None and dt2.utcoffset().total_seconds() == -5 * 3600
+    assert dt2 is not None and dt2.utcoffset() == timedelta(hours=-5)
     assert m.parse_internaldate("garbage") is None
     assert m.parse_internaldate("99-Zzz-2024 00:00:00 +0000") is None
 
@@ -98,7 +96,7 @@ def test_message_timestamp():
     dt2 = m.message_timestamp("", raw_with_date)
     # 结果归一化到本机时区，所以比 UTC 瞬间而不是比 day/hour —— 后者跨时区不成立
     assert dt2 is not None and dt2.tzinfo is not None
-    assert dt2.astimezone(timezone.utc) == DATE_HEADER_INSTANT, dt2
+    assert dt2.astimezone(UTC) == DATE_HEADER_INSTANT, dt2
 
     dt3 = m.message_timestamp("", b"no headers here")
     assert dt3 is not None and dt3.tzinfo is not None
@@ -125,7 +123,9 @@ def test_remote_and_local_message_id_keys_agree():
     """两侧判重用的 key 必须同值，否则增量会永远重复下载。"""
     block = b"Message-Id:  <a@b>\r\n"
     normalized = m.BLANKS_RE.sub(" ", str(block, "utf-8", "replace").strip())
-    remote_key = m.MSGID_RE.match(normalized).group(1)
+    matched = m.MSGID_RE.match(normalized)
+    assert matched is not None, normalized
+    remote_key = matched.group(1)
     local_key = m.folded_header(b"From: x\r\nMessage-Id:  <a@b>\r\n\r\n", "Message-Id")
     assert remote_key == local_key == "<a@b>", f"remote={remote_key!r} local={local_key!r}"
 
@@ -222,8 +222,8 @@ def test_download_messages_writes_both_formats(tmp_path):
 
     eml_files = sorted((tmp_path / "eml" / "INBOX").rglob("*.eml"))
     assert len(eml_files) == 2, [p.name for p in eml_files]
-    f1 = [p for p in eml_files if "aaa@x" in p.name][0]
-    f2 = [p for p in eml_files if p.name != f1.name][0]
+    f1 = next(p for p in eml_files if "aaa@x" in p.name)
+    f2 = next(p for p in eml_files if p.name != f1.name)
     assert f1.name == "Re_ 你好_aaa@x_20240512.eml", f1.name
     assert f1.parent.name == "2024-05" and f1.parent.parent.name == "INBOX"
     b1 = f1.read_bytes()
@@ -318,6 +318,7 @@ def test_account_layer_paths(tmp_path):
     cfg = m.get_config(["-s", "srv", "-u", "3273910043@qq.com", "-p", "x", "--eml-dir", "out"])
     account = m.sanitize_segment(cfg.user, m.EML_SEGMENT_MAX)
     assert account == "3273910043@qq.com"
+    assert cfg.eml_dir is not None
     assert "3273910043@qq.com" in str(cfg.eml_dir / account / "INBOX"), (
         str(cfg.eml_dir / account / "INBOX"))
 
@@ -385,10 +386,10 @@ def test_download_messages_compact_status_line_wiring(monkeypatch, tmp_path):
     m.download_messages(FetchServer({1: RESP1, 2: RESP2}), "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="其他文件夹",
-                        verbose=0, compact=True, report=recs)
+                        verbose=0, compact=True, report=recs.append)
     assert [e[0] for e in events] == ["init", "status", "spin", "status", "spin", "stop"], events
     assert "其他文件夹" in events[0][1], events[0]
-    first_status = [e for e in events if e[0] == "status"][0][1]
+    first_status = next(e for e in events if e[0] == "status")[1]
     assert "[" + m.BAR_FILL in first_status
     assert "1/2" in first_status and "其他文件夹" in first_status, first_status
     assert "Re: 你好" in first_status, first_status

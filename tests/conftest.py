@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Shared pytest fixtures.
 
 这里只放需要 pytest 管道支持的东西（专属临时目录、进程级日志全局态复位、
