@@ -7,6 +7,7 @@
 - 新功能基于 `imapbackup312.py`（Python 3.12+）。`imapbackup.py` 和 `imapbackup38.py` 是互不导入的遗留版本，除非用户明确要求，否则不修改。
 - `imapbackup_gui.py` 复用 `imapbackup312.py` 的核心能力；扫描、判重和下载逻辑只保留一份，不创建 GUI 专用副本。
 - 运行时代码保持 Python 标准库依赖。新增运行时依赖或包管理元数据前须获得用户明确批准。
+- 本项目由 `uv` 进行软件包管理：添加依赖时使用 `uv pip` 安装，不指定版本号，默认使用最新版本。
 - 产品标识使用 `imapbackup-gui`，用户可见名称使用 `IMAP Backup GUI`。
 
 ## 工作原则
