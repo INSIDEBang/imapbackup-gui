@@ -12,8 +12,9 @@ Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
    cooperative should_stop hook (ADR 0003).
  - The core's Spinner auto-disables and nospinner=True is passed anyway: nothing
    is ever written to stdout.
- - Logs go to %LOCALAPPDATA%\\imapbackup-gui\\log\\run-YYYY-MM-DD.log (daily file;
-   the whole directory is the uninstaller's cleanup target).
+ - Logs go to %LOCALAPPDATA%\\imapbackup-gui\\log\\run-YYYY-MM-DD.log (daily file);
+   mail-list column widths go to the same app-data directory and are independently
+   removable by the uninstaller.
 
 Original contributors (abridged): Rui Carmo and the upstream imapbackup
 contributors listed in imapbackup312.py.
@@ -24,11 +25,14 @@ __version__ = "1.6.0"  # 与 imapbackup312.__version__ 同一个号（项目统�
 __author__ = "Chen Chong"
 __copyright__ = "(C) 2026 Chen Chong. Code under MIT License."
 
+import base64
 import ctypes
 import email.utils
 import logging
 import os
 import queue
+import json
+import tempfile
 import sys
 import threading
 import time
@@ -97,6 +101,14 @@ FOLDER_WHEEL_ROWS = 1  # 一格滚轮滚几行：与下方「邮件列表」的 
 EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
 FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
 LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
+APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui"
+COLUMN_CONFIG_PATH = APP_DATA_DIR / "treeview-columns.json"
+MAIL_COLUMNS = ("from", "subject", "when", "folder", "size")
+UI_SETTINGS_VERSION = 1
+DEFAULT_WINDOW_WIDTH = 960
+DEFAULT_WINDOW_HEIGHT = 736
+MIN_WINDOW_WIDTH = 800
+MIN_WINDOW_HEIGHT = 620
 ELLIPSIS = "…"                    # 截断省略号，与「正在连接…」同一字符
 PROGRESS_MIN_WIDTH = 80           # 进度条地板宽度(px)：计数文字变长先压进度条，触底才开始截断文字
 TIP_DELAY_MS = 400                # 悬停多久后弹气泡
@@ -232,6 +244,56 @@ def _another_instance_running() -> bool:
     return ctypes.get_last_error() == ERROR_ALREADY_EXISTS
 
 
+class _DATA_BLOB(ctypes.Structure):  # wincrypt 的 DATA_BLOB
+    _fields_ = [("cbData", ctypes.c_ulong),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1  # 凭据场景不许弹 UI
+
+
+def _dpapi_run(func_name: str, raw: bytes) -> bytes | None:
+    """调一次 crypt32 的 CryptProtectData/CryptUnprotectData；非 win32 或任何失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        blob_in = _DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _DATA_BLOB()
+        if not getattr(crypt32, func_name)(ctypes.byref(blob_in), None, None, None, None,
+                                           _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)):
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except (OSError, AttributeError):
+        return None
+
+
+def _dpapi_encrypt(text: str) -> str | None:
+    """明文 → DPAPI 密文的 base64（仅当前用户+当前机器可解）。失败返回 None。"""
+    cipher = _dpapi_run("CryptProtectData", text.encode("utf-8"))
+    return None if cipher is None else base64.b64encode(cipher).decode("ascii")
+
+
+def _dpapi_decrypt(cipher: str) -> str | None:
+    """base64 密文 → 明文。解码/解密/utf-8 任一失败返回 None，调用方按没存过处理。"""
+    try:
+        raw = base64.b64decode(cipher, validate=True)
+    except (TypeError, ValueError):
+        return None
+    plain = _dpapi_run("CryptUnprotectData", raw)
+    if plain is None:
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 class BackupApp:
     """Single-window layout: config zones on top, Notebook (邮件列表/运行日志) below, status bar at the bottom."""
 
@@ -244,13 +306,15 @@ class BackupApp:
             except tk.TclError:
                 pass  # 非 Windows 平台没有 iconbitmap，或图标不可读时退回 Tk 默认图标
         self.root.title("IMAP Backup GUI")
-        self.root.geometry("960x736")
-        self.root.minsize(800, 620)
+        self.root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.events: queue.Queue[tuple] = queue.Queue()
         self.stop_flag = threading.Event()
         self.log = logging.getLogger("gui")
         self._setup_logging()
+        self._ui_settings = self._read_ui_settings()
+        self._normal_geometry = self._restore_window_settings()
 
         # ---- state ----
         self.connect_state = "idle"  # idle | connecting | connected | stale
@@ -276,11 +340,16 @@ class BackupApp:
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
         self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
         self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
+        self._column_config_loaded = False
+        self._column_config_fitted = False
+        self._column_reflowing = False
 
         self._build_config_area()
+        self._restore_user_config()
         self._build_run_area()
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._apply_connect_state()
         self._update_start_state()
 
@@ -494,7 +563,13 @@ class BackupApp:
         self.tree.column("when", width=110, stretch=False)
         self.tree.column("folder", width=140, stretch=False)
         self.tree.column("size", width=90, anchor="e", stretch=False)
+        self._load_column_config()
+        self.tree.bind("<Configure>", self._on_tree_configure, add="+")
         self.tree.tag_configure(ZEBRA_TAG, background=ZEBRA_BG)
+        self._tree_resize = None
+        self.tree.bind("<Button-1>", self._on_tree_resize_start, add="+")
+        self.tree.bind("<B1-Motion>", self._on_tree_resize_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_resize_end, add="+")
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree_scroll = tree_scroll
         self.tree.configure(yscrollcommand=tree_scroll.set)
@@ -1039,6 +1114,204 @@ class BackupApp:
         for widget in widgets:
             widget.bind("<Button-3>", self._on_entry_context)
 
+    def _read_ui_settings(self) -> dict:
+        try:
+            with COLUMN_CONFIG_PATH.open(encoding="utf-8") as stream:
+                raw = json.load(stream)
+            if (isinstance(raw, dict) and set(raw) == set(MAIL_COLUMNS)
+                    and all(isinstance(raw[name], int) and not isinstance(raw[name], bool)
+                            for name in MAIL_COLUMNS)):
+                return {"version": UI_SETTINGS_VERSION, "columns": raw}
+            if not isinstance(raw, dict) or raw.get("version") != UI_SETTINGS_VERSION:
+                raise ValueError("unsupported UI settings format")
+            columns = raw.get("columns")
+            if columns is not None and not isinstance(columns, dict):
+                raise ValueError("invalid columns section")
+            return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
+                    "config": raw.get("config")}
+        except FileNotFoundError:
+            return {"version": UI_SETTINGS_VERSION}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.log.warning("忽略无效的界面设置 %s: %s", COLUMN_CONFIG_PATH, exc)
+            return {"version": UI_SETTINGS_VERSION}
+
+    def _restore_window_settings(self) -> tuple[int, int, int, int]:
+        window = self._ui_settings.get("window")
+        if window is None:
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        if not isinstance(window, dict):
+            self.log.warning("忽略无效的窗口状态配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        geometry = window.get("normal_geometry")
+        if not isinstance(geometry, dict):
+            self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        values = tuple(geometry.get(name) for name in ("width", "height", "x", "y"))
+        if (any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+                or values[0] < MIN_WINDOW_WIDTH or values[1] < MIN_WINDOW_HEIGHT):
+            self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
+            return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+        width, height, x, y = values
+        maximized = window.get("maximized", False)
+        if not isinstance(maximized, bool):
+            self.log.warning("忽略无效的窗口最大化配置 %s", COLUMN_CONFIG_PATH)
+            maximized = False
+        self.root.geometry(f"{width}x{height}")
+        if self._window_position_visible(width, height, x, y):
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        else:
+            self.log.warning("窗口位置不在当前显示器范围内，使用默认位置")
+        self.root.update_idletasks()
+        if maximized:
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                self.log.warning("无法恢复窗口最大化状态")
+        return values
+
+    def _restore_user_config(self) -> None:
+        """启动时恢复配置区 6 字段；坏节/坏字段逐个跳过，回退默认值。
+
+        校验风格与窗口节一致：节不是 dict 就整节丢弃；字段逐个看类型（字符串/布尔），
+        坏的只跳过该字段。密码解不出明文视为没存过（换机器/换账户/文件损坏），
+        记一条 warning，不弹窗、不阻断启动。
+        """
+        config = self._ui_settings.get("config")
+        if config is None:
+            return
+        if not isinstance(config, dict):
+            self.log.warning("忽略无效的用户配置节 %s", COLUMN_CONFIG_PATH)
+            return
+        ssl = config.get("ssl")
+        if isinstance(ssl, bool):
+            self.ssl_var.set(ssl)
+        for name, var in (("user", self.user_var), ("server", self.server_var),
+                          ("port", self.port_var), ("outdir", self.outdir_var)):
+            value = config.get(name)
+            if isinstance(value, str):
+                var.set(value)
+                if name == "port":
+                    self._port_touched = True  # 持久化端口=用户确认过的值，挡住 SSL 联动
+        cipher = config.get("password_dpapi")
+        if isinstance(cipher, str):
+            password = _dpapi_decrypt(cipher)
+            if password is None:
+                self.log.warning("无法解密保存的密码，需要重新输入")
+            else:
+                self.password_var.set(password)
+
+    def _window_position_visible(self, width: int, height: int, x: int, y: int) -> bool:
+        left = self.root.winfo_vrootx()
+        top = self.root.winfo_vrooty()
+        right = left + self.root.winfo_vrootwidth()
+        bottom = top + self.root.winfo_vrootheight()
+        return x < right and x + width > left and y < bottom and y + height > top
+
+    def _load_column_config(self) -> None:
+        """Load five widths while allowing window settings to be invalid independently."""
+        self._ui_settings = self._read_ui_settings()
+        raw = self._ui_settings.get("columns")
+        if (not isinstance(raw, dict) or set(raw) != set(MAIL_COLUMNS)
+                or any(isinstance(raw[name], bool) or not isinstance(raw[name], int)
+                       for name in MAIL_COLUMNS)
+                or any(raw[name] < int(self.tree.column(name, "minwidth"))
+                       for name in MAIL_COLUMNS)):
+            if raw is not None:
+                self.log.warning("忽略无效的邮件列表列宽配置 %s", COLUMN_CONFIG_PATH)
+            return
+        self.tree.column("subject", stretch=False)
+        for name in MAIL_COLUMNS:
+            self.tree.column(name, width=raw[name])
+        self._column_config_loaded = True
+
+    def _save_column_config(self) -> None:
+        """Atomically persist all UI settings, leaving the live layout untouched on failure."""
+        widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        self._ui_settings["version"] = UI_SETTINGS_VERSION
+        self._ui_settings["columns"] = widths
+        self._ui_settings["window"] = self._window_settings()
+        config = {"user": self.user_var.get(), "server": self.server_var.get(),
+                  "ssl": bool(self.ssl_var.get()), "port": self.port_var.get(),
+                  "outdir": self.outdir_var.get()}
+        password = self.password_var.get()
+        if password and sys.platform == "win32":
+            cipher = _dpapi_encrypt(password)
+            if cipher is not None:
+                config["password_dpapi"] = cipher  # 空密码不落盘；非 win32 本项缺席
+            else:
+                self.log.warning("DPAPI 加密失败，本次未保存密码")
+        self._ui_settings["config"] = config
+        temporary: Path | None = None
+        try:
+            COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=COLUMN_CONFIG_PATH.parent,
+                                             prefix=f".{COLUMN_CONFIG_PATH.name}.",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(self._ui_settings, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, COLUMN_CONFIG_PATH)
+            self._column_config_loaded = True
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.log.warning("保存界面设置失败 %s: %s", COLUMN_CONFIG_PATH, exc)
+
+    def _window_settings(self) -> dict:
+        width, height, x, y = self._normal_geometry
+        return {
+            "normal_geometry": {"width": width, "height": height, "x": x, "y": y},
+            "maximized": self.root.state() == "zoomed",
+        }
+
+    def _on_root_configure(self, _event) -> None:
+        if self.root.state() == "zoomed":
+            return
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        if width >= MIN_WINDOW_WIDTH and height >= MIN_WINDOW_HEIGHT:
+            self._normal_geometry = (width, height, self.root.winfo_x(), self.root.winfo_y())
+
+    def _on_tree_configure(self, _event) -> None:
+        if (not self._column_config_loaded or self._column_reflowing
+                or self.tree.winfo_width() <= 1):
+            return
+        widths = [int(self.tree.column(name, "width")) for name in MAIL_COLUMNS]
+        if not self._column_config_fitted or sum(widths) != self.tree.winfo_width():
+            self._fit_loaded_columns()
+
+    def _fit_loaded_columns(self) -> None:
+        available = self.tree.winfo_width()
+        widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        if available <= 1 or not widths:
+            return
+        minimums = {name: int(self.tree.column(name, "minwidth")) for name in MAIL_COLUMNS}
+        total = sum(widths.values())
+        if total <= 0:
+            return
+        scale = available / total
+        fitted = {name: max(minimums[name], round(width * scale))
+                  for name, width in widths.items()}
+        excess = sum(fitted.values()) - available
+        if excess > 0:
+            for name in sorted(MAIL_COLUMNS, key=lambda item: fitted[item] - minimums[item],
+                               reverse=True):
+                reduction = min(excess, fitted[name] - minimums[name])
+                fitted[name] -= reduction
+                excess -= reduction
+                if excess == 0:
+                    break
+        self._column_reflowing = True
+        try:
+            for name, width in fitted.items():
+                self.tree.column(name, stretch=False, width=width)
+        finally:
+            self._column_reflowing = False
+        self._column_config_fitted = True
+
     def _on_entry_context(self, event) -> str:
         """输入框右键：记下弹窗目标、按当前选区与剪贴板刷新灰化，再弹菜单。"""
         self._entry_menu_target = event.widget
@@ -1069,6 +1342,57 @@ class BackupApp:
         if not self._prepare_tree_popup(event):
             return "break"
         self._tree_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _on_tree_resize_start(self, event) -> str | None:
+        if self.tree.identify_region(event.x, event.y) != "separator":
+            return None
+        columns = tuple(self.tree["columns"])
+        column = self.tree.identify_column(event.x)
+        try:
+            index = int(column[1:]) - 1
+        except (ValueError, IndexError):
+            return None
+        if not 0 <= index < len(columns) - 1:
+            return "break"
+        left, right = columns[index:index + 2]
+        subject_stretch = bool(self.tree.column("subject", "stretch"))
+        if subject_stretch:
+            # A stretch column otherwise grows while the fixed pair is
+            # resized, moving the separator being dragged.
+            self.tree.column("subject", stretch=False)
+        self._tree_resize = (event.x, left, right,
+                             int(self.tree.column(left, "width")),
+                             int(self.tree.column(right, "width")),
+                             subject_stretch)
+        return "break"
+
+    def _on_tree_resize_motion(self, event) -> str | None:
+        if self._tree_resize is None:
+            return None
+        start_x, left, right, left_width, right_width, _ = self._tree_resize
+        delta = event.x - start_x
+        left_min = int(self.tree.column(left, "minwidth"))
+        right_min = int(self.tree.column(right, "minwidth"))
+        delta = max(left_min - left_width, min(delta, right_width - right_min))
+        new_left = left_width + delta
+        new_right = right_width - delta
+        unchanged = {name: int(self.tree.column(name, "width"))
+                     for name in self.tree["columns"] if name not in (left, right)}
+        self.tree.column(left, width=new_left)
+        self.tree.column(right, width=new_right)
+        for name, width in unchanged.items():
+            self.tree.column(name, width=width)
+        return "break"
+
+    def _on_tree_resize_end(self, _event) -> str | None:
+        if self._tree_resize is None:
+            return None
+        _, left, right, _, _, subject_stretch = self._tree_resize
+        if subject_stretch:
+            self.tree.column("subject", stretch=True)
+        self._tree_resize = None
+        self._save_column_config()
         return "break"
 
     def _prepare_tree_popup(self, event) -> bool:
@@ -1579,6 +1903,7 @@ class BackupApp:
     def _on_close(self) -> None:
         if self.running and not messagebox.askokcancel("退出", "备份正在进行中，确定要退出吗？", parent=self.root):
             return
+        self._save_column_config()
         self.root.destroy()
 
     def run(self) -> None:
