@@ -11,6 +11,7 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 """
 import logging
 import json
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -1208,11 +1209,12 @@ def test_mail_column_config_loads_only_complete_valid_widths(app, monkeypatch, t
     app.tree.column("subject", stretch=True)
 
 
-def test_mail_column_config_save_is_atomic_and_excludes_credentials(app, monkeypatch, tmp_path):
+def test_mail_column_config_save_is_atomic_and_persists_user_config(app, monkeypatch, tmp_path):
+    """config 节与列宽/窗口同一原子写：5 个明文字段 + DPAPI 密文密码，明文不出现在文件里。"""
     config = tmp_path / "treeview-columns.json"
     monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
-    app.user_var.set("not persisted")
-    app.password_var.set("secret")
+    app.user_var.set("alice@example.com")
+    app.password_var.set("sëcret秘")
     app._save_column_config()
     assert app._column_config_loaded
     saved = json.loads(config.read_text(encoding="utf-8"))
@@ -1220,7 +1222,15 @@ def test_mail_column_config_save_is_atomic_and_excludes_credentials(app, monkeyp
     assert saved["columns"] == {
         name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
     assert "window" in saved
-    assert "secret" not in config.read_text(encoding="utf-8")
+    section = saved["config"]
+    assert section["user"] == "alice@example.com"
+    assert section["port"] == app.port_var.get()
+    assert section["ssl"] == bool(app.ssl_var.get())
+    if sys.platform == "win32":
+        assert g._dpapi_decrypt(section["password_dpapi"]) == "sëcret秘"
+    else:
+        assert "password_dpapi" not in section, "非 Windows 不持久化密码"
+    assert "sëcret秘" not in config.read_text(encoding="utf-8")
     before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
     warnings = []
     monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
@@ -1657,3 +1667,95 @@ def test_entry_focus_clears_on_click_outside(app, monkeypatch):
 
     app.root.focus_set()  # 收尾：不把聚焦与选中态留给后续用例
     app.tree.selection_set()
+
+
+def _reset_config_vars(app):
+    """把配置区输入框还给出厂状态（本模块用例共享同一个 app，顺序有意义）。"""
+    for var, value in ((app.user_var, ""), (app.server_var, ""), (app.port_var, "993"),
+                       (app.outdir_var, str(g.Path.home() / "邮箱备份")), (app.password_var, "")):
+        var.set(value)
+    app.ssl_var.set(True)
+    app._port_touched = False
+
+
+def test_user_config_save_and_restore_round_trip(app, monkeypatch, tmp_path):
+    """save → 重读 → restore：6 字段全数回到输入框；恢复出的端口挡住 SSL 联动。"""
+    config = tmp_path / "treeview-columns.json"
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+    app.user_var.set("bob@example.com")
+    app.server_var.set("imap.corp.com")
+    app.ssl_var.set(False)
+    app.port_var.set("1143")
+    app.outdir_var.set("D:\\bob 备份")
+    app.password_var.set("密päss")
+    app._save_column_config()
+
+    _reset_config_vars(app)  # 模拟重启：输入框回到出厂值，再重新读盘恢复
+    app._ui_settings = app._read_ui_settings()
+    app._restore_user_config()
+    assert app.user_var.get() == "bob@example.com"
+    assert app.server_var.get() == "imap.corp.com"
+    assert app.ssl_var.get() is False
+    assert app.port_var.get() == "1143"
+    assert app.outdir_var.get() == "D:\\bob 备份"
+    if sys.platform == "win32":
+        assert app.password_var.get() == "密päss"
+    else:
+        assert app.password_var.get() == "", "非 Windows 不恢复密码"
+
+    assert app._port_touched, "恢复出的端口应视为用户确认过的值"
+    app.ssl_var.set(True)
+    app._on_ssl_toggle()
+    assert app.port_var.get() == "1143", "SSL 联动不许盖掉持久化的端口"
+
+    app.password_var.set("")  # 空密码不落盘：文件里连键都不留
+    app._save_column_config()
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert "password_dpapi" not in saved["config"], saved["config"]
+
+    if sys.platform == "win32":  # 加密真失败：键缺席 + 记一条警告，其余字段照常
+        warnings = []
+        monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
+        monkeypatch.setattr(g, "_dpapi_encrypt", lambda _text: None)
+        app.password_var.set("存不下")
+        app._save_column_config()
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert "password_dpapi" not in saved["config"], saved["config"]
+        assert saved["config"]["user"] == "bob@example.com"
+        assert warnings
+
+    _reset_config_vars(app)
+
+
+def test_user_config_restore_tolerates_bad_data(app, monkeypatch):
+    """坏节/坏字段逐个跳过：整节非 dict 只警告；坏类型字段回退默认；坏密文当没存过。"""
+    warnings = []
+    monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
+
+    app._ui_settings = {"version": g.UI_SETTINGS_VERSION, "config": "nope"}
+    app._restore_user_config()
+    assert warnings
+    assert app.user_var.get() == "", app.user_var.get()  # 上一个用例已复位出厂值
+
+    warnings.clear()
+    app._ui_settings = {"version": g.UI_SETTINGS_VERSION,
+                        "config": {"user": 42, "server": "imap.ok.com", "ssl": "yes",
+                                   "port": 993, "outdir": "好的目录"}}
+    app._restore_user_config()
+    assert app.user_var.get() == ""               # 非字符串，跳过该字段
+    assert app.server_var.get() == "imap.ok.com"
+    assert app.ssl_var.get() is True              # "yes" 不是 bool，保持默认
+    assert app.port_var.get() == "993"            # int 不是 str，保持默认
+    assert app.outdir_var.get() == "好的目录"
+
+    # 坏密文：base64 损坏与解不开（合法 base64 但不是 DPAPI 密文）都视为没存过，各警告一次；
+    # 非字符串的 password_dpapi 静默跳过（不警告、不动密码框）
+    warnings.clear()
+    for blob in ("!!!not-base64!!!", "AAAA", 42):
+        app._ui_settings = {"version": g.UI_SETTINGS_VERSION,
+                            "config": {"password_dpapi": blob}}
+        app._restore_user_config()
+    assert app.password_var.get() == ""
+    assert len(warnings) == 2, warnings
+
+    _reset_config_vars(app)

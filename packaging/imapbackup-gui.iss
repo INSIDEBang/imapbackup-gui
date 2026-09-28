@@ -188,7 +188,7 @@ begin
     DeleteSettingsBox.Top := DeleteLogsBox.Top + DeleteLogsBox.Height;
     DeleteSettingsBox.Width := DeleteLogsBox.Width;
     DeleteSettingsBox.Height := DeleteLogsBox.Height;
-    DeleteSettingsBox.Caption := '同时删除界面设置';
+    DeleteSettingsBox.Caption := '同时删除界面设置（列宽、窗口位置、已保存的账号与加密密码）';
     DeleteSettingsBox.Checked := True;
 
     HintLabel := TLabel.Create(Form);

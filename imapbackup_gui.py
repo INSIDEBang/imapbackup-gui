@@ -25,6 +25,7 @@ __version__ = "1.6.0"  # 与 imapbackup312.__version__ 同一个号（项目统�
 __author__ = "Chen Chong"
 __copyright__ = "(C) 2026 Chen Chong. Code under MIT License."
 
+import base64
 import ctypes
 import email.utils
 import logging
@@ -243,6 +244,56 @@ def _another_instance_running() -> bool:
     return ctypes.get_last_error() == ERROR_ALREADY_EXISTS
 
 
+class _DATA_BLOB(ctypes.Structure):  # wincrypt 的 DATA_BLOB
+    _fields_ = [("cbData", ctypes.c_ulong),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1  # 凭据场景不许弹 UI
+
+
+def _dpapi_run(func_name: str, raw: bytes) -> bytes | None:
+    """调一次 crypt32 的 CryptProtectData/CryptUnprotectData；非 win32 或任何失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        blob_in = _DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _DATA_BLOB()
+        if not getattr(crypt32, func_name)(ctypes.byref(blob_in), None, None, None, None,
+                                           _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)):
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except (OSError, AttributeError):
+        return None
+
+
+def _dpapi_encrypt(text: str) -> str | None:
+    """明文 → DPAPI 密文的 base64（仅当前用户+当前机器可解）。失败返回 None。"""
+    cipher = _dpapi_run("CryptProtectData", text.encode("utf-8"))
+    return None if cipher is None else base64.b64encode(cipher).decode("ascii")
+
+
+def _dpapi_decrypt(cipher: str) -> str | None:
+    """base64 密文 → 明文。解码/解密/utf-8 任一失败返回 None，调用方按没存过处理。"""
+    try:
+        raw = base64.b64decode(cipher, validate=True)
+    except (TypeError, ValueError):
+        return None
+    plain = _dpapi_run("CryptUnprotectData", raw)
+    if plain is None:
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 class BackupApp:
     """Single-window layout: config zones on top, Notebook (邮件列表/运行日志) below, status bar at the bottom."""
 
@@ -294,6 +345,7 @@ class BackupApp:
         self._column_reflowing = False
 
         self._build_config_area()
+        self._restore_user_config()
         self._build_run_area()
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1075,7 +1127,8 @@ class BackupApp:
             columns = raw.get("columns")
             if columns is not None and not isinstance(columns, dict):
                 raise ValueError("invalid columns section")
-            return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window")}
+            return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
+                    "config": raw.get("config")}
         except FileNotFoundError:
             return {"version": UI_SETTINGS_VERSION}
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1116,6 +1169,37 @@ class BackupApp:
                 self.log.warning("无法恢复窗口最大化状态")
         return values
 
+    def _restore_user_config(self) -> None:
+        """启动时恢复配置区 6 字段；坏节/坏字段逐个跳过，回退默认值。
+
+        校验风格与窗口节一致：节不是 dict 就整节丢弃；字段逐个看类型（字符串/布尔），
+        坏的只跳过该字段。密码解不出明文视为没存过（换机器/换账户/文件损坏），
+        记一条 warning，不弹窗、不阻断启动。
+        """
+        config = self._ui_settings.get("config")
+        if config is None:
+            return
+        if not isinstance(config, dict):
+            self.log.warning("忽略无效的用户配置节 %s", COLUMN_CONFIG_PATH)
+            return
+        ssl = config.get("ssl")
+        if isinstance(ssl, bool):
+            self.ssl_var.set(ssl)
+        for name, var in (("user", self.user_var), ("server", self.server_var),
+                          ("port", self.port_var), ("outdir", self.outdir_var)):
+            value = config.get(name)
+            if isinstance(value, str):
+                var.set(value)
+                if name == "port":
+                    self._port_touched = True  # 持久化端口=用户确认过的值，挡住 SSL 联动
+        cipher = config.get("password_dpapi")
+        if isinstance(cipher, str):
+            password = _dpapi_decrypt(cipher)
+            if password is None:
+                self.log.warning("无法解密保存的密码，需要重新输入")
+            else:
+                self.password_var.set(password)
+
     def _window_position_visible(self, width: int, height: int, x: int, y: int) -> bool:
         left = self.root.winfo_vrootx()
         top = self.root.winfo_vrooty()
@@ -1146,6 +1230,17 @@ class BackupApp:
         self._ui_settings["version"] = UI_SETTINGS_VERSION
         self._ui_settings["columns"] = widths
         self._ui_settings["window"] = self._window_settings()
+        config = {"user": self.user_var.get(), "server": self.server_var.get(),
+                  "ssl": bool(self.ssl_var.get()), "port": self.port_var.get(),
+                  "outdir": self.outdir_var.get()}
+        password = self.password_var.get()
+        if password and sys.platform == "win32":
+            cipher = _dpapi_encrypt(password)
+            if cipher is not None:
+                config["password_dpapi"] = cipher  # 空密码不落盘；非 win32 本项缺席
+            else:
+                self.log.warning("DPAPI 加密失败，本次未保存密码")
+        self._ui_settings["config"] = config
         temporary: Path | None = None
         try:
             COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
