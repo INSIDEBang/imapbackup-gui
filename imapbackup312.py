@@ -25,31 +25,32 @@ from __future__ import annotations
 __version__ = "1.6.0"
 __author__ = "Rui Carmo (http://taoofmac.com)"
 __copyright__ = "(C) 2006-2025 Rui Carmo. Code under MIT License.(C)"
-__contributors__ = "jwagnerhki, Bob Ippolito, Michael Leonhard, Giuseppe Scrivano <gscrivano@gnu.org>, Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett, Mark Feit, Marco Machicao"
+__contributors__ = ("jwagnerhki, Bob Ippolito, Michael Leonhard, Giuseppe Scrivano <gscrivano@gnu.org>, "
+                    "Ronan Sheth, Brandon Long, Christian Schanz, A. Bovett, Mark Feit, Marco Machicao")
 
 import argparse
 import base64
+import contextlib
 import email.utils
-import ssl
-import logging
 import getpass
 import hashlib
 import imaplib
+import logging
 import mailbox
 import os
 import re
 import shutil
 import socket
+import ssl
 import sys
 import time
 import unicodedata
+from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
-
 
 # Daily run log shared with the Tkinter GUI: both entry points append to one
 # file per day under the app data directory, which the uninstaller deletes whole.
@@ -66,7 +67,7 @@ LOG_FORMATTER = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
 RUN_LOG_LOGGER = 'imapbackup.runlog'
 
 
-def make_log_file_handler() -> Optional[logging.FileHandler]:
+def make_log_file_handler() -> logging.FileHandler | None:
     """Handler for today's run log, or None so the caller can degrade gracefully.
 
     The log is a diagnostic convenience and never a precondition for the backup:
@@ -117,7 +118,7 @@ def _truncate_width(text: str, max_width: int) -> str:
         return ""
     if _display_width(text) <= max_width:
         return text
-    out: List[str] = []
+    out: list[str] = []
     width = 0
     for ch in text:
         cw = _char_width(ch)
@@ -158,30 +159,39 @@ class Spinner:
         sys.stdout.flush()
     def status(self, text: str) -> None:
         """Replace the status line content without advancing the glyph."""
-        if self.disabled: return
+        if self.disabled:
+            return
         self.message = text
         self._render(text)
     def erase(self) -> None:
         """Blank the status line so a report line can be printed above it."""
-        if self.disabled: return
+        if self.disabled:
+            return
         sys.stdout.write("\r" + " " * self._width + "\r")
         sys.stdout.flush()
         self._width = 0
     def spin(self) -> None:
-        if self.disabled: return
+        if self.disabled:
+            return
         self.pos = (self.pos + 1) % len(self.glyphs)
         self._render(self.message)
     def stop(self) -> None:
-        if self.disabled: return
+        if self.disabled:
+            return
         self.erase()
 
 
 def pretty_byte_count(num: int) -> str:
-    if num == 1: return "1 byte"
-    if num < 1024: return f"{num} bytes"
-    if num < 1 << 20: return f"{num/1024.0:.2f} KB"
-    if num < 1 << 30: return f"{num/1048576.0:.3f} MB"
-    if num < 1 << 40: return f"{num/1073741824.0:.3f} GB"
+    if num == 1:
+        return "1 byte"
+    if num < 1024:
+        return f"{num} bytes"
+    if num < 1 << 20:
+        return f"{num/1024.0:.2f} KB"
+    if num < 1 << 30:
+        return f"{num/1048576.0:.3f} MB"
+    if num < 1 << 40:
+        return f"{num/1073741824.0:.3f} GB"
     return f"{num/1099511627776.0:.3f} TB"
 
 
@@ -208,8 +218,10 @@ FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate pe
 
 
 def string_from_file(value: str) -> str:
-    if not value or value[0] not in ("\\", "@"): return value
-    if value[0] == "\\": return value[1:]
+    if not value or value[0] not in ("\\", "@"):
+        return value
+    if value[0] == "\\":
+        return value[1:]
     path = Path(os.path.expanduser(value[1:]))
     try:
         return path.read_text(encoding="utf-8").strip()
@@ -241,7 +253,7 @@ def sanitize_msgid(msg_id: str, max_len: int = EML_MSGID_MAX) -> str:
     return sanitize_segment(text, max_len)
 
 
-def build_eml_target(bucket_dir: Path, timestamp: datetime, msg_id: str, subject: Optional[str]) -> Path:
+def build_eml_target(bucket_dir: Path, timestamp: datetime, msg_id: str, subject: str | None) -> Path:
     """eml target path `<subject>_<Message-Id>_yyyyMMdd.eml`; subject, then Message-Id, shrink until the path fits the budget."""
 
     def assemble(subj_part: str, mid_part: str) -> Path:
@@ -269,7 +281,7 @@ def unique_eml_path(target: Path) -> Path:
     return candidate
 
 
-def parse_internaldate(value: str) -> Optional[datetime]:
+def parse_internaldate(value: str) -> datetime | None:
     """Parse an IMAP INTERNALDATE (English month abbreviations, zone offset) without locale traps."""
     m = INTERNALDATE_TS_RE.match(value.strip())
     if not m:
@@ -313,7 +325,7 @@ def decode_mime_words(value: str) -> str:
         chunks = decode_header(value)
     except Exception:
         return value
-    out: List[str] = []
+    out: list[str] = []
     for data, charset in chunks:
         if isinstance(data, bytes):
             try:
@@ -331,7 +343,7 @@ def _subject_label(subject: str, max_len: int) -> str:
     return title[: max_len - 1] + "…" if len(title) > max_len else title
 
 
-@lru_cache(maxsize=None)
+@cache
 def _folded_header_re(name: str) -> re.Pattern[str]:
     """Regex extracting a named header plus its continuation (folded) lines; compiled once per name."""
     return re.compile(rf"^{name}[ \t]*:(.*(?:\r?\n[ \t].*)*)", re.IGNORECASE | re.MULTILINE)
@@ -355,15 +367,17 @@ def imap_utf7_decode(name: str) -> str:
     """Decode an IMAP4 modified UTF-7 mailbox name (RFC 3501 §5.1.3); malformed runs are kept raw."""
     if "&" not in name:
         return name
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     while i < len(name):
         if name[i] != "&":
-            out.append(name[i]); i += 1
+            out.append(name[i])
+            i += 1
             continue
         j = name.find("-", i + 1)
         if j < 0:
-            out.append(name[i:]); break
+            out.append(name[i:])
+            break
         b64 = name[i + 1:j]
         if not b64:
             out.append("&")
@@ -407,8 +421,8 @@ def format_message_line(foldername: str, idx: int, total: int, timestamp: dateti
 
 def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
                    from_value: str, subject: str, size: int, msg_id: str,
-                   quiet: bool, verbose: int, report: Optional[Callable[[dict], None]] = None,
-                   erase: Optional[Callable[[], None]] = None) -> None:
+                   quiet: bool, verbose: int, report: Callable[[dict], None] | None = None,
+                   erase: Callable[[], None] | None = None) -> None:
     """Emit per-message progress: a structured dict to the GUI callback, else one terminal line.
 
     The callback receives raw header values (undecoded From/Subject) — consumers
@@ -428,33 +442,38 @@ def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
         sys.stdout.flush()
 
 
-def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, int],
+def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, int],
                       overwrite: bool, nospinner: bool, thunderbird: bool,
-                      basedir: Optional[Path], icloud: bool, quiet: bool, log: logging.Logger,
-                      eml_dir: Optional[Path] = None, skip_mbox: Optional[Set[str]] = None,
-                      skip_eml: Optional[Set[str]] = None, foldername: str = "",
+                      basedir: Path | None, icloud: bool, quiet: bool, log: logging.Logger,
+                      eml_dir: Path | None = None, skip_mbox: Container[str] | None = None,
+                      skip_eml: Container[str] | None = None, foldername: str = "",
                       verbose: int = 0, compact: bool = False,
-                      report: Optional[Callable[[dict], None]] = None,
-                      should_stop: Optional[Callable[[], bool]] = None) -> None:
+                      report: Callable[[dict], None] | None = None,
+                      should_stop: Callable[[], bool] | None = None) -> None:
     """Download `messages` (Message-Id -> seq) once each, writing to whichever sinks are
     selected. skip_mbox/skip_eml hold Message-Ids already present in that sink, so a
     message missing from only one format is fetched once and written only to the sink
     that lacks it. `messages` must not contain an id present in BOTH skip sets."""
-    if skip_mbox is None: skip_mbox = frozenset()
-    if skip_eml is None: skip_eml = frozenset()
+    if skip_mbox is None:
+        skip_mbox = frozenset()
+    if skip_eml is None:
+        skip_eml = frozenset()
     if basedir is not None:
         fullname = basedir / filename
         if overwrite and fullname.exists():
-            if not quiet: log.info("Deleting mbox %s at %s", filename, fullname)
+            if not quiet:
+                log.info("Deleting mbox %s at %s", filename, fullname)
             fullname.unlink()
     if eml_dir is not None and overwrite and eml_dir.exists():
-        if not quiet: log.info("Deleting eml folder %s", eml_dir)
+        if not quiet:
+            log.info("Deleting eml folder %s", eml_dir)
         shutil.rmtree(eml_dir)
     if not messages:
-        if not quiet: log.info("%s: New messages: 0", filename)
+        if not quiet:
+            log.info("%s: New messages: 0", filename)
         return
     if basedir is not None:
-        fullname.parent.mkdir(parents=True, exist_ok=True)
+        (basedir / filename).parent.mkdir(parents=True, exist_ok=True)
     count = len(messages)
     display = foldername or filename
     spinner = Spinner(f"Downloading {count} new messages to {display}", nospinner, quiet=quiet)
@@ -462,11 +481,12 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
     done_bytes = 0
     t0 = time.monotonic()
     from_re = re.compile(br"\n(>*)From ")
-    mbox = fullname.open("ab") if basedir is not None else None
+    mbox = (basedir / filename).open("ab") if basedir is not None else None
     try:
         for idx, (msg_id, seq) in enumerate(messages.items(), start=1):
             if should_stop is not None and should_stop():
-                if not quiet: log.info("%s: stopped by request after %d/%d messages", display, idx - 1, count)
+                if not quiet:
+                    log.info("%s: stopped by request after %d/%d messages", display, idx - 1, count)
                 break
             fetch_cmd = "(INTERNALDATE BODY.PEEK[])"
             typ, data = server.fetch(str(seq), fetch_cmd)
@@ -483,25 +503,25 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
             size = 0
             if mbox is not None and msg_id not in skip_mbox:
                 buf = f"From nobody {time.ctime()}\n"
-                if UUID in msg_id: buf += f"Message-Id: {msg_id}\n"
+                if UUID in msg_id:
+                    buf += f"Message-Id: {msg_id}\n"
                 mbox.write(buf.encode("utf-8"))
                 text_bytes = raw_bytes.strip().replace(b"\r", b"")
-                if thunderbird:
-                    text_bytes = text_bytes.replace(b"\nFrom ", b"\n From ")
-                else:
-                    text_bytes = from_re.sub(b"\n>\\1From ", text_bytes)
+                text_bytes = (text_bytes.replace(b"\nFrom ", b"\n From ") if thunderbird
+                              else from_re.sub(b"\n>\\1From ", text_bytes))
                 mbox.write(text_bytes + b"\n\n")
                 size = len(text_bytes)
             if eml_dir is not None and msg_id not in skip_eml:
                 payload = raw_bytes.strip() + b"\r\n"
                 if UUID in msg_id and b"message-id:" not in head.lower():
-                    payload = f"Message-Id: {msg_id}\r\n".encode("utf-8") + payload
+                    payload = f"Message-Id: {msg_id}\r\n".encode() + payload
                 bucket_dir = eml_dir / timestamp.strftime("%Y-%m")
                 target = unique_eml_path(build_eml_target(bucket_dir, timestamp, msg_id, decode_mime_words(subject_value)))
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
                 size = max(size, len(payload))
-            if size > biggest: biggest = size
+            if size > biggest:
+                biggest = size
             if not compact:
                 report_message(display, idx, count, timestamp, from_value, subject_value, size,
                                msg_id, quiet, verbose, report, erase=spinner.erase)
@@ -522,65 +542,77 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: Dict[str, 
         log.info("%s: %s total, %s largest", filename, pretty_byte_count(done_bytes), pretty_byte_count(biggest))
 
 
-def scan_file(filename: str, overwrite: bool, nospinner: bool, basedir: Path, quiet: bool, log: logging.Logger) -> Dict[str, str]:
-    if overwrite: return {}
+def scan_file(filename: str, overwrite: bool, nospinner: bool, basedir: Path, quiet: bool, log: logging.Logger) -> dict[str, str]:
+    if overwrite:
+        return {}
     fullname = basedir / filename
     if not fullname.exists():
-        if not quiet: log.info("File %s: not found", filename)
+        if not quiet:
+            log.info("File %s: not found", filename)
         return {}
     spinner = Spinner(f"File {filename}", nospinner, quiet=quiet)
-    messages: Dict[str, str] = {}
+    messages: dict[str, str] = {}
     header = 'Message-Id'
     mbox = mailbox.mbox(fullname)
     try:
         for idx, msg in enumerate(mbox):
             raw_val = msg.get(header)
             if not raw_val:
-                if not quiet: log.warning("Message #%d in %s has no %s header", idx, filename, header)
-                spinner.spin(); continue
+                if not quiet:
+                    log.warning("Message #%d in %s has no %s header", idx, filename, header)
+                spinner.spin()
+                continue
             line = f"{header}: {raw_val}".strip()
             line = BLANKS_RE.sub(' ', line)
             match = MSGID_RE.match(line)
             if match:
                 messages.setdefault(match.group(1), match.group(1))
             else:
-                if not quiet: log.warning("Message #%d in %s has malformed %s header", idx, filename, header)
+                if not quiet:
+                    log.warning("Message #%d in %s has malformed %s header", idx, filename, header)
             spinner.spin()
     finally:
         mbox.close()
     spinner.stop()
-    if not quiet: log.info("%s: %d messages", filename, len(messages))
+    if not quiet:
+        log.info("%s: %d messages", filename, len(messages))
     return messages
 
 
-def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> Dict[str, str]:
+def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> dict[str, str]:
     """Content-level scan mirroring scan_file(): recover Message-Ids from each .eml header block."""
-    if overwrite: return {}
+    if overwrite:
+        return {}
     if not folder_dir.is_dir():
-        if not quiet: log.info("eml folder %s: not found", folder_dir)
+        if not quiet:
+            log.info("eml folder %s: not found", folder_dir)
         return {}
     spinner = Spinner(f"Scanning eml {folder_dir.name}", nospinner, quiet=quiet)
-    messages: Dict[str, str] = {}
+    messages: dict[str, str] = {}
     try:
         for path in sorted(folder_dir.rglob("*" + EML_SUFFIX)):
             try:
-                with path.open("rb") as f: head = f.read(65536)
+                with path.open("rb") as f:
+                    head = f.read(65536)
             except OSError as exc:
-                if not quiet: log.warning("Cannot read %s: %s", path, exc)
+                if not quiet:
+                    log.warning("Cannot read %s: %s", path, exc)
                 continue
             value = folded_header(head, "Message-Id")
             if value:
                 messages.setdefault(value, value)
             else:
-                if not quiet: log.warning("%s has no Message-Id header", path)
+                if not quiet:
+                    log.warning("%s has no Message-Id header", path)
             spinner.spin()
     finally:
         spinner.stop()
-    if not quiet: log.info("%s: %d messages", folder_dir, len(messages))
+    if not quiet:
+        log.info("%s: %d messages", folder_dir, len(messages))
     return messages
 
 
-def pending_messages(remote: Dict[str, int], *scans: Optional[Dict[str, str]]) -> Dict[str, int]:
+def pending_messages(remote: dict[str, int], *scans: dict[str, str] | None) -> dict[str, int]:
     """Server messages that still need downloading, for the selected output formats.
 
     Each entry in `scans` is one selected format's local scan result (scan_file /
@@ -592,8 +624,9 @@ def pending_messages(remote: Dict[str, int], *scans: Optional[Dict[str, str]]) -
     return {mid: remote[mid] for mid in remote if any(mid not in scan for scan in selected)}
 
 
-def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: bool, log: logging.Logger, display: Optional[str] = None) -> Dict[str, int]:
-    messages: Dict[str, int] = {}
+def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: bool, log: logging.Logger,
+                display: str | None = None) -> dict[str, int]:
+    messages: dict[str, int] = {}
     shown = display or foldername
     quoted = f'"{foldername}"'
     spinner = Spinner(f'Folder "{shown}"', nospinner, quiet=quiet)
@@ -601,9 +634,10 @@ def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: 
         typ, data = server.select(quoted, readonly=True)
         if typ != 'OK':
             raise SkipFolderException(f"SELECT failed: {data}")
+        first = data[0] if data else None
         try:
-            num_msgs = int(data[0])
-        except (ValueError, TypeError):
+            num_msgs = int(first) if isinstance(first, bytes) else 0
+        except ValueError:
             num_msgs = 0
         if num_msgs > 0:
             typ, data = server.fetch(f"1:{num_msgs}", '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
@@ -620,43 +654,56 @@ def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: 
                     msg_typ, msg_data = server.fetch(str(seq), '(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])')
                     if msg_typ != 'OK':
                         raise SkipFolderException(f"HEADER FETCH {seq} failed: {msg_data}")
-                    hdr_bytes = msg_data[0][1].replace(b'\r\n', b'\t')
+                    entry = msg_data[0] if msg_data else None
+                    if not isinstance(entry, tuple) or not isinstance(entry[1], bytes):
+                        raise SkipFolderException(f"Malformed HEADER FETCH {seq}: {msg_data}")
+                    hdr_bytes = entry[1].replace(b'\r\n', b'\t')
                     synthetic = '<' + UUID + '.' + hashlib.sha1(hdr_bytes).hexdigest() + '>'
                     messages.setdefault(synthetic, seq)
                 spinner.spin()
     finally:
         spinner.stop()
-    if not quiet: log.info("%s: %d messages", shown, len(messages))
+    if not quiet:
+        log.info("%s: %d messages", shown, len(messages))
     return messages
 
 
-def parse_paren_list(row: str):
-    if not row or row[0] != '(': raise ValueError("Expected '('")
+type ParenItem = str | list[ParenItem]
+
+
+def parse_paren_list(row: str) -> tuple[list[ParenItem], str]:
+    if not row or row[0] != '(':
+        raise ValueError("Expected '('")
     row = row[1:]
-    result: List[str | List[str]] = []
+    result: list[ParenItem] = []
     name_attr_re = re.compile(r"^\s*(\\[a-zA-Z0-9_]+)\s*")
     while row and row[0] != ')':
         if row[0] == '(':
-            sub, row = parse_paren_list(row); result.append(sub)
+            sub, row = parse_paren_list(row)
+            result.append(sub)
         else:
             m = name_attr_re.search(row)
-            if not m: raise ValueError("Malformed attribute list")
-            result.append(m.group(1)); row = row[m.end():]
-    if not row or row[0] != ')': raise ValueError("Unterminated attribute list")
+            if not m:
+                raise ValueError("Malformed attribute list")
+            result.append(m.group(1))
+            row = row[m.end():]
+    if not row or row[0] != ')':
+        raise ValueError("Unterminated attribute list")
     return result, row[1:]
 
 
-def parse_string_list(row: str) -> List[str]:
+def parse_string_list(row: str) -> list[str]:
     slist = re.compile(r'\s*"([^"]+)"\s*|\s*(\S+)\s*').split(row)
     return [s for s in slist if s]
 
 
-def parse_list(row: str) -> List[str | List[str]]:
+def parse_list(row: str) -> list[ParenItem]:
     row = row.strip()
     paren_list, rest = parse_paren_list(row)
     string_list = parse_string_list(rest)
-    if len(string_list) != 2: raise ValueError("Unexpected LIST response format")
-    return [paren_list] + string_list
+    if len(string_list) != 2:
+        raise ValueError("Unexpected LIST response format")
+    return [paren_list, *string_list]
 
 
 def folder_to_eml_relpath(foldername: str, delim: str) -> str:
@@ -664,7 +711,7 @@ def folder_to_eml_relpath(foldername: str, delim: str) -> str:
     return "/".join(sanitize_segment(s, EML_SEGMENT_MAX) for s in foldername.split(delim))
 
 
-def split_folder_display(display_name: str) -> Tuple[str, ...]:
+def split_folder_display(display_name: str) -> tuple[str, ...]:
     """Hierarchy segments of a decoded folder name.
 
     The delimiter is the server's choice, not the client's (QQ uses "/", Outlook
@@ -674,7 +721,7 @@ def split_folder_display(display_name: str) -> Tuple[str, ...]:
     return tuple(display_name.split(delim)) if delim else (display_name,)
 
 
-def split_folder_patterns(value: Optional[str]) -> List[str]:
+def split_folder_patterns(value: str | None) -> list[str]:
     """Comma-separated --folders/--exclude-folders value as trimmed patterns; empty items dropped."""
     if not value:
         return []
@@ -695,7 +742,7 @@ def folder_matches(display_name: str, raw_name: str, pattern: str) -> bool:
     return len(pattern_segs) < len(folder_segs) and folder_segs[:len(pattern_segs)] == pattern_segs
 
 
-def folder_listing(names: List[Tuple[str, str, str, str]]) -> str:
+def folder_listing(names: list[tuple[str, str, str, str]]) -> str:
     """Every folder as one markdown-style bullet per line, names sorted parents-first.
 
     Input must already be sorted so a parent precedes the folders nested under it.
@@ -703,25 +750,31 @@ def folder_listing(names: List[Tuple[str, str, str, str]]) -> str:
     return "\n".join(f"- {n[3]}" for n in names)
 
 
-def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> List[Tuple[str, str, str, str]]:
+def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: bool,
+              log: logging.Logger) -> list[tuple[str, str, str, str]]:
     spinner = Spinner("Finding Folders", nospinner, quiet=quiet)
     typ, data = server.list()
     if typ != 'OK':
         log.error("LIST failed: %s", data)
         raise RuntimeError(f"LIST failed: {data}")
     spinner.spin()
-    entries: List[Tuple[Tuple[str, ...], Tuple[str, str, str, str]]] = []
+    entries: list[tuple[tuple[str, ...], tuple[str, str, str, str]]] = []
     for raw in data:
+        if not isinstance(raw, bytes):
+            continue
         row_str = str(raw, 'utf-8', 'replace')
         try:
             lst = parse_list(row_str)
         except (ValueError, IndexError):
             continue
-        delim = lst[1]; foldername = lst[2]  # type: ignore[index]
+        delim, foldername = lst[1], lst[2]
+        if not isinstance(delim, str) or not isinstance(foldername, str):
+            continue
         display_name = imap_utf7_decode(foldername)
         if thunderbird:
             filename = '.sbd/'.join(display_name.split(delim))
-            if filename.startswith("INBOX"): filename = filename.replace("INBOX", "Inbox")
+            if filename.startswith("INBOX"):
+                filename = filename.replace("INBOX", "Inbox")
         else:
             filename = '.'.join(display_name.split(delim)) + '.mbox'
         # key by segments so a parent always precedes its descendants
@@ -766,31 +819,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 @dataclass
 class Config:
-    overwrite: bool; usessl: bool; thunderbird: bool; nospinner: bool
-    basedir: Optional[Path]; icloud: bool; quiet: bool; user: str; server: str; password: str
-    timeout: int = 60; folders: Optional[str] = None; exclude_folders: Optional[str] = None
-    keyfilename: Optional[str] = None; certfilename: Optional[str] = None; port: int = field(default=0)
+    # 每字段一行：分号打包的单行多字段曾被个别语言服务器解析漏字段（如 overwrite），分写更稳也更可读
+    overwrite: bool
+    usessl: bool
+    thunderbird: bool
+    nospinner: bool
+    basedir: Path | None
+    icloud: bool
+    quiet: bool
+    user: str
+    server: str
+    password: str
+    timeout: int = 60
+    folders: str | None = None
+    exclude_folders: str | None = None
+    keyfilename: str | None = None
+    certfilename: str | None = None
+    port: int = field(default=0)
     verbose: int = 0
-    eml_dir: Optional[Path] = None
+    eml_dir: Path | None = None
     compact: bool = False
-    def parsed_folders(self) -> List[str]: return split_folder_patterns(self.folders)
-    def parsed_excludes(self) -> List[str]: return split_folder_patterns(self.exclude_folders)
+    def parsed_folders(self) -> list[str]: return split_folder_patterns(self.folders)
+    def parsed_excludes(self) -> list[str]: return split_folder_patterns(self.exclude_folders)
 
 
-def parse_args_to_config(argv: List[str]) -> Config:
+def parse_args_to_config(argv: list[str]) -> Config:
     args = build_arg_parser().parse_args(argv)
     overwrite = args.yes_overwrite_mboxes and not args.append_to_mboxes
     eml_dir = Path(os.path.expanduser(args.eml_dir)).resolve() if args.eml_dir else None
     if args.mbox_dir:
-        basedir: Optional[Path] = Path(os.path.expanduser(args.mbox_dir)).resolve()
+        basedir: Path | None = Path(os.path.expanduser(args.mbox_dir)).resolve()
     elif eml_dir is None:
         basedir = Path(".").resolve()
     else:
         basedir = None
     password = string_from_file(args.password) if args.password else getpass.getpass()
-    server = args.server; port = 993 if args.ssl else 143
+    server = args.server
+    port = 993 if args.ssl else 143
     if ':' in server:
-        host, p = server.split(':',1); server = host
+        host, p = server.split(':',1)
+        server = host
         try:
             p_int = int(p)
             if not (0 < p_int < 65536):
@@ -800,10 +868,14 @@ def parse_args_to_config(argv: List[str]) -> Config:
             raise SystemExit(f"Invalid port in --server: {p}") from exc
     if (args.keyfile and not args.certfile) or (args.certfile and not args.keyfile):
         raise SystemExit("Specify both --keyfile and --certfile or neither")
-    if args.keyfile and not args.ssl: raise SystemExit("--keyfile requires --ssl")
-    if args.certfile and not args.ssl: raise SystemExit("--certfile requires --ssl")
-    if args.exclude_folders and args.folders: raise SystemExit("Cannot use both --folders and --exclude-folders")
-    if args.timeout <= 0: raise SystemExit("--timeout must be > 0")
+    if args.keyfile and not args.ssl:
+        raise SystemExit("--keyfile requires --ssl")
+    if args.certfile and not args.ssl:
+        raise SystemExit("--certfile requires --ssl")
+    if args.exclude_folders and args.folders:
+        raise SystemExit("Cannot use both --folders and --exclude-folders")
+    if args.timeout <= 0:
+        raise SystemExit("--timeout must be > 0")
     return Config(overwrite, bool(args.ssl), bool(args.thunderbird), bool(args.nospinner),
                   basedir, bool(args.icloud), bool(args.quiet), args.user, server, password,
                   int(args.timeout), args.folders, args.exclude_folders, args.keyfile, args.certfile, port,
@@ -811,10 +883,8 @@ def parse_args_to_config(argv: List[str]) -> Config:
 
 
 def configure_logging(cfg: Config) -> logging.Logger:
-    if cfg.quiet and cfg.verbose == 0:
-        level = logging.WARNING
-    else:
-        level = logging.INFO if cfg.verbose == 0 else logging.DEBUG
+    level = (logging.WARNING if cfg.quiet and cfg.verbose == 0
+             else logging.INFO if cfg.verbose == 0 else logging.DEBUG)
     # Root stays permissive so records are not dropped before the handlers see
     # them; the console level is applied to the StreamHandler itself. That is
     # what lets the run log keep INFO records while --quiet silences stderr.
@@ -841,7 +911,7 @@ def configure_logging(cfg: Config) -> logging.Logger:
     return log
 
 
-def get_config(argv: Optional[List[str]] = None) -> Config:
+def get_config(argv: list[str] | None = None) -> Config:
     return parse_args_to_config(argv if argv is not None else sys.argv[1:])
 
 
@@ -863,16 +933,14 @@ def connect_and_login(cfg: Config, log: logging.Logger) -> imaplib.IMAP4:
         else:
             log.info("Connecting to '%s' TCP %s", cfg.server, cfg.port)
             server = imaplib.IMAP4(cfg.server, cfg.port)
-        try:
+        with contextlib.suppress(OSError, AttributeError):
             server.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except (OSError, AttributeError):
-            pass
         log.info("Logging in as '%s'", cfg.user)
         server.login(cfg.user, cfg.password)
         return server
     except socket.gaierror as e:
         raise SystemExit(f"DNS lookup failed for '{cfg.server}': {e}") from e
-    except socket.error as e:
+    except OSError as e:
         raise SystemExit(f"Connection to '{cfg.server}' failed: {e}") from e
     except imaplib.IMAP4.error as e:
         raise SystemExit(f"IMAP authentication failed: {e}") from e
@@ -881,13 +949,14 @@ def connect_and_login(cfg: Config, log: logging.Logger) -> imaplib.IMAP4:
 def ensure_basedir(path: Path) -> None: path.mkdir(parents=True, exist_ok=True)
 
 
-def create_folder_structure(names: Iterable[Tuple[str, str, str, str]], basedir: Path, account: str = "") -> None:
+def create_folder_structure(names: Iterable[tuple[str, str, str, str]], basedir: Path, account: str = "") -> None:
     for _, filename, _, _ in sorted(names, key=lambda n: n[1]):
         folder = Path(f"{account}/{filename}" if account else filename).parent
-        if folder and str(folder) != '.': (basedir / folder).mkdir(parents=True, exist_ok=True)
+        if folder and str(folder) != '.':
+            (basedir / folder).mkdir(parents=True, exist_ok=True)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     cfg = get_config(argv)
     log = configure_logging(cfg)
     runlog = logging.getLogger(RUN_LOG_LOGGER)
@@ -918,19 +987,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log.warning("No folder matches --exclude-folders '%s'", ", ".join(unmatched))
         account = sanitize_segment(cfg.user, EML_SEGMENT_MAX)
         if cfg.basedir is not None:
-            ensure_basedir(cfg.basedir); create_folder_structure(names, cfg.basedir, account)
+            ensure_basedir(cfg.basedir)
+            create_folder_structure(names, cfg.basedir, account)
         total_folders = len(names)
         for folder_idx, (foldername, filename, eml_relpath, display_name) in enumerate(names, start=1):
-            if not cfg.quiet: folder_separator(folder_idx, total_folders, display_name)
+            if not cfg.quiet:
+                folder_separator(folder_idx, total_folders, display_name)
             try:
                 remote_msgs = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
                 # per-format incremental: pending iff any selected format lacks the message;
                 # download_messages then writes only the sinks that still lack it
-                local_mbox: Optional[Dict[str, str]] = None
+                local_mbox: dict[str, str] | None = None
                 if cfg.basedir is not None:
                     local_mbox = scan_file(f"{account}/{filename}", cfg.overwrite, cfg.nospinner,
                                            cfg.basedir, quiet=cfg.quiet, log=log)
-                local_eml: Optional[Dict[str, str]] = None
+                local_eml: dict[str, str] | None = None
                 eml_folder_dir = None
                 if cfg.eml_dir is not None:
                     eml_folder_dir = cfg.eml_dir / account / eml_relpath
@@ -942,10 +1013,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                                   eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                   foldername=display_name, verbose=cfg.verbose, compact=cfg.compact)
             except SkipFolderException as e:
-                if not cfg.quiet: log.warning("%s", e); continue
-        if not cfg.quiet: log.info("Disconnecting")
-        try: server.logout()
-        except imaplib.IMAP4.error: pass
+                if not cfg.quiet:
+                    log.warning("%s", e)
+                continue
+        if not cfg.quiet:
+            log.info("Disconnecting")
+        with contextlib.suppress(imaplib.IMAP4.error):
+            server.logout()
         return 0
     except KeyboardInterrupt:
         runlog.warning("Run interrupted by user")
@@ -962,7 +1036,8 @@ def cli_exception(typ, value, traceback):
     if not issubclass(typ, KeyboardInterrupt):
         sys.__excepthook__(typ, value, traceback)
     elif sys.stdout is not None:
-        sys.stdout.write("\n"); sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 if sys.stdin is not None and sys.stdin.isatty():  # pragma: no cover
     sys.excepthook = cli_exception

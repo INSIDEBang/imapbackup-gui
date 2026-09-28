@@ -1,0 +1,19 @@
+# ruff 配置：本仓库运行时只依赖标准库，ruff 仅作为开发期静态检查工具（uv tool install ruff）。
+target-version = "py312"
+line-length = 140
+# 两个遗留版本整体不进 ruff 的默认检查（AGENTS.md 约定：非明确要求不修改）。
+# imapbackup.py 是 py2 语法，无法解析；imapbackup38.py 曾按 py38 目标做过一次性检查
+# （basedpyright 0 错误；ruff 68 条均为风格现代化改写，收益低、回归风险高，故豁免）。
+# 显式传路径仍可单独检查：ruff check --isolated --target-version py38 imapbackup38.py
+extend-exclude = ["imapbackup.py", "imapbackup38.py"]
+
+[lint]
+# E/F/W 基础规范 + isort 导入排序 + bugbear 常见陷阱 + pyupgrade 语法升级 + 常用简化规则
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF"]
+ignore = [
+    # 全中文注释/文案的代码库：全角标点（如 ｜、「」）是有意为之，不做同形字符告警
+    "RUF001", "RUF002", "RUF003",
+]
+
+[lint.isort]
+known-first-party = ["imapbackup312"]

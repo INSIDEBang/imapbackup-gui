@@ -26,21 +26,22 @@ __author__ = "Chen Chong"
 __copyright__ = "(C) 2026 Chen Chong. Code under MIT License."
 
 import base64
+import contextlib
 import ctypes
 import email.utils
+import json
 import logging
 import os
 import queue
-import json
-import tempfile
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-import tkinter.font as tkfont
 
 import imapbackup312 as core
 
@@ -131,10 +132,9 @@ class QueueLogHandler(logging.Handler):
         self.setFormatter(LOG_FORMATTER)
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
+        # pragma: no cover — logging must never raise into the app
+        with contextlib.suppress(Exception):
             self.events.put(("log", self.format(record)))
-        except Exception:  # pragma: no cover — logging must never raise into the app
-            pass
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -143,9 +143,18 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _ellipsize(full: str, budget: int, font: tkfont.Font) -> str:
-    """按像素预算截断：放得下返回原文；放不下二分最长前缀，使「前缀+…」刚好 ≤ budget。
+    """按像素预算截断出「前缀 + …」。
 
-    始终从 full 重算，调用方在行宽变大后重调即可自动恢复全文（双向动态）。
+    Args:
+        full: 完整文本，截断源。
+        budget: 像素预算上限。
+        font: 量字宽用的字体。
+
+    Returns:
+        放得下时原样返回全文；放不下时返回二分出的最长前缀加省略号，宽度刚好 ≤ budget。
+
+    Note:
+        始终从 full 重算，调用方在行宽变大后重调即可自动恢复全文（双向动态）。
     """
     if font.measure(full) <= budget:
         return full
@@ -160,17 +169,32 @@ def _ellipsize(full: str, budget: int, font: tkfont.Font) -> str:
 
 
 def _italic_font(base: tkfont.Font) -> tkfont.Font:
-    """同一字体的斜体版：Tk 没有字体克隆 API，按 family/size 重建，其余属性走默认。
+    """返回同一字体的斜体版。
 
-    size 取绝对值——系统默认字号可能是负数（DPI 无关），Font 构造要正数。
+    Args:
+        base: 作为模板的字体。
+
+    Returns:
+        按 family/size 重建的斜体字体（Tk 没有字体克隆 API，其余属性走默认）。
+
+    Note:
+        size 取绝对值——系统默认字号可能是负数（DPI 无关），Font 构造要正数。
     """
     return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), slant="italic")
 
 
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
-    """最后一段显示名。eml_relpath 的段数等于真实层级深度，用它反查真实分隔符。
+    """返回显示名的最后一段。
 
-    不能直接按 "/" 切 display：QQ 用 "/"，Outlook 用 "."，服务器决定分隔符。
+    Args:
+        display: 文件夹显示名。
+        path: eml_relpath 拆出的层级段；段数等于真实层级深度，用它反查真实分隔符。
+
+    Returns:
+        显示名的最后一段；匹配不出分隔符时原样返回 display。
+
+    Note:
+        不能直接按 "/" 切 display：QQ 用 "/"，Outlook 用 "."，服务器决定分隔符。
     """
     for delim in ("/", "\\", "."):
         if display.count(delim) == len(path) - 1:
@@ -189,10 +213,14 @@ def _window_icon_path() -> str | None:
 
 
 def _icon_size() -> int:
-    """图标边长(px)：跟默认字体行高走——系统缩放或字号变大，图标同比例变大。
+    """返回按钮图标的边长(px)。
 
-    不设上限（封顶会让高 DPI 下的图标相对文字偏小）；比行高矮几像素，按钮高度因此仍由文字决定，
-    只留一个下限兜底。
+    Returns:
+        图标边长，跟默认字体行高走——系统缩放或字号变大，图标同比例变大。
+
+    Note:
+        不设上限（封顶会让高 DPI 下的图标相对文字偏小）；比行高矮几像素，按钮高度因此仍由
+        文字决定，只留一个下限兜底。
     """
     linespace = tkfont.nametofont("TkDefaultFont").metrics("linespace")
     return max(ICON_MIN_SIZE, linespace - ICON_LINESPACE_GAP)
@@ -210,7 +238,7 @@ def _play_icon(color: str, size: int) -> tk.PhotoImage:
     img = tk.PhotoImage(width=size, height=size)
     mid = (size - 1) / 2
     for y in range(size):
-        width = int(round(size * (1 - abs(y - mid) / (mid + 0.5))))
+        width = round(size * (1 - abs(y - mid) / (mid + 0.5)))
         _put(img, color, 0, y, width, y + 1)
     return img
 
@@ -224,12 +252,19 @@ def _stop_icon(color: str, size: int) -> tk.PhotoImage:
 
 
 def _blank_icon(height: int) -> tk.PhotoImage:
-    """高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
+    """生成高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
 
-    加载态不能把 image 撤成 ""：Tk 的按钮请求高度取决于「有没有 image」——实测同一按钮
-    带图 28px、撤图 30px，与文案是中文还是盲文帧无关。保留一枚 1px 宽的占位只借它的高度：
-    按钮高度在加载/静止之间不动，而图标槽不再占宽——转圈符贴近左边框，左右留白与静止态
-    一样对称。
+    Args:
+        height: 位图高度(px)，与彩色图标一致。
+
+    Returns:
+        全透明的占位图。
+
+    Note:
+        加载态不能把 image 撤成 ""：Tk 的按钮请求高度取决于「有没有 image」——实测同一按钮
+        带图 28px、撤图 30px，与文案是中文还是盲文帧无关。保留一枚 1px 宽的占位只借它的高度：
+        按钮高度在加载/静止之间不动，而图标槽不再占宽——转圈符贴近左边框，左右留白与静止态
+        一样对称。
     """
     return tk.PhotoImage(width=1, height=height)
 
@@ -253,7 +288,15 @@ _CRYPTPROTECT_UI_FORBIDDEN = 0x1  # 凭据场景不许弹 UI
 
 
 def _dpapi_run(func_name: str, raw: bytes) -> bytes | None:
-    """调一次 crypt32 的 CryptProtectData/CryptUnprotectData；非 win32 或任何失败返回 None。"""
+    """调一次 crypt32 的加/解密入口。
+
+    Args:
+        func_name: "CryptProtectData" 或 "CryptUnprotectData"。
+        raw: 输入字节串（明文或密文）。
+
+    Returns:
+        成功时的输出字节串；非 win32 或任何失败返回 None。
+    """
     if sys.platform != "win32":
         return None
     try:
@@ -301,10 +344,9 @@ class BackupApp:
         self.root = tk.Tk()
         icon = _window_icon_path()
         if icon:
-            try:
+            # 非 Windows 平台没有 iconbitmap，或图标不可读时退回 Tk 默认图标
+            with contextlib.suppress(tk.TclError):
                 self.root.iconbitmap(icon)
-            except tk.TclError:
-                pass  # 非 Windows 平台没有 iconbitmap，或图标不可读时退回 Tk 默认图标
         self.root.title("IMAP Backup GUI")
         self.root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
         self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
@@ -323,10 +365,10 @@ class BackupApp:
         self.stopping = False  # 运行中的子阶段：已按停止、工作线程还在收尾（按钮与提示都跟着换口径）
         self.folder_rows: list[dict] = []
         self._folder_nodes: dict[tuple[str, ...], dict] = {}
-        self._folder_clickables: list[tuple[tk.Widget, str]] = []
+        self._folder_clickables: list[tuple[tk.Label, str]] = []
         self._port_touched = False
-        self._spinner_job: int | None = None  # root.after id while the button shows a spinner
-        self._run_spinner_job: int | None = None  # 同上，备份运行中的开始按钮
+        self._spinner_job: str | None = None  # root.after id while the button shows a spinner
+        self._run_spinner_job: str | None = None  # 同上，备份运行中的开始按钮
         self._config_widgets: list[tuple[tk.Widget, str]] = []
         self.server_total = 0
         self.pending_total = 0
@@ -374,7 +416,8 @@ class BackupApp:
 
     # ------------------------------------------------------------- config area
 
-    def _register(self, widget: tk.Widget) -> tk.Widget:
+    def _register[T: tk.Widget](self, widget: T) -> T:
+        """登记配置区控件并原样返回：加入运行中的启停名单，构造时可链式书写。"""
         self._config_widgets.append((widget, str(widget.cget("state"))))
         return widget
 
@@ -407,7 +450,8 @@ class BackupApp:
         self.server_entry = self._register(tk.Entry(group, textvariable=self.server_var))
         self.server_entry.grid(row=2, column=1, sticky="we", padx=4, pady=3)
         self.ssl_var = tk.BooleanVar(value=True)
-        self._register(tk.Checkbutton(group, text="SSL", variable=self.ssl_var, command=self._on_ssl_toggle)).grid(row=2, column=2, sticky="w")
+        self._register(tk.Checkbutton(group, text="SSL", variable=self.ssl_var,
+                                      command=self._on_ssl_toggle)).grid(row=2, column=2, sticky="w")
         tk.Label(group, text="端口：").grid(row=2, column=3, sticky="e", padx=(8, 0))
         self.port_var = tk.StringVar(value="993")
         self.port_entry = self._register(tk.Entry(group, textvariable=self.port_var, width=7))
@@ -419,7 +463,8 @@ class BackupApp:
         self.password_entry = self._register(tk.Entry(group, textvariable=self.password_var, show="*"))
         self.password_entry.grid(row=3, column=1, columnspan=4, sticky="we", padx=4, pady=3)
         self.show_var = tk.BooleanVar(value=False)
-        self._register(tk.Checkbutton(group, text="显示", variable=self.show_var, command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
+        self._register(tk.Checkbutton(group, text="显示", variable=self.show_var,
+                                      command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
 
         self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=CONNECT_BTN_CHARS,
                                                      command=self._on_connect))
@@ -451,8 +496,10 @@ class BackupApp:
         fmt_row.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
         self.mbox_var = tk.BooleanVar(value=False)
         self.eml_var = tk.BooleanVar(value=True)
-        self._register(tk.Checkbutton(fmt_row, text="mbox 输出", variable=self.mbox_var, command=self._update_start_state)).pack(side="left")
-        self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var, command=self._update_start_state)).pack(side="left", padx=(12, 0))
+        self._register(tk.Checkbutton(fmt_row, text="mbox 输出", variable=self.mbox_var,
+                                      command=self._update_start_state)).pack(side="left")
+        self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var,
+                                      command=self._update_start_state)).pack(side="left", padx=(12, 0))
 
         self._bind_enter(self.outdir_entry)
         self._bind_context_menu(self.outdir_entry)
@@ -469,7 +516,8 @@ class BackupApp:
         toolbar = tk.Frame(group)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=6, pady=(2, 0))
         self._register(tk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
-        self._register(tk.Button(toolbar, text="清空", width=7, command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
+        self._register(tk.Button(toolbar, text="清空", width=7,
+                                 command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
         self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(6, 0))
 
         # 用嵌套 Frame 手搭树形，不用 ttk.Treeview：Treeview 的原生 <Button-1> 把整行都当展开/折叠
@@ -499,9 +547,16 @@ class BackupApp:
     # --------------------------------------------------------------- run area
 
     def _panel_style_frame(self, parent: tk.Widget) -> tk.Frame:
-        """页签外包边框：与「邮箱文件夹」面板同款（groove + 面板同值 borderwidth，两处永远一致）。
+        """生成页签的外包边框：与「邮箱文件夹」面板同款。
 
-        面板先于本区构建，这里能安全读到它的值。
+        Args:
+            parent: 边框所属的父容器（页签页）。
+
+        Returns:
+            groove 边框、与面板同值 borderwidth 的 Frame，两处观感永远一致。
+
+        Note:
+            面板先于本区构建，这里能安全读到它的值。
         """
         return tk.Frame(parent, relief="groove",
                         borderwidth=int(self.folder_group.cget("borderwidth")))
@@ -652,8 +707,9 @@ class BackupApp:
     def _attach_button_icons(self) -> None:
         """给两个按钮挂上代码画的彩色图标（开始=绿三角、停止=红方块）。
 
-        位图必须由 Python 侧持引用：Tkinter 不持引用，PhotoImage 一旦被 GC，按钮上的图标
-        会变空白。blank_icon 是加载态的透明占位（见 _blank_icon），同样要持引用。
+        Note:
+            位图必须由 Python 侧持引用：Tkinter 不持引用，PhotoImage 一旦被 GC，按钮上的图标
+            会变空白。blank_icon 是加载态的透明占位（见 _blank_icon），同样要持引用。
         """
         size = _icon_size()
         self.start_icon = _play_icon(PLAY_ICON_COLOR, size)
@@ -708,6 +764,7 @@ class BackupApp:
                            password=v["password"], timeout=60, port=v["port"], eml_dir=eml_dir)
 
     def _connect_worker(self, v: dict) -> None:
+        """连接线程入口：登录并拉取文件夹清单，结果经事件队列回主线程。"""
         log = logging.getLogger("imapbackup")
         cfg = self._core_config(v)
         try:
@@ -715,10 +772,8 @@ class BackupApp:
             try:
                 names = core.get_names(server, False, True, quiet=False, log=log)
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     server.logout()
-                except Exception:
-                    pass
             self.events.put(("folders_loaded", (names, v)))
         except SystemExit as e:
             self.events.put(("connect_failed", str(e)))
@@ -823,7 +878,7 @@ class BackupApp:
         else:
             node["kids"].pack_forget()
 
-    def _empty_hint(self, parent: tk.Frame, text: str, row: int, column: int) -> tk.Label:
+    def _empty_hint(self, parent: tk.Widget, text: str, row: int, column: int) -> tk.Label:
         """空态提示：与内容控件占同一格居中叠放，内容出现后用 _toggle_hint 收掉。"""
         label = tk.Label(parent, text=text, foreground=EMPTY_HINT_FG)
         label.grid(row=row, column=column, padx=8, pady=6)
@@ -895,11 +950,15 @@ class BackupApp:
         self._sync_folder_row_increment()
 
     def _measure_folder_row_pitch(self) -> int:
-        """任取一对相邻的行容器，用它们的真实间距当行距（含 pady、随 DPI 与字体走）。
+        """量文件夹树的行距(px)。
 
-        行容器是 folder_inner 的顶层节点框，也是各节点 kids 框里的子节点框——先看主宿主，
-        只有一个顶层节点时（都挂在那一个父节点下面）退到它的 kids 框里量。量不到返回 0：
-        新建控件的请求尺寸与位置要等布局铺完才可信，重建那一刻量到的是 Tk 的占位值。
+        Returns:
+            任取一对相邻行容器的真实间距（含 pady、随 DPI 与字体走）；量不到时为 0。
+
+        Note:
+            行容器是 folder_inner 的顶层节点框，也是各节点 kids 框里的子节点框——先看主宿主，
+            只有一个顶层节点时（都挂在那一个父节点下面）退到它的 kids 框里量。新建控件的请求
+            尺寸与位置要等布局铺完才可信，重建那一刻量到的是 Tk 的占位值，这时就量不到。
         """
         hosts = [self.folder_inner] + [n["kids"] for n in self._folder_nodes.values()]
         for host in hosts:
@@ -912,11 +971,13 @@ class BackupApp:
         return 0
 
     def _sync_folder_row_increment(self) -> None:
-        """让画布的 1 unit = 1 行：滚轮一格（`FOLDER_WHEEL_ROWS` 行）才落在行边界上，
-        滚条箭头一格也正好一行。
+        """让画布的 1 unit = 1 行。
 
-        量不到行距（还没有行 / 布局没铺完）时归 0，单位回到 Tk 默认的窗口高的 1/10。
-        只在与画布现值不同时才写，免得布局事件里反复做无谓的配置。
+        滚轮一格（`FOLDER_WHEEL_ROWS` 行）才落在行边界上，滚条箭头一格也正好一行。
+
+        Note:
+            量不到行距（还没有行 / 布局没铺完）时归 0，单位回到 Tk 默认的窗口高的 1/10。
+            只在与画布现值不同时才写，免得布局事件里反复做无谓的配置。
         """
         pitch = self._measure_folder_row_pitch()
         if pitch != int(self.folder_canvas.cget("yscrollincrement")):
@@ -933,10 +994,15 @@ class BackupApp:
         self._update_start_state()
 
     def _show_conn_hint(self, text: str, color: str) -> None:
-        """显示提示并上色；空文案时整行让出空间，避免无提示时留一条空带。
+        """显示连接提示并上色；空文案时整行让出空间，避免无提示时留一条空带。
 
-        用 winfo_manager 判断是否已挂出，不用 winfo_ismapped：后者反映显示端映射态，
-        比布局管理器滞后，刚 grid_remove 后仍报 True，会让该显示的提示被跳过。
+        Args:
+            text: 提示文案。
+            color: 提示前景色。
+
+        Note:
+            判断是否已挂出用 winfo_manager 而不用 winfo_ismapped：后者反映显示端映射态，
+            比布局管理器滞后，刚 grid_remove 后仍报 True，会让该显示的提示被跳过。
         """
         if text:
             self.conn_hint.configure(text=text, foreground=color)
@@ -988,7 +1054,7 @@ class BackupApp:
         if not self._port_touched:
             self.port_var.set("993" if self.ssl_var.get() else "143")
 
-    def _on_port_key(self, _event) -> str:
+    def _on_port_key(self, _event) -> str | None:
         self._port_touched = True
         return None  # continue normal binding
 
@@ -1029,9 +1095,16 @@ class BackupApp:
     def _on_wheel(self, event) -> str | None:
         """主窗口唯一的滚轮入口：指针落在「邮箱文件夹」面板内才接管，面板外原样放行。
 
-        返回 "break" 才是真的中断后续 bindtag（Tkinter 拿回调返回值与 "break" 比较）——面板内的
-        滚条正是靠它压掉 TScrollbar 的类绑定；反过来 break 也会挡掉 root 上这条，所以滚条必须
-        绑到这个函数、由它自己完成滚动。
+        Args:
+            event: MouseWheel 事件。
+
+        Returns:
+            面板内返回 "break" 中断后续 bindtag；面板外返回 None 原样放行。
+
+        Note:
+            返回 "break" 才是真的中断（Tkinter 拿回调返回值与 "break" 比较）——面板内的滚条正是
+            靠它压掉 TScrollbar 的类绑定；反过来 break 也会挡掉 root 上这条，所以滚条必须绑到
+            这个函数、由它自己完成滚动。
         """
         if not self._wheel_in_folder_panel(event.widget):
             return None  # 邮件列表 / 运行日志的滚轮节奏一字不动
@@ -1043,11 +1116,19 @@ class BackupApp:
         return "break"  # 不满一格也到此为止，别漏给面板内滚条的原生步长
 
     def _wheel_in_folder_panel(self, widget) -> bool:
-        """事件控件沿 .master 上溯，看它是否属于「邮箱文件夹」面板。
+        """判断事件控件是否属于「邮箱文件夹」面板。
 
-        画布内嵌的行控件父链是：Label → 行容器 → 节点框 → folder_inner → canvas → folder_group。
-        用控件路径比而不是对象同一性：event.widget 与 folder_group 可能是同一条路径的两个 Python
-        对象。也不用 winfo_containing：那取决于窗口位置与层叠顺序，测试里不稳。
+        Args:
+            widget: 事件携带的控件，沿 .master 上溯比对。
+
+        Returns:
+            控件在面板内时为 True。
+
+        Note:
+            画布内嵌的行控件父链是：Label → 行容器 → 节点框 → folder_inner → canvas →
+            folder_group。用控件路径比而不是对象同一性：event.widget 与 folder_group 可能是
+            同一条路径的两个 Python 对象。也不用 winfo_containing：那取决于窗口位置与层叠
+            顺序，测试里不稳。
         """
         panel = str(self.folder_group)
         while widget is not None:
@@ -1065,13 +1146,17 @@ class BackupApp:
     def _on_click_clear_selection_and_focus(self, event) -> None:
         """主窗口唯一的左键入口：清邮件列表选中高亮，并把输入框焦点收归主窗口。
 
-        只清理、不拦截：返回 None 让 bindtag 链照常走完（点行/换选是 Treeview 类绑定的事，
-        本入口在类绑定之后执行，那时选中已就位，识别出「是行」就别动它）。选中与焦点共用两个
-        例外：邮件列表自己的滚条——拖它多半是在查看选中行，不能误伤，焦点也一并保留；Alt-Tab
-        切窗口不产生 Button-1，天然不清，与资源管理器「切走再回来高亮还在」一致。焦点只在
-        「点击后焦点仍在某个输入框、且落点不是这个框」时收归主窗口：Tk 只让输入框、列表、日志
-        文本在点击时接焦（禁用中的输入框不接），其余落点（标签、空白、按钮、勾选框）焦点原地
-        不动，正需要这里收走。
+        Args:
+            event: Button-1 事件。
+
+        Note:
+            只清理、不拦截：返回 None 让 bindtag 链照常走完（点行/换选是 Treeview 类绑定的事，
+            本入口在类绑定之后执行，那时选中已就位，识别出「是行」就别动它）。选中与焦点共用
+            两个例外：邮件列表自己的滚条——拖它多半是在查看选中行，不能误伤，焦点也一并保留；
+            Alt-Tab 切窗口不产生 Button-1，天然不清，与资源管理器「切走再回来高亮还在」一致。
+            焦点只在「点击后焦点仍在某个输入框、且落点不是这个框」时收归主窗口：Tk 只让输入框、
+            列表、日志文本在点击时接焦（禁用中的输入框不接），其余落点（标签、空白、按钮、
+            勾选框）焦点原地不动，正需要这里收走。
         """
         entry_paths = self._entry_widget_paths()
         focused = self.root.focus_get()
@@ -1146,12 +1231,17 @@ class BackupApp:
         if not isinstance(geometry, dict):
             self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
             return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
-        values = tuple(geometry.get(name) for name in ("width", "height", "x", "y"))
-        if (any(isinstance(value, bool) or not isinstance(value, int) for value in values)
-                or values[0] < MIN_WINDOW_WIDTH or values[1] < MIN_WINDOW_HEIGHT):
+        parsed: list[int] = []
+        for name in ("width", "height", "x", "y"):
+            value = geometry.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
+                return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
+            parsed.append(value)
+        width, height, x, y = parsed
+        if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
             self.log.warning("忽略无效的窗口几何配置 %s", COLUMN_CONFIG_PATH)
             return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
-        width, height, x, y = values
         maximized = window.get("maximized", False)
         if not isinstance(maximized, bool):
             self.log.warning("忽略无效的窗口最大化配置 %s", COLUMN_CONFIG_PATH)
@@ -1167,14 +1257,17 @@ class BackupApp:
                 self.root.state("zoomed")
             except tk.TclError:
                 self.log.warning("无法恢复窗口最大化状态")
-        return values
+        return width, height, x, y
 
     def _restore_user_config(self) -> None:
-        """启动时恢复配置区 6 字段；坏节/坏字段逐个跳过，回退默认值。
+        """启动时恢复配置区 6 字段。
 
-        校验风格与窗口节一致：节不是 dict 就整节丢弃；字段逐个看类型（字符串/布尔），
-        坏的只跳过该字段。密码解不出明文视为没存过（换机器/换账户/文件损坏），
-        记一条 warning，不弹窗、不阻断启动。
+        坏节/坏字段逐个跳过，回退默认值。
+
+        Note:
+            校验风格与窗口节一致：节不是 dict 就整节丢弃；字段逐个看类型（字符串/布尔），
+            坏的只跳过该字段。密码解不出明文视为没存过（换机器/换账户/文件损坏），
+            记一条 warning，不弹窗、不阻断启动。
         """
         config = self._ui_settings.get("config")
         if config is None:
@@ -1320,10 +1413,16 @@ class BackupApp:
         return "break"
 
     def _refresh_entry_menu_state(self, entry: tk.Entry) -> None:
-        """弹窗前的灰化：无选中文本时剪切/复制灰；剪贴板没有文本或控件已禁用时粘贴灰。
+        """弹窗前刷新输入框菜单的灰化状态。
 
-        禁用判断读控件自己的 state：备份运行中 _set_config_enabled 把配置区整片关掉，
-        禁用态的输入框做不出选区，三项自然都该灰。
+        无选中文本时剪切/复制灰；剪贴板没有文本或控件已禁用时粘贴灰。
+
+        Args:
+            entry: 右键命中的输入框。
+
+        Note:
+            禁用判断读控件自己的 state：备份运行中 _set_config_enabled 把配置区整片关掉，
+            禁用态的输入框做不出选区，三项自然都该灰。
         """
         editable = str(entry.cget("state")) != "disabled"
         has_sel = editable and entry.selection_present()
@@ -1388,7 +1487,7 @@ class BackupApp:
     def _on_tree_resize_end(self, _event) -> str | None:
         if self._tree_resize is None:
             return None
-        _, left, right, _, _, subject_stretch = self._tree_resize
+        _, _left, _right, _, _, subject_stretch = self._tree_resize
         if subject_stretch:
             self.tree.column("subject", stretch=True)
         self._tree_resize = None
@@ -1396,10 +1495,16 @@ class BackupApp:
         return "break"
 
     def _prepare_tree_popup(self, event) -> bool:
-        """弹窗前的全部判断与副作用：定位单元格、右键先选中该行（Windows 惯例）、记下复制目标。
+        """邮件列表右键弹窗前的全部判断与副作用。
 
-        返回 False 表示这个落点没有可操作的内容（行下方空白、列标题、列号识别不出），
-        不弹菜单也不动选中。
+        定位单元格、右键先选中该行（Windows 惯例）、记下复制目标。
+
+        Args:
+            event: Button-3 事件。
+
+        Returns:
+            落点有可复制的单元格时为 True；行下方空白、列标题、列号识别不出时为 False，
+            此时既不弹菜单也不动选中。
         """
         target = self._tree_context_target(event)
         if target is None:
@@ -1410,9 +1515,16 @@ class BackupApp:
         return True
 
     def _tree_context_target(self, event) -> tuple[str, int] | None:
-        """右键落点 → (行 id, 列号 1 起)；空白与无效列号返回 None。
+        """把右键落点定位成 (行 id, 列号 1 起)。
 
-        identify 只吃控件内坐标（与 x_root/y_root 无关），测试可直接喂伪事件。
+        Args:
+            event: Button-3 事件。
+
+        Returns:
+            (行 id, 列号 1 起)；空白与无效列号返回 None。
+
+        Note:
+            identify 只吃控件内坐标（与 x_root/y_root 无关），测试可直接喂伪事件。
         """
         row = self.tree.identify_row(event.y)
         if not row:
@@ -1483,7 +1595,13 @@ class BackupApp:
     def _set_loading_frame(self, button: tk.Button, label: str, index: int) -> None:
         """把按钮画成加载态的第 index 帧——连接与备份共用这一个入口。
 
-        盲文点阵当前缀，节奏同为 SPINNER_INTERVAL_MS，所以两处的加载图标看起来一模一样。
+        Args:
+            button: 要画帧的按钮。
+            label: 加载态文案，帧字符作前缀。
+            index: 帧序号，按 SPINNER_FRAMES 长度取模循环。
+
+        Note:
+            盲文点阵当前缀，节奏同为 SPINNER_INTERVAL_MS，所以两处的加载图标看起来一模一样。
         """
         button.configure(text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {label}")
 
@@ -1496,11 +1614,15 @@ class BackupApp:
     def _run_spinner_tick(self, index: int) -> None:
         """画第 index 帧，并按状态决定排不排下一帧、以及画在哪颗按钮上。
 
-        帧链只有一条（job 槽 self._run_spinner_job）：运行中画开始按钮，停止中改画停止按钮
-        （开始按钮已在 _on_stop 里退回静止外观），所以「谁在忙」永远只有一颗按钮在转。
-        退出时把整段运行态界面复位（两颗按钮 + 配置区提示）：有的路径会把 running 直接置假
-        而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」、
-        提示会滞留在「备份正在停止…」。帧推进单独成方法，测试可直接驱动。
+        Args:
+            index: 帧序号。
+
+        Note:
+            帧链只有一条（job 槽 self._run_spinner_job）：运行中画开始按钮，停止中改画停止按钮
+            （开始按钮已在 _on_stop 里退回静止外观），所以「谁在忙」永远只有一颗按钮在转。
+            退出时把整段运行态界面复位（两颗按钮 + 配置区提示）：有的路径会把 running 直接置假
+            而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」、
+            提示会滞留在「备份正在停止…」。帧推进单独成方法，测试可直接驱动。
         """
         if not self.running:
             self._run_spinner_job = None
@@ -1529,10 +1651,10 @@ class BackupApp:
 
     def _set_config_enabled(self, enabled: bool) -> None:
         for widget, default_state in self._config_widgets:
-            try:
-                widget.configure(state=default_state if enabled else "disabled")
-            except tk.TclError:
-                pass
+            # Misc.__setitem__ 等价 configure({key: value})：存根把 configure 的 state 形参
+            # 收成 Literal，而这里要存回的默认 state 是运行期 str，走按 Any 校验的下标路径
+            with contextlib.suppress(tk.TclError):
+                widget["state"] = default_state if enabled else "disabled"
         # 树里是 tk.Label：它有 -state 选项，但置灰和阻断绑定都不生效，
         # 所以靠前景色 + 光标提示不可点，真正的拦截在两个 handler 的 running 判定里。
         # 默认前景色是 Tk 的系统色名（如 SystemButtonText），"" 不是合法颜色名，须按控件记录还原。
@@ -1543,8 +1665,9 @@ class BackupApp:
     def _ensure_status_rows(self) -> None:
         """首次开始备份时放出进度条和第二行状态条；放出后不再收回。
 
-        结束/停止后保持两行：完成与停止消息需要第二行显示。before= 保持
-        msg_bar 居最底、进度条排在计数与按钮之间，与初始打包顺序一致。
+        Note:
+            结束/停止后保持两行：完成与停止消息需要第二行显示。before= 保持
+            msg_bar 居最底、进度条排在计数与按钮之间，与初始打包顺序一致。
         """
         if self._msg_bar.winfo_manager():
             return
@@ -1554,10 +1677,13 @@ class BackupApp:
         self._fit_status()
 
     def _begin_run_ui(self) -> None:
-        """开始备份的界面侧（调用前 self.running 已置真）：锁配置区、亮出"先停止才能改"提示、切到列表。
+        """开始备份的界面侧（调用前 self.running 已置真）。
 
-        必须调 _apply_connect_state：运行中那条提示只在连接状态机里输出，
-        只锁控件不刷状态机的话，用户会以为可以照改配置。
+        锁配置区、亮出"先停止才能改"提示、切到列表。
+
+        Note:
+            必须调 _apply_connect_state：运行中那条提示只在连接状态机里输出，
+            只锁控件不刷状态机的话，用户会以为可以照改配置。
         """
         self._ensure_status_rows()
         self._set_config_enabled(False)
@@ -1592,6 +1718,7 @@ class BackupApp:
         threading.Thread(target=self._backup_worker, args=(v, selected), daemon=True).start()
 
     def _backup_worker(self, v: dict, selected: list[tuple]) -> None:
+        """备份线程入口：先统计待备份总量、再逐文件夹下载，进度经事件队列回主线程。"""
         log = logging.getLogger("imapbackup")
         t0 = time.monotonic()
         eq = self.events
@@ -1661,10 +1788,8 @@ class BackupApp:
                                            eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                            foldername=display,
                                            report=report, should_stop=self.stop_flag.is_set)
-            try:
+            with contextlib.suppress(Exception):
                 server.logout()
-            except Exception:
-                pass
             seconds = time.monotonic() - t0
             eq.put(("run_done", backed, server_total - pending_total, seconds,
                     self.stop_flag.is_set(), pending_total))
@@ -1675,11 +1800,15 @@ class BackupApp:
             eq.put(("run_failed", f"{type(e).__name__}: {e}"))
 
     def _on_stop(self) -> None:
-        """停止中：多处同时给反馈——停止按钮接手转圈、开始按钮退回静止外观、状态行清空、配置区提示换口径。
+        """停止中：多处同时给反馈。
 
-        帧链不用重启（工作线程还在收尾、self.running 仍为真），下一帧起 _run_spinner_tick 会按
-        stopping 把帧画到停止按钮上；所以这里翻状态后当帧就把开始按钮复位，点击立刻有反馈。
-        状态行只清文案、不收回整行：版本号与行高都留在原地，结束时已有「已停止：…」回填。
+        停止按钮接手转圈、开始按钮退回静止外观、状态行清空、配置区提示换口径。
+
+        Note:
+            帧链不用重启（工作线程还在收尾、self.running 仍为真），下一帧起 _run_spinner_tick
+            会按 stopping 把帧画到停止按钮上；所以这里翻状态后当帧就把开始按钮复位，点击立刻
+            有反馈。状态行只清文案、不收回整行：版本号与行高都留在原地，结束时已有「已停止：…」
+            回填。
         """
         if not self.running:
             return
@@ -1772,9 +1901,10 @@ class BackupApp:
     def _fit_counts(self) -> None:
         """计数文案与进度条的退让：文字变长先缩进度条，触底 PROGRESS_MIN_WIDTH 后文字才截断。
 
-        不能靠 pack 的亏空裁剪让进度条变小——控件总请求超过行宽时 expand 控件收缩、
-        后打包的按钮会叠进它的残 parcel 里（实测叠影）。所以进度条用 length 主动改请求，
-        保证整行请求宽度始终 ≤ 行宽：pack 无亏空，按钮永不受损。
+        Note:
+            不能靠 pack 的亏空裁剪让进度条变小——控件总请求超过行宽时 expand 控件收缩、
+            后打包的按钮会叠进它的残 parcel 里（实测叠影）。所以进度条用 length 主动改请求，
+            保证整行请求宽度始终 ≤ 行宽：pack 无亏空，按钮永不受损。
         """
         width = self._bar.winfo_width()
         if width < 20:  # 未映射时宽度是 1，等真实 <Configure> 再算
@@ -1807,8 +1937,18 @@ class BackupApp:
         self._hide_tip()
 
     def _shrink_to_fit(self, label: tk.Label, var: tk.StringVar, full: str, budget: int) -> None:
-        """把 full 截到标签请求宽 ≤ budget（像素）。font.measure 与标签请求宽差一个固定
-        边距（本机约 6px），先留 8px 余量砍一刀，再按真实请求宽补一刀收口。"""
+        """把 full 截到标签请求宽 ≤ budget（像素）。
+
+        Args:
+            label: 要截断的标签。
+            var: 承载截断结果的文本变量。
+            full: 全文。
+            budget: 像素预算。
+
+        Note:
+            font.measure 与标签请求宽差一个固定边距（本机约 6px），先留 8px 余量砍一刀，
+            再按真实请求宽补一刀收口。
+        """
         font = self._text_font()
         var.set(_ellipsize(full, budget - 8, font))
         over = label.winfo_reqwidth() - budget
@@ -1860,7 +2000,8 @@ class BackupApp:
             self._tip = None
 
     def _refresh_counts(self) -> None:
-        self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ 已备份 {self.backed_count} / {self.pending_total}")
+        self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ "
+                         f"已备份 {self.backed_count} / {self.pending_total}")
         self.progress.configure(value=self.backed_count)
 
     def _clear_message_rows(self) -> None:
@@ -1907,11 +2048,13 @@ class BackupApp:
         self.root.destroy()
 
     def run(self) -> None:
+        """启动事件泵与 Tk 主循环。"""
         self.root.after(100, self._pump)
         self.root.mainloop()
 
 
 def main() -> int:
+    """程序入口：单实例检测后启动主窗口，返回进程退出码。"""
     if _another_instance_running():
         print("IMAP Backup GUI 已经在运行了。", file=sys.stderr)
         return 1
