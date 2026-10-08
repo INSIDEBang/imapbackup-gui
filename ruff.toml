@@ -16,9 +16,10 @@ ignore = [
 ]
 
 [lint.isort]
-known-first-party = ["imapbackup312", "fakes"]
+known-first-party = ["imapbackup312", "imapbackup_tray", "fakes"]
 
 [lint.per-file-ignores]
 # GUI 冒烟测试在 importorskip("tkinter") 之后才导入 tkinter.font / imapbackup_gui，
 # 无显示环境下整文件跳过 —— E402（模块级导入不在顶部）是这道守卫的必然结果。
 "tests/test_gui_smoke.py" = ["E402"]
+"tests/test_gui_background.py" = ["E402"]

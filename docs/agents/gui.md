@@ -94,9 +94,33 @@
 - `test_tree_context_menu_copies_the_clicked_cell`
 - `test_log_context_menu_copies_all`
 
+## 后台驻留、托盘与页面导航
+
+改关闭按钮行为、托盘、菜单栏或设置页前先读这一节；完整决策见 ADR 0009。
+
+- **关闭三态**：`close_action` = `ask`（默认）/ `tray` / `exit`，读写都在既有设置文件里，**不升 `UI_SETTINGS_VERSION`**（升版本会让老设置整份失效），非法值回退 `ask` + warning。关闭动作由纯函数 `decide_close(preference, hidden=)` 决定（`force_exit` / `hide` / `exit` / `ask`）；备份是否运行中只影响对话框文案与托盘「退出」的确认，不参与判定。
+- **「已隐藏」只认 `root.state() == "withdrawn"`**，不设影子标志；据此定死一条规则：**隐藏状态下收到的关闭请求一律真退出**（那只可能是安装器/卸载器/任务管理器发来的），否则升级安装关不掉旧实例。
+- **托盘线程边界与工作线程同款**：`imapbackup_tray.TrayHost` 的回调只往 `self.events` 投 `tray_show` / `tray_stop` / `tray_quit`，由 `_pump` 在 Tk 线程消费；界面侧所有托盘调用都必须走 `TrayHost` 的公开方法（内部转给托盘线程），绝不在托盘线程里碰 widget。托盘为 `None`（非 Windows / 建不起来 / `show()` 返回 False）时「隐藏到后台」退化为 `iconify()`——出口路径必须先成立。
+- **图标常驻**：`TrayHost.show()` 是幂等的「确保挂出并刷新 tooltip」，启动时调一次（失败只记 warning），隐藏窗口前再调一次并以它的返回值决定是否隐藏；`hide()` 不存在——唯一移除点是真宿主的 `close()`（`_quit()` 调用）。tooltip 与菜单「停止备份」的可用性由 `_sync_tray()` 在启动、开始备份、运行结束、隐藏、恢复、后台通知处追平。
+- **后台结束只发气泡**：`run_done` / `run_failed` 在 `_background_hidden()` 为真时不恢复窗口、不弹错误框，改为 `tray.notify(...)` + `_sync_tray()`；点气泡或左键图标走 `tray_show` 恢复窗口。
+- **设置落盘仍是「一次写」**：设置页单选钮与关闭对话框只改内存 `_ui_settings`，隐藏/退出/外部关闭三条路径各调一次 `_save_column_config()`；隐藏时先落盘再 `withdraw()`（此刻几何还读得对）。
+- **窗口状态记忆**：`_window_maximized` 由 `_restore_window_settings()` 初始化、`<Configure>` 在 state 为 `zoomed`/`normal` 时维护；`_window_settings()` 与 `_show_window()` 都读它，**不现场读 `wm state`**——最小化（iconic）或已隐藏（withdrawn）时现读会把最大化记丢（托盘菜单退出、外部关闭正是后一种）。`withdraw()`→`deiconify()` **不带回最大化**（真机实测：回来是 normal + 最大化前几何），隐藏恢复必须重放 `state("zoomed")`；iconic 分支保持 `state("normal")`——Tk 自己记得最小化前的状态（含最大化）。
+- **页面外壳**：`page_host` 下 `backup_page` / `settings_page` 同格叠放，`_show_page()` 是唯一切页入口（`tkraise` + 菜单栏选中态 + 设置页回填）；菜单栏两项是顶层 radiobutton（不开下拉）。设置页两栏＝左 `Listbox` 分类栏（`SETTINGS_SECTIONS` 表驱动，固定 160px，`pack_propagate(False)`）+ 右详情（`tkraise` 切分类），**四边留白等宽**（`outer` 用 `padx=8, pady=8`：备份页的底边距由运行区自带，设置页下方没有内容，漏掉就会「三边等宽、底边贴边」）；设置页控件**不进 `_register`**。
+- **菜单栏的客户区代价**：Windows 原生菜单栏在窗口落地前会吃掉几何高度（实测 736 → 716），`__init__` 末尾 `update()` 落地后再重设一次 `_target_geometry`（由 `_restore_window_settings()` 记录，含位置）；最大化时不再重设，避免碰坏 ADR 0008 的正常几何。
+
+相关回归：
+
+- `test_close_policy.py`（偏好解析与关闭决策矩阵，非 gui）
+- `test_close_with_tray_preference_hides_and_keeps_saving` / `test_close_with_exit_preference_closes_tray_and_window` / `test_close_while_hidden_always_exits_without_asking` / `test_ask_preference_dialog_result_drives_the_action` / `test_cancelled_dialog_changes_nothing`
+- `test_hide_degrades_to_iconify_without_a_tray` / `test_hide_degrades_when_the_icon_cannot_be_added`
+- `test_hide_and_show_keeps_the_maximized_window` / `test_maximized_is_recorded_when_iconic_at_save` / `test_tray_quit_while_hidden_keeps_the_maximized_choice`（窗口状态记忆与三种落盘时刻）
+- `test_run_finished_in_background_only_sends_a_balloon` / `test_stopped_run_in_background_sends_the_stopped_balloon` / `test_failed_run_in_background_does_not_pop_a_dialog`
+- `test_tray_icon_is_up_from_startup` / `test_tray_state_follows_the_run` / `test_tray_show_event_restores_the_window` / `test_tray_stop_event_only_stops_a_running_backup` / `test_tray_quit_confirms_only_while_running` / `test_tray_host_wiring_is_available_on_windows`
+- `test_menubar_navigation_switches_pages` / `test_settings_page_lists_the_sections_and_selects_the_first` / `test_settings_page_offers_the_three_close_options` / `test_changing_the_option_lands_in_memory_then_on_disk_with_the_close`
+
 ## 单实例与验证
 
-`APP_MUTEX_NAME` 必须与 `packaging/imapbackup-gui.iss` 的 `AppMutex` 完全一致。修改 GUI 后至少运行：
+`APP_MUTEX_NAME` 必须与 `packaging/imapbackup-gui.iss` 的 `AppMutex` 完全一致。二次启动不再只是「打印一行再退出」，而是经 `imapbackup_tray.request_restore()`（`FindWindowW(WINDOW_CLASS_NAME)` + `PostMessageW`）唤起已有实例的窗口；改互斥量名或托盘窗口类名会同时影响安装器的运行实例探测与这条唤起通道。修改 GUI 后至少运行：
 
 ```bash
 .venv/Scripts/python.exe -m py_compile imapbackup_gui.py

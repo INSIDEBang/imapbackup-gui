@@ -117,13 +117,22 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 **GUI settings and recovery contract**
 
-* UI settings are global to the Windows user, not keyed by account, folder or backup root. The versioned settings file stores normal window geometry, maximized state, and mail-list column widths; it restores normal geometry before maximization, keeps the last normal geometry while maximized, and falls back to the default position if a saved position is entirely off the current displays.
+* UI settings are global to the Windows user, not keyed by account, folder or backup root. The versioned settings file stores normal window geometry, maximized state, mail-list column widths and the close-button preference; it restores normal geometry before maximization, keeps the last normal geometry while maximized, and falls back to the default position if a saved position is entirely off the current displays.
 * The settings file never contains passwords, server credentials, session tokens or message content. A missing, corrupt, incompatible or unwritable settings file must not block the GUI, connection or backup: recover with defaults or the last successfully saved values, keep the current process state, and report a diagnostic warning through the run log (or the existing console/status fallback when logging is unavailable).
+
+**Background backup and the tray**
+
+* Closing the window no longer kills a running backup. The close button follows a three-way preference — ask me every time (default), hide to the tray and keep running, or quit the program — stored next to the other UI settings. The dialog has "hide to background" / "quit" plus a "remember my choice" checkbox; the Settings page can switch back to asking at any time, and it is the same stored option either way.
+* The tray icon lives in the notification area for the whole session (starting with the program, removed only when it exits), so the app's presence and its right-click menu — show / stop backup / quit — are always reachable; it is also the way back in while the window is hidden. A tooltip and the greying of "stop backup" follow whether a run is in progress.
+* When a run finishes, stops or fails while the window is hidden, the window stays hidden and only a tray balloon reports the result; clicking the balloon or the icon brings the results back. Quitting from the tray while a run is in progress asks for confirmation first.
+* If the tray is unavailable (or the icon cannot be created), "hide to background" degrades to minimising to the taskbar so there is always a way back to the window.
+* A second launch of an already-running (possibly hidden) instance now brings that instance's window to the front instead of silently exiting.
+* The window has a native menu bar with "备份" (backup) and "设置" (settings) entries that switch pages in place; the Settings page uses the usual two-pane layout — a category list on the left, the settings of the selected category on the right.
 
 **Windows installer**
 
 * `packaging\build.bat` runs PyInstaller (GUI and CLI executables sharing one runtime directory) and then Inno Setup, producing `dist\installer\imapbackup-gui-setup-<version>.exe`. The wizard is in Chinese, installs per-user (no administrator), and creates Start-menu entries for both executables; the desktop icon is an optional task.
-* The GUI is single-instance — a second launch exits with a message instead of opening a second window; the installer and uninstaller detect a running instance through the same mutex.
+* The GUI is single-instance — a second launch brings the existing instance's window to the front instead of opening a second window; the installer and uninstaller detect a running instance through the same mutex.
 * The uninstaller removes program files, shortcuts and registry entries by itself. When launched from Control Panel or Windows "Settings → Apps", it runs as a small wizard: the first page carries separate, pre-checked checkboxes for deleting run logs and UI settings under `%LOCALAPPDATA%\imapbackup-gui\` (the logs hold server addresses and account names, never passwords) — uncheck either one to keep it, or cancel the wizard to abort the uninstall entirely; a final dialog confirms completion. (The stock confirmation and completion message boxes are suppressed by launching the uninstaller silently through a rewritten `UninstallString`; running `unins000.exe` directly keeps them.) Silent uninstalls with plain `/SILENT` (automation) stay fully unattended and delete both by default. Backups are never touched. The CLI executable is `imapbackup-gui-cli.exe`; adding it to `PATH` is deliberately not done — it is reachable from the Start menu.
 
 ### One-time migration for backups made before the account layer

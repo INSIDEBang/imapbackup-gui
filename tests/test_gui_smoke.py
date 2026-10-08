@@ -88,6 +88,9 @@ def app():
         yield instance
     finally:
         instance.root.geometry("960x736")
+        # 真实例带的是真托盘（Windows 上）：拆窗口前先收掉图标与消息窗口，别留孤儿
+        if instance._tray is not None:
+            instance._tray.close()
         instance.root.destroy()
         # _setup_logging 会把 root.handlers 换成 QueueLogHandler + 文件 handler；
         # 文件 handler 指向已销毁的临时目录，清掉免得留着
@@ -843,6 +846,24 @@ def test_right_edges_share_one_baseline(app):
     assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width(),
             app.tab_edge_bottom.winfo_height()) == insets, insets
 
+    # 设置页：两栏与备份页共用同一条 8px 左右基线（左栏贴左边线、右栏贴右边线，栏间 8px），
+    # 左分类栏固定宽，四边留白等宽（底边与上/左/右同为 8px）。量完切回备份页，
+    # 后面的用例继续在备份页上跑。
+    app._show_page(g.PAGE_SETTINGS)
+    app.root.update()
+    nav_frame = app.settings_nav.master
+    detail_frame = app._settings_sections[g.SETTINGS_WINDOW_SECTION]
+    assert left(nav_frame) == left(app.folder_group.master), (left(nav_frame), left(app.folder_group.master))
+    assert right(detail_frame) == right(app.folder_group), (right(detail_frame), right(app.folder_group))
+    assert nav_frame.winfo_width() == g.SETTINGS_SECTION_LIST_WIDTH, nav_frame.winfo_width()
+    assert left(detail_frame) - right(nav_frame) == 8, (left(detail_frame), right(nav_frame))
+    client_bottom = app.root.winfo_rooty() + app.root.winfo_height()
+    panel_bottom = detail_frame.winfo_rooty() + detail_frame.winfo_height()
+    assert client_bottom - panel_bottom == 8, (client_bottom, panel_bottom)
+    assert detail_frame.winfo_rooty() - app.root.winfo_rooty() == 8, detail_frame.winfo_rooty()
+    app._show_page(g.PAGE_BACKUP)
+    app.root.update()
+
 
 def test_folder_panel_wheel_covers_the_whole_panel(app):
     """「邮箱文件夹」面板整块都能用滚轮滚：一格 1 行（与下方邮件列表同节奏）、停在行边界。
@@ -1288,9 +1309,15 @@ def test_invalid_window_settings_do_not_discard_columns(app, monkeypatch, tmp_pa
 
 
 def test_close_saves_window_settings_before_destroy(app, monkeypatch):
+    """偏好=退出程序：关闭按钮仍然「先存界面设置、再销毁窗口」。
+
+    默认偏好是「每次询问」，这里注入退出偏好绕过询问对话框；_quit 也换替身，
+    免得把模块级共享实例的真托盘一起拆掉。
+    """
     calls = []
     monkeypatch.setattr(app, "_save_column_config", lambda: calls.append("save"))
-    monkeypatch.setattr(app.root, "destroy", lambda: calls.append("destroy"))
+    monkeypatch.setattr(app, "_quit", lambda: calls.append("destroy"))
+    monkeypatch.setattr(app, "_close_action", lambda: g.CLOSE_ACTION_EXIT)
     app.running = False
     app._on_close()
     assert calls == ["save", "destroy"]

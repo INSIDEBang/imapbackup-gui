@@ -44,6 +44,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import imapbackup312 as core
+import imapbackup_tray
 
 # 日志目录、文件名与格式由 core 模块统一定义：命令行与 GUI 写入同一日文件（见 ADR 0005）
 LOG_FORMAT = core.LOG_FORMAT
@@ -122,6 +123,49 @@ MENU_COPY_LABEL = "复制"
 MENU_PASTE_LABEL = "粘贴"
 MENU_COPY_ALL_LABEL = "复制全部"
 
+# 关闭行为偏好：点窗口关闭按钮时的处理方式，与其它界面设置同存一份 JSON（键 close_action）。
+# 不加版本号（bump 会让老设置整份被判不兼容而丢弃），新键按字段独立校验、非法即回退默认值。
+CLOSE_ACTION_KEY = "close_action"
+CLOSE_ACTION_ASK = "ask"
+CLOSE_ACTION_TRAY = "tray"
+CLOSE_ACTION_EXIT = "exit"
+DEFAULT_CLOSE_ACTION = CLOSE_ACTION_ASK
+CLOSE_ACTION_LABELS = ((CLOSE_ACTION_ASK, "关闭窗口时询问我"),
+                       (CLOSE_ACTION_TRAY, "关闭窗口时隐藏到托盘，继续在后台运行"),
+                       (CLOSE_ACTION_EXIT, "关闭窗口时退出程序"))
+SETTINGS_WINDOW_SECTION = "window"
+# 设置页左栏分类表：(表键, 分类名)。加分类＝加一行 + 建一个详情 Frame（见 _build_settings_page）。
+SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = ((SETTINGS_WINDOW_SECTION, "窗口与后台"),)
+SETTINGS_SECTION_LIST_WIDTH = 160   # 左分类栏固定宽度(px)：右栏吃掉剩余宽度
+PAGE_BACKUP = "backup"
+PAGE_SETTINGS = "settings"
+PAGE_LABELS = ((PAGE_BACKUP, "备份"), (PAGE_SETTINGS, "设置"))
+
+# 托盘：图标只在窗口隐藏期间存在；tooltip 随备份是否运行切换
+TRAY_TOOLTIP_IDLE = "IMAP Backup GUI"
+TRAY_TOOLTIP_RUNNING = "IMAP Backup GUI — 备份运行中"
+TRAY_TITLE_DONE = "备份完成"
+TRAY_TITLE_STOPPED = "备份已停止"
+TRAY_TITLE_FAILED = "备份失败"
+TRAY_BODY_STOPPED = "备份已停止，可随时重新开始"
+TRAY_BODY_FAILED = "备份失败，详见运行日志"
+
+# 关闭询问对话框
+CLOSE_DLG_TITLE = "关闭窗口"
+CLOSE_DLG_TEXT_RUNNING = ("备份正在进行中。\n\n"
+                          "隐藏到后台：窗口收进托盘，备份继续运行，图标在任务栏右下角通知区域。\n"
+                          "退出程序：中断本次备份并结束程序。")
+CLOSE_DLG_TEXT_IDLE = ("隐藏到后台：窗口收进托盘，程序继续运行，图标在任务栏右下角通知区域。\n"
+                       "退出程序：结束程序。")
+CLOSE_DLG_REMEMBER = "记住我的选择，以后不再询问"
+CLOSE_DLG_HIDE = "隐藏到后台"
+CLOSE_DLG_EXIT = "退出程序"
+QUIT_CONFIRM_TITLE = "退出"
+QUIT_CONFIRM_TEXT = "备份正在进行中，退出会中断本次备份。确定要退出吗？"
+SETTINGS_HINT_TEXT = ("托盘图标（任务栏右下角通知区域）从程序启动起常驻，直到退出：左键单击它恢复窗口，右键菜单可停止备份或退出。\n"
+                      "Windows 11 默认把新托盘图标收进溢出区（任务栏的 ^ 小箭头里），找不到时点开那里看看。\n"
+                      "在关闭对话框里勾选「记住我的选择」与在这里选定等价。")
+
 
 class QueueLogHandler(logging.Handler):
     """Mirror INFO+ records onto the event queue for the 运行日志 tab (current session only)."""
@@ -183,6 +227,11 @@ def _italic_font(base: tkfont.Font) -> tkfont.Font:
     return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), slant="italic")
 
 
+def _bold_font(base: tkfont.Font) -> tkfont.Font:
+    """返回同一字体的加粗版（设置页分组标题用，口径与 _italic_font 一致）。"""
+    return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), weight="bold")
+
+
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
     """返回显示名的最后一段。
 
@@ -200,6 +249,59 @@ def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
         if display.count(delim) == len(path) - 1:
             return display.rsplit(delim, 1)[-1]
     return display
+
+
+def parse_close_action(raw: object) -> str:
+    """校验关闭行为偏好：只认三个已知值，其余（含缺失、类型不对）一律回退默认值。"""
+    if raw in (CLOSE_ACTION_ASK, CLOSE_ACTION_TRAY, CLOSE_ACTION_EXIT):
+        return str(raw)
+    return DEFAULT_CLOSE_ACTION
+
+
+def decide_close(preference: str, *, hidden: bool) -> str:
+    """关闭窗口的决策点：偏好 × 当前窗口状态 → 动作。
+
+    Args:
+        preference: 关闭行为偏好（`parse_close_action` 的产物）。
+        hidden: 窗口当前是否已隐藏（`root.state() == "withdrawn"`）。
+
+    Returns:
+        `"force_exit"`（窗口已隐藏时收到的关闭请求来自外部程序，一律真退出，不能把程序卡在
+        后台让安装器/卸载器关不掉它）、`"hide"`、`"exit"` 或 `"ask"`。
+
+    Note:
+        备份是否运行不影响这里的判定：它只改变询问对话框的文案与托盘「退出」的确认，
+        隐藏与退出两条路径本身与运行状态无关。
+    """
+    if hidden:
+        return "force_exit"
+    if preference == CLOSE_ACTION_TRAY:
+        return "hide"
+    if preference == CLOSE_ACTION_EXIT:
+        return "exit"
+    return "ask"
+
+
+def _make_tray(events: queue.Queue[tuple], log: logging.Logger) -> imapbackup_tray.TrayHost | None:
+    """托盘宿主的唯一构造点：测试替换这里即可注入假托盘。
+
+    Args:
+        events: GUI 事件队列（托盘线程只往里投元组，不碰 widget）。
+        log: 诊断日志。
+
+    Returns:
+        可用的托盘宿主；非 Windows 或创建失败时 None（调用方退化为最小化到任务栏）。
+    """
+    tray = imapbackup_tray.create_tray(
+        icon_path=_window_icon_path(),
+        tooltip=TRAY_TOOLTIP_IDLE,
+        on_show=lambda: events.put(("tray_show",)),
+        on_stop=lambda: events.put(("tray_stop",)),
+        on_quit=lambda: events.put(("tray_quit",)),
+        log=log)
+    if tray is None:
+        log.info("托盘不可用：关闭窗口选「隐藏到后台」时将退化为最小化到任务栏")
+    return tray
 
 
 def _window_icon_path() -> str | None:
@@ -386,14 +488,40 @@ class BackupApp:
         self._column_config_fitted = False
         self._column_reflowing = False
 
+        # 页面外壳：备份页与设置页同格叠放，tkraise 切页；菜单栏两项直接切页（不开下拉）
+        self.page_host = tk.Frame(self.root)
+        self.page_host.pack(fill="both", expand=True)
+        self.page_host.columnconfigure(0, weight=1)
+        self.page_host.rowconfigure(0, weight=1)
+        self.backup_page = tk.Frame(self.page_host)
+        self.backup_page.grid(row=0, column=0, sticky="nsew")
+        self.settings_page = tk.Frame(self.page_host)
+        self.settings_page.grid(row=0, column=0, sticky="nsew")
+        self._build_menubar()
+        # 托盘宿主：非 Windows 或创建失败时为 None，关闭窗口选「隐藏到后台」会退化为最小化
+        self._tray = _make_tray(self.events, self.log)
+
         self._build_config_area()
         self._restore_user_config()
         self._build_run_area()
+        self._build_settings_page()
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._apply_connect_state()
         self._update_start_state()
+        self._show_page(PAGE_BACKUP)
+        # 窗口真正落地后再摆一次几何：菜单栏在落地前会把客户区高度吃掉一截（真机实测默认 736
+        # 变成 716），落地后设置才生效、所见即所得。最大化时不许再动——ADR 0008 要求先恢复
+        # 正常几何再最大化，zoomed 状态下再设几何会碰正常几何。
+        self.root.update()
+        if self.root.state() != "zoomed":
+            self.root.geometry(self._target_geometry)
+        # 托盘图标随程序启动常驻（窗口可见时也在），直到 _quit() 才收掉；挂不出来不致命，
+        # 记一条 warning，隐藏窗口前还会重试一次——那次失败才退化为最小化
+        if self._tray is not None and not self._tray.show(self._tray_tooltip()):
+            self.log.warning("托盘图标挂出失败：关闭窗口选「隐藏到后台」将退化为最小化到任务栏")
+        self._sync_tray()
 
     # ------------------------------------------------------------------ logging
 
@@ -422,7 +550,7 @@ class BackupApp:
         return widget
 
     def _build_config_area(self) -> None:
-        outer = tk.Frame(self.root)
+        outer = tk.Frame(self.backup_page)
         outer.pack(fill="x", padx=8, pady=(8, 2))
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
@@ -544,6 +672,129 @@ class BackupApp:
         # 控件级绑定先于类绑定执行，靠返回 "break" 把它压掉，全场节奏才一致。
         folder_scroll.bind("<MouseWheel>", self._on_wheel)
 
+    # ------------------------------------------------------- 页面外壳与设置页
+
+    def _build_menubar(self) -> None:
+        """顶部菜单栏：备份 / 设置两项直接切页（tk 原生菜单栏，不做下拉、不弹新窗口）。
+
+        Note:
+            顶层可点项（radiobutton）在 Windows 上的呈现按「当前页带选中点」读，与主流应用的
+            导航栏同义；以后加页面只需往 PAGE_LABELS 里加一行。
+        """
+        self._page_var = tk.StringVar(value=PAGE_BACKUP)
+        self.menubar = tk.Menu(self.root, tearoff=False)
+        for name, label in PAGE_LABELS:
+            self.menubar.add_radiobutton(label=label, variable=self._page_var, value=name,
+                                         command=lambda page=name: self._show_page(page))
+        self.root.configure(menu=self.menubar)
+
+    def _show_page(self, name: str) -> None:
+        """切页唯一入口：抬升目标页并同步菜单栏选中态；进设置页时按内存偏好回填控件。"""
+        if name == PAGE_SETTINGS:
+            self._settings_action_var.set(self._close_action())
+            self._show_settings_section(self._settings_section)
+            self.settings_page.tkraise()
+        else:
+            name = PAGE_BACKUP
+            self.backup_page.tkraise()
+        if self._page_var.get() != name:
+            self._page_var.set(name)
+
+    def _build_settings_page(self) -> None:
+        """设置页：左分类栏（表驱动 Listbox）+ 右详情区，四边与备份页共用同一条 8px 基线。"""
+        outer = tk.Frame(self.settings_page)
+        # 上/下都留 8：备份页的下边距由运行区自己带（pady=(2, 8)），设置页没有下方内容，
+        # 少了这 8px 就会变成「三边等宽、底边贴边」
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        nav = self._panel_style_frame(outer)
+        nav.configure(width=SETTINGS_SECTION_LIST_WIDTH)
+        nav.pack_propagate(False)  # 固定宽：分类名/条目再长也不挤动右栏（右栏吃剩余宽度）
+        nav.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.settings_nav = tk.Listbox(nav, exportselection=False, activestyle="none",
+                                       background="#ffffff", highlightthickness=0, borderwidth=0)
+        self.settings_nav.pack(fill="both", expand=True)
+        for _key, title in SETTINGS_SECTIONS:
+            self.settings_nav.insert("end", title)
+        self.settings_nav.bind("<<ListboxSelect>>", self._on_settings_section_select)
+
+        detail = tk.Frame(outer)
+        detail.grid(row=0, column=1, sticky="nsew")
+        detail.columnconfigure(0, weight=1)
+        detail.rowconfigure(0, weight=1)
+        self._settings_sections: dict[str, tk.Frame] = {}
+        for key, title in SETTINGS_SECTIONS:
+            page = self._panel_style_frame(detail)
+            page.grid(row=0, column=0, sticky="nsew")
+            self._settings_sections[key] = page
+            if key == SETTINGS_WINDOW_SECTION:
+                self._build_window_settings(page, title)
+        self._settings_section = SETTINGS_SECTIONS[0][0]
+
+    def _build_window_settings(self, parent: tk.Frame, title: str) -> None:
+        """「窗口与后台」分类的详情：关闭行为三态 + 说明文字。
+
+        Note:
+            控件不进 _register 名单：关闭行为不影响正在跑的备份，运行中也不必跟着禁用。
+        """
+        body = tk.Frame(parent)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(body, text=title, anchor="w",
+                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+        self._settings_action_var = tk.StringVar(value=DEFAULT_CLOSE_ACTION)
+        for value, label in CLOSE_ACTION_LABELS:
+            tk.Radiobutton(body, text=label, value=value, variable=self._settings_action_var,
+                           anchor="w", command=self._on_close_action_change).pack(fill="x", pady=(6, 0))
+        tk.Label(body, text=SETTINGS_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
+                 wraplength=TIP_WRAP).pack(fill="x", pady=(14, 0))
+
+    def _on_settings_section_select(self, _event=None) -> None:
+        selection = self.settings_nav.curselection()
+        if selection:
+            self._show_settings_section(SETTINGS_SECTIONS[selection[0]][0])
+
+    def _show_settings_section(self, key: str) -> None:
+        """切设置分类的唯一入口：同步左栏选中态与右栏详情（表驱动，加分类只加一行）。"""
+        keys = [section_key for section_key, _title in SETTINGS_SECTIONS]
+        if key not in keys:
+            key = keys[0]
+        index = keys.index(key)
+        self._settings_sections[key].tkraise()
+        if self.settings_nav.curselection() != (index,):
+            self.settings_nav.selection_clear(0, "end")
+            self.settings_nav.selection_set(index)
+        self.settings_nav.activate(index)
+        self._settings_section = key
+
+    def _on_close_action_change(self) -> None:
+        """设置页单选钮变更：只更新内存，落盘沿用「关闭/隐藏/退出时统一保存一次」（ADR 0008）。"""
+        action = parse_close_action(self._settings_action_var.get())
+        self._settings_action_var.set(action)
+        if action != self._close_action():
+            self._ui_settings[CLOSE_ACTION_KEY] = action
+            self.log.info("关闭行为偏好改为：%s", action)
+
+    def _close_action(self) -> str:
+        """当前关闭行为偏好：非法或缺失回退默认值（每次询问）。"""
+        return parse_close_action(self._ui_settings.get(CLOSE_ACTION_KEY))
+
+    def _tray_tooltip(self) -> str:
+        return TRAY_TOOLTIP_RUNNING if self.running else TRAY_TOOLTIP_IDLE
+
+    def _sync_tray(self) -> None:
+        """把常驻托盘图标的状态追平界面状态：tooltip 与菜单「停止备份」的可用性。
+
+        Note:
+            图标本身不在这里挂出/收掉——它随程序启动常驻、只在 `_quit()` 里移除；这里只同步
+            随运行状态变化的那两项。托盘缺席时静默跳过。
+        """
+        if self._tray is None:
+            return
+        self._tray.set_tooltip(self._tray_tooltip())
+        self._tray.set_running(self.running)
+
     # --------------------------------------------------------------- run area
 
     def _panel_style_frame(self, parent: tk.Widget) -> tk.Frame:
@@ -562,7 +813,7 @@ class BackupApp:
                         borderwidth=int(self.folder_group.cget("borderwidth")))
 
     def _build_run_area(self) -> None:
-        run = tk.Frame(self.root)
+        run = tk.Frame(self.backup_page)
         # 左右内边距是 7/5 而不是 8：notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，
         # 先把它补掉，页签包裹边框的左右线才能与上方面板线、下方按钮行落在同一条 8px 基线上
         # （探针实测，issues/15）；按钮行与状态行再用 padx=(1, 3) 把自己的 8px 边距补回去。
@@ -1212,8 +1463,11 @@ class BackupApp:
             columns = raw.get("columns")
             if columns is not None and not isinstance(columns, dict):
                 raise ValueError("invalid columns section")
+            action = raw.get(CLOSE_ACTION_KEY)
+            if action is not None and parse_close_action(action) != action:
+                self.log.warning("忽略无效的关闭行为偏好 %s: %r", COLUMN_CONFIG_PATH, action)
             return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
-                    "config": raw.get("config")}
+                    "config": raw.get("config"), CLOSE_ACTION_KEY: parse_close_action(action)}
         except FileNotFoundError:
             return {"version": UI_SETTINGS_VERSION}
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1221,6 +1475,10 @@ class BackupApp:
             return {"version": UI_SETTINGS_VERSION}
 
     def _restore_window_settings(self) -> tuple[int, int, int, int]:
+        # 落地后要重设的那份几何（见 __init__ 末尾）：默认就是默认尺寸，恢复到保存值时在下面替换
+        self._target_geometry = f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}"
+        # 记忆口径的最大化状态（见 _on_root_configure）：坏配置与 TclError 都落到 False
+        self._window_maximized = False
         window = self._ui_settings.get("window")
         if window is None:
             return DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, 0, 0
@@ -1247,8 +1505,10 @@ class BackupApp:
             self.log.warning("忽略无效的窗口最大化配置 %s", COLUMN_CONFIG_PATH)
             maximized = False
         self.root.geometry(f"{width}x{height}")
+        self._target_geometry = f"{width}x{height}"
         if self._window_position_visible(width, height, x, y):
             self.root.geometry(f"{width}x{height}+{x}+{y}")
+            self._target_geometry = f"{width}x{height}+{x}+{y}"
         else:
             self.log.warning("窗口位置不在当前显示器范围内，使用默认位置")
         self.root.update_idletasks()
@@ -1257,6 +1517,8 @@ class BackupApp:
                 self.root.state("zoomed")
             except tk.TclError:
                 self.log.warning("无法恢复窗口最大化状态")
+            else:
+                self._window_maximized = True
         return width, height, x, y
 
     def _restore_user_config(self) -> None:
@@ -1323,6 +1585,8 @@ class BackupApp:
         self._ui_settings["version"] = UI_SETTINGS_VERSION
         self._ui_settings["columns"] = widths
         self._ui_settings["window"] = self._window_settings()
+        # 关闭行为偏好只由设置页/关闭对话框改内存，落盘统一走这里（ADR 0008 的单一写入路径）
+        self._ui_settings[CLOSE_ACTION_KEY] = self._close_action()
         config = {"user": self.user_var.get(), "server": self.server_var.get(),
                   "ssl": bool(self.ssl_var.get()), "port": self.port_var.get(),
                   "outdir": self.outdir_var.get()}
@@ -1358,11 +1622,16 @@ class BackupApp:
         width, height, x, y = self._normal_geometry
         return {
             "normal_geometry": {"width": width, "height": height, "x": x, "y": y},
-            "maximized": self.root.state() == "zoomed",
+            # 记忆口径：窗口最小化（iconic）或已隐藏（withdrawn）时现场读 wm state 会把最大化记丢
+            "maximized": self._window_maximized,
         }
 
     def _on_root_configure(self, _event) -> None:
-        if self.root.state() == "zoomed":
+        state = self.root.state()
+        # 只有可见且未最小化时才算「窗口状态」的真值；派发时刻读的是当下状态，排队事件也安全
+        if state in ("zoomed", "normal"):
+            self._window_maximized = state == "zoomed"
+        if state == "zoomed":
             return
         width, height = self.root.winfo_width(), self.root.winfo_height()
         if width >= MIN_WINDOW_WIDTH and height >= MIN_WINDOW_HEIGHT:
@@ -1715,6 +1984,7 @@ class BackupApp:
         self._begin_run_ui()
         self.log.info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
                       len(selected), v["outdir"], v["mbox"], v["eml"])
+        self._sync_tray()  # 图标常驻时窗口可见也挂着：菜单「停止备份」此刻就该可点
         threading.Thread(target=self._backup_worker, args=(v, selected), daemon=True).start()
 
     def _backup_worker(self, v: dict, selected: list[tuple]) -> None:
@@ -1854,11 +2124,35 @@ class BackupApp:
         elif kind == "message":
             self._add_message_row(ev[1])
         elif kind == "run_done":
+            hidden = self._background_hidden()
             self._finish_run(*ev[1:])
+            if hidden:
+                self._notify_run_done_background(*ev[1:])
         elif kind == "run_failed":
+            hidden = self._background_hidden()
             self._end_run_controls()
             self._set_status("备份失败，详见运行日志", error=True)
-            messagebox.showerror("备份失败", ev[1], parent=self.root)
+            if hidden:
+                self._notify_background(TRAY_TITLE_FAILED, TRAY_BODY_FAILED)
+            else:
+                messagebox.showerror("备份失败", ev[1], parent=self.root)
+        elif kind == "tray_show":
+            self._show_window()
+        elif kind == "tray_stop":
+            if self.running:
+                self._on_stop()
+        elif kind == "tray_quit":
+            self._on_tray_quit()
+
+    def _notify_run_done_background(self, backed: int, skipped: int, seconds: float,
+                                    stopped: bool, pending: int) -> None:
+        """后台驻留期间的运行结束：完成/停止分别给气泡文案（窗口保持隐藏）。"""
+        if stopped:
+            self._notify_background(TRAY_TITLE_STOPPED, TRAY_BODY_STOPPED)
+            return
+        seconds_text = _fmt_duration(seconds)
+        self._notify_background(TRAY_TITLE_DONE, f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {seconds_text}")
+        self.log.info("后台驻留期间备份结束：%d 封（待备份 %d）", backed, pending)
 
     def _end_run_controls(self) -> None:
         self.running = False
@@ -1875,6 +2169,8 @@ class BackupApp:
         # 开始按钮按当前连接与勾选情况重新判定（不是一律 disabled）：失败路径原先停在禁用态，
         # 用户想重跑还得先去动一下复选框才解禁
         self._update_start_state()
+        # 运行结束：常驻托盘图标的 tooltip 与菜单「停止备份」跟着复位（窗口可见时也挂着）
+        self._sync_tray()
 
     def _finish_run(self, backed: int, skipped: int, seconds: float, stopped: bool, pending: int) -> None:
         self._end_run_controls()
@@ -2042,10 +2338,125 @@ class BackupApp:
     # ------------------------------------------------------------------ close
 
     def _on_close(self) -> None:
-        if self.running and not messagebox.askokcancel("退出", "备份正在进行中，确定要退出吗？", parent=self.root):
+        """窗口关闭按钮：按关闭行为偏好（隐藏到后台 / 退出 / 每次询问）分派。
+
+        Note:
+            窗口已隐藏时收到的关闭请求来自外部程序（安装器、卸载器、任务管理器），一律真退出——
+            把程序卡在后台会让升级/卸载关不掉旧实例。
+        """
+        action = decide_close(self._close_action(), hidden=self.root.state() == "withdrawn")
+        if action == "ask":
+            answer = self._ask_close_action()
+            if answer is None:
+                return
+            preference, remember = answer
+            if remember:
+                self._ui_settings[CLOSE_ACTION_KEY] = preference
+                self.log.info("关闭行为偏好已记住：%s", preference)
+            # 对话框说的是偏好口径（tray/exit，勾了记住就直接存），这里换成动作口径
+            action = "hide" if preference == CLOSE_ACTION_TRAY else "exit"
+        if action == "hide":
+            self._hide_to_background()
+        else:
+            self._save_column_config()
+            self._quit()
+
+    def _ask_close_action(self) -> tuple[str, bool] | None:
+        """关闭询问对话框：返回 (动作, 是否记住)，取消（X / Esc）返回 None。
+
+        Note:
+            展示与决策分离：测试替换本方法即可绕开真实 Toplevel（与 tk_popup 的替换口径一致）。
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(CLOSE_DLG_TITLE)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        answer: list[tuple[str, bool]] = []
+        remember_var = tk.BooleanVar(value=False)
+        body = tk.Frame(dialog)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        tk.Label(body, text=CLOSE_DLG_TEXT_RUNNING if self.running else CLOSE_DLG_TEXT_IDLE,
+                 justify="left", anchor="w").pack(fill="x")
+        tk.Checkbutton(body, text=CLOSE_DLG_REMEMBER, variable=remember_var).pack(anchor="w", pady=(10, 0))
+        buttons = tk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+
+        def choose(action: str) -> None:
+            answer.append((action, bool(remember_var.get())))
+            dialog.destroy()
+
+        tk.Button(buttons, text=CLOSE_DLG_EXIT, command=lambda: choose(CLOSE_ACTION_EXIT)).pack(side="right")
+        tk.Button(buttons, text=CLOSE_DLG_HIDE,
+                  command=lambda: choose(CLOSE_ACTION_TRAY)).pack(side="right", padx=(0, 6))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_reqheight()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return answer[0] if answer else None
+
+    def _hide_to_background(self) -> None:
+        """隐藏到后台：先存界面设置（此刻窗口还可见，几何与最大化状态读得对），再收进托盘。
+
+        Note:
+            托盘图标此时通常已经挂着（启动时就挂了），这里再 `show()` 一次是为了拿「图标确实
+            可用」的结果：拿不到就退化为最小化到任务栏，窗口必须留一条回到用户眼前的路径。
+        """
+        self._save_column_config()
+        if self._tray is not None and self._tray.show(self._tray_tooltip()):
+            self.root.withdraw()
+            self._sync_tray()
+            self.log.info("窗口已隐藏到托盘（%s）", "备份运行中" if self.running else "空闲")
+            return
+        self.log.warning("托盘不可用，改为最小化到任务栏")
+        self.root.iconify()
+
+    def _show_window(self) -> None:
+        """从后台恢复窗口；托盘图标常驻不动，只把 tooltip 追平当前状态。"""
+        state = self.root.state()
+        if state == "withdrawn":
+            self.root.deiconify()
+            # withdraw/deiconify 不带回最大化（真机实测：回来是 normal + 最大化前的正常几何），
+            # 按记忆重放；iconic 分支不用管——Tk 自己记得最小化前的状态（含最大化）
+            if self._window_maximized:
+                try:
+                    self.root.state("zoomed")
+                except tk.TclError:
+                    self.log.warning("无法恢复窗口最大化状态")
+        elif state == "iconic":
+            self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+        self._sync_tray()
+        self.log.info("窗口已从后台恢复")
+
+    def _quit(self) -> None:
+        """真正退出：移除托盘图标并销毁主窗口（关闭按钮与托盘「退出」共用）。"""
+        if self._tray is not None:
+            self._tray.close()
+            self._tray = None
+        self.root.destroy()
+
+    def _background_hidden(self) -> bool:
+        """窗口是否正隐藏着（托盘驻留）：后台结果通知按它分派。"""
+        return self.root.state() == "withdrawn"
+
+    def _notify_background(self, title: str, text: str) -> None:
+        """后台驻留期间的运行结果：窗口保持隐藏，只弹托盘气泡（tooltip 与菜单同步追平）。"""
+        if self._tray is None:
+            return
+        self._tray.notify(title, text)
+        self._sync_tray()
+
+    def _on_tray_quit(self) -> None:
+        """托盘菜单「退出」：备份运行中先确认（退出会中断本次备份）。"""
+        if self.running and not messagebox.askokcancel(QUIT_CONFIRM_TITLE, QUIT_CONFIRM_TEXT, parent=self.root):
             return
         self._save_column_config()
-        self.root.destroy()
+        self._quit()
 
     def run(self) -> None:
         """启动事件泵与 Tk 主循环。"""
@@ -2054,8 +2465,15 @@ class BackupApp:
 
 
 def main() -> int:
-    """程序入口：单实例检测后启动主窗口，返回进程退出码。"""
+    """程序入口：单实例检测后启动主窗口，返回进程退出码。
+
+    Note:
+        已有实例在运行时，本次启动改为唤起那个实例的窗口：GUI exe 没有控制台，
+        原来那句「已经在运行了」用户根本看不到。
+    """
     if _another_instance_running():
+        if imapbackup_tray.request_restore():
+            return 0
         print("IMAP Backup GUI 已经在运行了。", file=sys.stderr)
         return 1
     app = BackupApp()
