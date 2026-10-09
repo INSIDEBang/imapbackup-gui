@@ -695,7 +695,24 @@ class BackupApp:
         pane = self.account_pane = tk.LabelFrame(parent, text=ACCOUNT_LIST_TITLE)
         pane.configure(width=ACCOUNT_LIST_WIDTH)
         pane.pack_propagate(False)  # 固定宽：账户名再长也不挤动右栏（右栏吃剩余宽度）
-        self.account_list = tk.Frame(pane)
+        area = tk.Frame(pane)
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        # 列表装在画布里，账户多到一屏放不下才挂滚条。滚条贴面板内沿，与「邮箱文件夹」同款；
+        # 画布底色跟行一样是对话框灰：行下面那点空白也是列表的一部分。
+        self.account_canvas = tk.Canvas(area, highlightthickness=0, background=ACCOUNT_ROW_BG)
+        self.account_canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = self.account_scroll = ttk.Scrollbar(area, orient="vertical",
+                                                     command=self.account_canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.account_canvas.configure(yscrollcommand=scroll.set)
+        self.account_list = tk.Frame(self.account_canvas, background=ACCOUNT_ROW_BG)
+        self._account_win = self.account_canvas.create_window((0, 0), window=self.account_list, anchor="nw")
+        self._account_scroll_shown = False
+        scroll.grid_remove()  # 先不挂：去留由 _sync_account_scroll 按内容高度定
+        scroll.bind("<MouseWheel>", self._on_wheel)  # 与面板内滚条同款：走窗口级节奏
+        self.account_list.bind("<Configure>", lambda _e: self._sync_account_scroll())
+        self.account_canvas.bind("<Configure>", self._on_account_canvas_configure)
         self.backup_selected_btn = tk.Button(pane, text=BACKUP_SELECTED_BTN_LABEL,
                                              command=self._on_start_selected)
         tools = tk.Frame(pane)
@@ -708,12 +725,13 @@ class BackupApp:
         # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
         self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
         tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
-        self.account_list.pack(fill="both", expand=True, padx=2, pady=(4, 0))
+        area.pack(fill="both", expand=True, pady=(4, 0))
         return pane
 
     def _build_config_area(self, parent: tk.Frame) -> None:
         outer = tk.Frame(parent)
-        outer.pack(fill="x", padx=8, pady=(8, 2))
+        # 下边距与运行区的上边距合起来 = 面板之间的 8px（上半区与下半区之间的那条）
+        outer.pack(fill="x", padx=8, pady=(8, 4))
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
         left = tk.Frame(outer)
@@ -725,7 +743,8 @@ class BackupApp:
     def _build_conn_group(self, parent: tk.Frame) -> None:
         """账户信息卡：连接设置已在设置页维护，这里只读展示（无任何输入框）。"""
         group = self.conn_group = tk.LabelFrame(parent, text="账户信息")
-        group.pack(fill="x", pady=(0, 6))
+        # 与「账户信息」「邮箱文件夹」之间那条 8px 同宽：面板之间的横竖间距都取 8px
+        group.pack(fill="x", pady=(0, 8))
         group.columnconfigure(1, weight=1)
 
         tk.Label(group, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
@@ -1060,7 +1079,8 @@ class BackupApp:
         # 左右内边距是 7/5 而不是 8：notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，
         # 先把它补掉，页签包裹边框的左右线才能与上方面板线、下方按钮行落在同一条 8px 基线上
         # （探针实测，issues/15）；按钮行与状态行再用 padx=(1, 3) 把自己的 8px 边距补回去。
-        run.pack(fill="both", expand=True, padx=(7, 5), pady=(2, 8))
+        # 上边距与配置区的下边距合起来 = 8px，与各面板之间那条同宽。
+        run.pack(fill="both", expand=True, padx=(7, 5), pady=(4, 8))
 
         # 两行状态条都先于 Notebook 以 side=bottom 打包，Notebook 的 expand 才不会挤掉它们。
         # msg_bar 先打包所以落在最底。初始只显示一行（未开始备份时没有进度与状态可显示），
@@ -1572,6 +1592,42 @@ class BackupApp:
             self._make_account_row(account)
         self._render_account_rows()
         self._update_start_state()
+        # 行数变了就重算滚条去留，但要等布局把新的请求尺寸算出来——当场量到的还是旧值
+        self.account_canvas.after_idle(self._sync_account_scroll)
+
+    def _on_account_canvas_configure(self, event) -> None:
+        """画布尺寸变化：内嵌列表跟着变宽（行吃满宽度），并重算滚条去留。"""
+        self.account_canvas.itemconfigure(self._account_win, width=event.width)
+        self._sync_account_scroll()
+
+    def _sync_account_scroll(self) -> None:
+        """同步账户列表的滚动状态：画布单位 = 一行，内容装不下才把滚条挂出来。
+
+        Note:
+            比较内容框的请求高度与画布实际高度：账户增删、窗口缩放都会跑到这里。挂出滚条
+            本身又会让画布变窄、再触发一次 <Configure>，第二次进来状态已稳定，不会来回抖。
+        """
+        self.account_canvas.configure(scrollregion=self.account_canvas.bbox("all"))
+        pitch = self._measure_account_row_pitch()
+        if pitch != int(self.account_canvas.cget("yscrollincrement")):
+            self.account_canvas.configure(yscrollincrement=pitch)
+        need = self.account_list.winfo_reqheight() > self.account_canvas.winfo_height()
+        if need != self._account_scroll_shown:
+            self._account_scroll_shown = need
+            if need:
+                self.account_scroll.grid()
+            else:
+                self.account_scroll.grid_remove()
+                self.account_canvas.yview_moveto(0)   # 收进可视区后回到顶部
+
+    def _measure_account_row_pitch(self) -> int:
+        """量账户行的行距(px)：任取一对相邻行，不足两行（或还没铺完布局）时为 0。"""
+        frames = self.account_list.winfo_children()
+        if len(frames) > 1:
+            pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
+            if pitch > 0:
+                return pitch
+        return 0
 
     def _make_account_row(self, account: dict) -> None:
         """画一行：底子 Frame + 复选框 + 名称，后两者的命中区分得开。
@@ -1581,13 +1637,14 @@ class BackupApp:
         """
         account_id = account["id"]
         frame = tk.Frame(self.account_list, background=ACCOUNT_ROW_BG, cursor="hand2")
-        frame.pack(fill="x", pady=1)
+        frame.pack(fill="x", padx=2, pady=1)
         var = tk.BooleanVar(value=account_id in self._checked_accounts)
+        # 复选框自己给「文字」预留了一圈内边距（约 7px），内边距清零、右侧也不留白，名称才贴得近
         check = tk.Checkbutton(frame, variable=var, background=ACCOUNT_ROW_BG,
                                activebackground=ACCOUNT_ROW_BG, highlightthickness=0, borderwidth=0,
-                               cursor="hand2", command=self._sync_account_checks)
-        check.pack(side="left", padx=(2, 2))
-        label = tk.Label(frame, text=account_display(account), anchor="w", cursor="hand2",
+                               padx=0, pady=0, cursor="hand2", command=self._sync_account_checks)
+        check.pack(side="left", padx=(2, 0))
+        label = tk.Label(frame, text=account_display(account), anchor="w", cursor="hand2", padx=0,
                          background=ACCOUNT_ROW_BG, foreground=ACCOUNT_ROW_FG)
         label.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self._account_rows[account_id] = {"frame": frame, "check": check, "label": label, "var": var}
@@ -1975,46 +2032,55 @@ class BackupApp:
         self._update_start_state()
 
     def _on_wheel(self, event) -> str | None:
-        """主窗口唯一的滚轮入口：指针落在「邮箱文件夹」面板内才接管，面板外原样放行。
+        """主窗口唯一的滚轮入口：指针落在「邮箱文件夹」或左侧账户列表里才接管，其余放行。
 
         Args:
             event: MouseWheel 事件。
 
         Returns:
-            面板内返回 "break" 中断后续 bindtag；面板外返回 None 原样放行。
+            在接管的面板内返回 "break" 中断后续 bindtag；面板外返回 None 原样放行。
 
         Note:
             返回 "break" 才是真的中断（Tkinter 拿回调返回值与 "break" 比较）——面板内的滚条正是
             靠它压掉 TScrollbar 的类绑定；反过来 break 也会挡掉 root 上这条，所以滚条必须绑到
             这个函数、由它自己完成滚动。
         """
-        if not self._wheel_in_folder_panel(event.widget):
-            return None  # 邮件列表 / 运行日志的滚轮节奏一字不动
+        canvas = self._wheel_canvas(event.widget)
+        if canvas is None:
+            return None  # 邮件列表 / 运行日志 / 设置页的滚轮节奏一字不动
         self._wheel_accum += event.delta
         notches = int(self._wheel_accum / WHEEL_DELTA)  # 向零取整：正反两个方向都不吃掉余量
         if notches:
             self._wheel_accum -= notches * WHEEL_DELTA
-            self.folder_canvas.yview_scroll(-notches * FOLDER_WHEEL_ROWS, "units")
+            canvas.yview_scroll(-notches * FOLDER_WHEEL_ROWS, "units")
         return "break"  # 不满一格也到此为止，别漏给面板内滚条的原生步长
 
-    def _wheel_in_folder_panel(self, widget) -> bool:
-        """判断事件控件是否属于「邮箱文件夹」面板。
+    def _wheel_canvas(self, widget) -> tk.Canvas | None:
+        """事件落在哪个可滚列表里：返回对应画布（邮箱文件夹 / 账户列表），其余返回 None。"""
+        for panel, canvas in ((self.folder_group, self.folder_canvas),
+                              (self.account_pane, self.account_canvas)):
+            if self._widget_in_panel(widget, panel):
+                return canvas
+        return None
+
+    def _widget_in_panel(self, widget, panel) -> bool:
+        """判断事件控件是否属于某个面板。
 
         Args:
             widget: 事件携带的控件，沿 .master 上溯比对。
+            panel: 目标面板。
 
         Returns:
             控件在面板内时为 True。
 
         Note:
-            画布内嵌的行控件父链是：Label → 行容器 → 节点框 → folder_inner → canvas →
-            folder_group。用控件路径比而不是对象同一性：event.widget 与 folder_group 可能是
-            同一条路径的两个 Python 对象。也不用 winfo_containing：那取决于窗口位置与层叠
-            顺序，测试里不稳。
+            画布内嵌的行控件父链是：Label → 行容器 → 节点框 → inner → canvas → panel。用控件
+            路径比而不是对象同一性：event.widget 与 panel 可能是同一条路径的两个 Python 对象。
+            也不用 winfo_containing：那取决于窗口位置与层叠顺序，测试里不稳。
         """
-        panel = str(self.folder_group)
+        target = str(panel)
         while widget is not None:
-            if str(widget) == panel:
+            if str(widget) == target:
                 return True
             widget = getattr(widget, "master", None)
         return False

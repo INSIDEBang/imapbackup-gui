@@ -1953,6 +1953,90 @@ def test_account_checkboxes_are_independent_of_selection(app):
     assert app._checked_accounts == {first["id"]}
 
 
+def test_account_row_checkbox_sits_next_to_the_name(app):
+    """复选框紧挨名称：控件里那圈给「文字」预留的内边距清零、右侧也不再留白。
+
+    用户口径：原来那条缝太宽。剩下的一点空隙在复选框控件内部（Tk 固定留出），收不掉。
+    """
+    row = app._account_rows[current_account(app)["id"]]
+    app.root.update()   # 上一个用例刚重画完列表，几何要等这一轮布局
+    check, label = row["check"], row["label"]
+    assert (int(check.cget("padx")), int(check.cget("pady"))) == (0, 0)
+    # 控件之间零留白：名称紧贴复选框控件的右缘
+    assert label.winfo_rootx() == check.winfo_rootx() + check.winfo_width(), (
+        label.winfo_rootx(), check.winfo_rootx(), check.winfo_width())
+    # 行自己的左缩 2px（原来是挂在列表容器上的 padx）
+    assert check.winfo_rootx() - row["frame"].winfo_rootx() == 2, (
+        check.winfo_rootx(), row["frame"].winfo_rootx())
+
+
+def test_account_list_scrolls_only_when_accounts_do_not_fit(app):
+    """账户列表：一屏装得下就没有滚条，装不下才挂出来；滚条贴面板内沿、滚轮一格一行。
+
+    回归自：列表曾是直接打包的 Frame——账户多到装不下就被裁掉，既没有滚条也没有滚轮。
+    用例自己收尾：账户表还原成进来时的样子，滚条跟着收起。
+    """
+    keep = list(app.accounts)
+    first = current_account(app)
+    app.root.geometry("960x736")
+    app.root.update()
+    canvas = app.account_canvas
+    assert not app.account_scroll.winfo_ismapped(), "账户不多时不该有滚条"
+
+    # 一次加够装不下的行数（行高 + 行自己的 pady=1 上下各一）
+    room = canvas.winfo_height()
+    pitch = app._account_rows[first["id"]]["frame"].winfo_height() + 2
+    for i in range(room // pitch + 3):
+        account = g.new_account()
+        account.update({"name": f"溢出{i:03d}", "user": f"over{i}@example.com",
+                        "server": "imap.example.com"})
+        app.accounts.append(account)
+    app._refresh_account_list()
+    app.root.update()
+    assert app.account_list.winfo_reqheight() > room, (app.account_list.winfo_reqheight(), room)
+    assert app.account_scroll.winfo_ismapped(), "装不下就该挂滚条"
+
+    border = int(app.account_pane.cget("borderwidth"))
+    assert (app.account_pane.winfo_rootx() + app.account_pane.winfo_width()
+            - (app.account_scroll.winfo_rootx() + app.account_scroll.winfo_width()) == border), (
+        app.account_pane.winfo_rootx(), app.account_pane.winfo_width(),
+        app.account_scroll.winfo_rootx(), app.account_scroll.winfo_width(), border)
+
+    row_pitch = app._measure_account_row_pitch()
+    assert row_pitch > 0
+    assert int(canvas.cget("yscrollincrement")) == row_pitch
+    canvas.yview_moveto(0)
+    app._wheel_accum = 0
+    app.root.update()
+    before = canvas.canvasy(0)
+    app._account_rows[first["id"]]["label"].event_generate("<MouseWheel>", delta=-g.WHEEL_DELTA, x=5, y=5)
+    app.root.update()
+    assert canvas.canvasy(0) - before == g.FOLDER_WHEEL_ROWS * row_pitch, (
+        canvas.canvasy(0), before, row_pitch)
+
+    # 账户数不动、只把窗口缩小：装不下了滚条要自己冒出来（走的是画布 <Configure> 这条路，
+    # 和上面「账户变多」不是同一条）。窗口高度按量到的差值给足余量，不钉像素。
+    grew = app.root.winfo_height() + (app.account_list.winfo_reqheight() - canvas.winfo_height()) + 40
+    app.root.geometry(f"960x{grew}")
+    app.root.update()
+    assert not app.account_scroll.winfo_ismapped(), (
+        "窗口拉高到装得下，滚条该收起", app.root.winfo_height(), canvas.winfo_height())
+    app.root.geometry("960x736")
+    app.root.update()
+    assert app.account_scroll.winfo_ismapped(), (
+        "窗口缩回去，滚条该自己冒出来", app.root.winfo_height(), canvas.winfo_height())
+
+    app.accounts[:] = keep
+    app._states = {k: v for k, v in app._states.items() if k in {a["id"] for a in keep}}
+    app._selected_account_id = first["id"]
+    app._ui_settings["selected_account"] = first["id"]
+    app._refresh_account_list()
+    app._render_account_detail()
+    app.root.update()
+    assert app.accounts == keep
+    assert not app.account_scroll.winfo_ismapped(), "行收进可视区后滚条该收起"
+
+
 def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
     """「备份所选」只跑勾选的账户；一个都没勾时只提示、不进运行态。"""
     first = current_account(app)

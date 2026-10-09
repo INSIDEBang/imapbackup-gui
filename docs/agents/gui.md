@@ -26,7 +26,8 @@
 - **账户是唯一配置单位**：`self.accounts` 是账户字典列表（`id` / `name` / `user` / `server` / `ssl` / `port` / `password_dpapi` / `folders` / `mbox` / `eml`），引用一律用创建时生成的稳定 `id`（名称可改、邮箱地址可重复）。`parse_account` / `account_record` 是读写这两个方向的唯一入口；`account_display` 给出显示名（名称→邮箱地址→占位名）。
 - **账号目录名永远取邮箱地址**：`_backup_account` 用 `core.sanitize_segment(v["user"], …)` 拼 `<备份根>/<邮箱地址>/…`。账户名称只是显示名，任何路径、输出、判重逻辑都不得读它（AGENTS.md 的不变量）。
 - **界面分工**：设置页「账户」= 账户增删改 + 连接设置表单 +「保存」（保存是显式动作，校验邮箱地址/收件服务器/端口后落盘）；「备份」= 全局唯一的备份保存位置。备份页 = 左账户列表（`account_list`，固定 160px）+ 右账户备份详情；详情里连接信息与备份位置是**只读信息卡**，唯一可编辑项是格式复选框与文件夹勾选树。备份页不得出现 `tk.Entry`（`test_backup_detail_has_no_entry_widgets` 守着）。
-- **账户行是自绘的**：一行 = 复选框 + 名称（`_make_account_row`），不是一个 Listbox——点行切详情、点复选框只翻勾选，两个动作的命中区必须分开。行底色 `ACCOUNT_ROW_BG`（对话框灰），选中行整行 `SystemHighlight`（与原 Listbox 的选中蓝同一个系统色，`_render_account_rows` 上色，选中行连复选框一起换底色）。勾选集合 `self._checked_accounts` 是纯界面态、不落盘：`_refresh_account_list` 里同步——删掉的账户不再占勾选，上一次画列表时还没有的账户默认勾上（「勾」是默认态，`_on_account_add` 只负责开户）。
+- **账户行是自绘的**：一行 = 复选框 + 名称（`_make_account_row`），不是一个 Listbox——点行切详情、点复选框只翻勾选，两个动作的命中区必须分开。行底色 `ACCOUNT_ROW_BG`（对话框灰），选中行整行 `SystemHighlight`（与原 Listbox 的选中蓝同一个系统色，`_render_account_rows` 上色，选中行连复选框一起换底色）。勾选集合 `self._checked_accounts` 是纯界面态、不落盘：`_refresh_account_list` 里同步——删掉的账户不再占勾选，上一次画列表时还没有的账户默认勾上（「勾」是默认态，`_on_account_add` 只负责开户）。复选框的 `padx/pady` 清零、右侧零留白，名称紧贴控件的右缘（Tk 在复选框控件里固定留一圈给「文字」的内边距，那点空隙收不掉）。
+- **账户列表装不下才挂滚条**：列表在画布 `account_canvas` 里（`account_scroll` 贴面板内沿，与「邮箱文件夹」同款）；`_sync_account_scroll` 比内容请求高度与画布高度决定滚条去留——行数变化后延到 `after_idle` 量（当场量到的还是旧值），窗口缩放走画布 `<Configure>`。画布单位 `yscrollincrement` = 实测行距，滚轮一格一行（`_on_wheel` 的账户列表分支，与文件夹面板同节奏）。
 - **一套共享控件 + 每账户状态字典**：`self._states[account_id]` 存 `connect_state` / `snapshot`（服务器、地址、密码密文）/ `folder_rows` / `open_keys` / `messages` / `row_index` / 计数 / 状态文案 / 进度。`_switch_account` → `_render_account_detail` 负责「收当前账户进度 → 重画目标账户」；`self.folder_rows`、`self._folder_nodes`、`self._folder_clickables` 始终指向可见账户的那一份。`_visible_state()` 对存在的账户按需建立状态。
 - **过期口径**：`_refresh_stale` 比较账户现值与连接当刻快照（密码比密文），不相等即 `stale`；设置页保存后与重连成功时各刷一次，不靠字段 trace（备份页已无输入框）。
 - **每账户独立进度**：事件都带 `account_id`——`folders_loaded` / `totals` / `message` / `account_done` / `account_failed`；批量结束走 `batch_done`，整轮失败 `batch_done(False, [(显示名, 消息), …])` 决定弹不弹错误框，后台隐藏只弹气泡。可见账户实时刷新，其余账户只累积状态，切过去再重画。
@@ -39,6 +40,7 @@
 - `test_accounts_v1_settings_migrate_to_accounts` / `test_accounts_restore_tolerates_bad_records` / `test_accounts_save_and_restore_round_trip`
 - `test_backup_detail_has_no_entry_widgets` / `test_format_checkboxes_are_per_account`
 - `test_account_rows_are_gray_until_selected` / `test_account_checkboxes_are_independent_of_selection` / `test_backup_selected_runs_only_checked_accounts`
+- `test_account_row_checkbox_sits_next_to_the_name` / `test_account_list_scrolls_only_when_accounts_do_not_fit`
 - `test_batch_worker_runs_accounts_in_order_and_isolates_failures` / `test_backup_account_uses_email_for_the_account_directory`
 - `test_folder_load_marks_the_account_connected` / `test_editing_credentials_makes_the_connection_stale`
 
@@ -60,13 +62,14 @@
 ## 布局与滚轮
 
 - 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框。
+- 面板与面板之间的间隔横竖都是 **8px**：左栏账户列表 ↔ 右栏、「账户信息」↔「邮箱文件夹」、「账户信息」↔「输出」（`pady=(0, 8)`），以及上半区 ↔ 运行区（配置区下边距 4 + 运行区上边距 4）。
 - 两个页签（邮件列表 / 运行日志）各有一层与「邮箱文件夹」面板同款的外包边框（`_panel_style_frame()`：groove + 面板同值 `borderwidth`）：滚条包在框内、贴着边框内侧，日志页签的工具栏也在框内，空态提示挂框内。
 - 邮件列表：外框与面板同款（groove）；白色表格**自己带凹陷边**（`tree_wrap`：`tk.Frame(relief="sunken", borderwidth=1, background="#ffffff")`，Tk 经典 3D 绘制——左/上 153 阴影、右/下 230 高光），整块贴着外框内沿、不留灰边距。**只保留右侧那条凹陷线**：树用 `place(x=-1, y=-1, relwidth=1.0, relheight=1.0, width=1, height=2)` 往左上各溢出 1px、右下各多铺 1px（宽那 1px 用来吃掉顶边最后一个像素，否则白板右上角会留下一个深色点），把白板的左/上/下三条线盖住（与外框合成一条线），右边留出的 230 高光正对滚条左缘的 1px 白色反光条（没有对比时白对白会糊成一片，用户口径，探针见 issues/15）。白底是必需的：3D 色阶由控件背景推出，白底才与日志板同色。树自己的 vista field 边框走派生样式 `Mail.Treeview`（layout 只留 `treearea`，全局 `Treeview` 布局不动）压平。
 - 运行日志：板面与「打开日志文件夹」按钮同外框之间处处留 **4px** 灰边距（以最短的下边距统一，按钮与板面左缘同一竖线），板面保留 Tk 自带下沉边框、右侧贴住滚条；滚条也带 4px 上下边距（与文件夹面板的滚条同款）。
 - 回归：`test_right_edges_share_one_baseline` 断言这些边框 / 留白 / 凹陷边 / 滚条对齐。
 - notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px、下缩 3px，且会在客户区四周自绘 1px 淡边线（原生绘制，颜色改不了：`TNotebook` 只有 `-tabmargins` 可配，换 background/bordercolor/lightcolor/darkcolor 像素纹丝不动，见 issues/15）。因此容器 `run` 的左右内边距用 7/5 把它补掉（按钮行与状态行用 `padx=(1, 3)` 保留 8px 边距），页签包裹边框的左/右线才与配置区左边线、上方面板右线**精确重合**；`tab_edge_left`/`tab_edge_right`/`tab_edge_bottom` 三条背景色窄条（1px/3px/3px，`place` 在 notebook 上、随其几何走）盖掉客户区内缩带，页签里就只剩包裹边框这一条线。**底边那条必须盖**：它的淡线落在包裹边框外侧，底边看起来会多出一道「突出」的线（用户复核）；顶边那条是页签行底界线，保留。
 - `test_right_edges_share_one_baseline` 断言上述三处均为**精确相等**，并断言窄条尺寸（左 1 / 右 3 / 下 3）== 实测内缩：换主题或 DPI 让内缩变了，会在这里炸出来，提醒同步改窄条尺寸与容器内边距。
-- 邮箱文件夹滚轮使用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；沿事件控件的 `.master` 向上判断是否位于 `folder_group`，其他区域返回 `None` 放行。
+- 邮箱文件夹与账户列表的滚轮共用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；`_wheel_canvas` 沿事件控件的 `.master` 向上认面板（`_widget_in_panel`），落在「邮箱文件夹」或左栏账户列表里才接管，其他区域返回 `None` 放行（设置页那个 Listbox 因此照旧走原生滚动）。
 - 面板内滚条也调用 `_on_wheel` 并返回 `"break"`，由该入口完成滚动，避免 `TScrollbar` 默认步长覆盖统一节奏。
 - 每格滚动 `FOLDER_WHEEL_ROWS` 行；`yscrollincrement` 使用实测行距。不足一格的 delta 按 `WHEEL_DELTA` 累积，以支持高分辨率滚轮和触摸板。
 
@@ -74,6 +77,7 @@
 
 - `test_right_edges_share_one_baseline`
 - `test_folder_panel_wheel_covers_the_whole_panel`
+- `test_account_list_scrolls_only_when_accounts_do_not_fit`
 
 ## 邮件列表选中
 
