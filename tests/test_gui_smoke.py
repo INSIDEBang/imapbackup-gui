@@ -1,8 +1,11 @@
 """GUI 无头冒烟：实例化真实的 BackupApp，喂合成队列事件，断言 UI 状态。不联网。
 
 整套用例共享同一个 module 级 app 实例，**pytest 按定义顺序执行**，所以前一节留下的
-界面状态就是后一节的前置条件（连接 → 树 → stale → 工具栏 → 级联 → … → 状态条 → 气泡）。
+界面状态就是后一节的前置条件（账户 → 连接 → 树 → stale → 工具栏 → 级联 → … → 状态条 → 气泡）。
 这个顺序依赖是有意保留的，别重排测试。
+
+多账户改造后的事件都带 account_id：`folders_loaded` / `totals` / `message` / `account_done`
+一律针对某个账户，批量结束走 `batch_done`。`load_folders` 是本文件唯一的“连接成功”入口。
 
 标了 @pytest.mark.gui：需要真实 Tk 显示与 ttk 主题，几何断言（winfo_width、
 winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示环境的 runner 用
@@ -10,7 +13,6 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 """
 import json
 import logging
-import sys
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -48,7 +50,8 @@ DUP_A = "&UXZO1mWHTvZZOQ-/a"
 DUP_B = "&UXZO1mWHTvZZOQ-/b"
 
 SHORT_DONE = "完成：本次备份 123456 封，跳过 123456 封（本地已存在），用时 1:05"
-LONG_STATUS = "扫描 12/45：Deleted Messages/2024 年第四季度归档副本(2)/再一个很长的名字" * 4
+# 三次重复：多账户改造后右栏少了一条账户列表的宽度，四次重复在 1924px 的屏幕上已经放不下了
+LONG_STATUS = "扫描 12/45：Deleted Messages/2024 年第四季度归档副本(2)/再一个很长的名字" * 3
 LONG_COUNTS = ("服务器共 123456789012345 ｜ 待备份 123456789012345 ｜ "
                "已备份 123456789012345 / 123456789012345")
 MID_COUNTS = "服务器共 123456789 ｜ 待备份 123456789 ｜ 已备份 123456789 / 123456789"
@@ -76,14 +79,29 @@ def _redirect_column_config(tmp_path_factory):
     patch.undo()
 
 
+DPAPI_OK = g._dpapi_encrypt("probe") is not None
+
+
 @pytest.fixture(scope="module")
 def app():
     """The real app, created once for the whole module.
 
     见模块 docstring：用例顺序是有意义的，重排会破坏前置状态。
+    启动后先补一个账户：多账户改造后所有界面都挂在「当前账户」上。
     """
     root = logging.getLogger()
     instance = g.BackupApp()
+    account = g.new_account()
+    account.update({"name": "主账户", "user": V["user"], "server": V["server"], "ssl": True, "port": "993"})
+    if DPAPI_OK:
+        account["password_dpapi"] = g._dpapi_encrypt(V["password"])
+    instance.accounts.append(account)
+    instance._ui_settings["accounts"] = instance.accounts
+    instance._selected_account_id = account["id"]
+    instance._ui_settings["selected_account"] = account["id"]
+    instance._refresh_account_list()
+    instance._refresh_edit_list(account["id"])
+    instance._render_account_detail()
     try:
         yield instance
     finally:
@@ -97,6 +115,26 @@ def app():
         for handler in [h for h in root.handlers if isinstance(h, logging.FileHandler)]:
             handler.close()
             root.removeHandler(handler)
+
+
+def current_account(app):
+    """当前可见账户记录。"""
+    return app._find_account(app._selected_account_id)
+
+
+def load_folders(app, names, account_id=None):
+    """模拟连接成功：为（默认可见的）账户投一条 folders_loaded 事件并泵一轮。"""
+    account_id = account_id or app._selected_account_id
+    account = app._find_account(account_id)
+    app.events.put(("folders_loaded", (account_id, names, app._account_snapshot(account))))
+    pump(app)
+
+
+def clear_folders(app):
+    """把可见账户的文件夹行清空并重画（等价于服务器一个文件夹都没返回）。"""
+    state = app._visible_state()
+    state["folder_rows"] = []
+    app._render_folder_tree(state)
 
 
 def pump(instance, n=3):
@@ -231,12 +269,10 @@ def test_version_is_shared_and_status_bar_starts_on_one_row(app):
 
 
 def test_folder_load_marks_the_account_connected(app):
-    """folders_loaded 事件走完真实流程：字段先被读进 app，再投队列。"""
-    app.server_var.set(V["server"])
-    app.user_var.set(V["user"])
-    app.password_var.set(V["password"])
-    app.events.put(("folders_loaded", (NAMES, V)))
-    pump(app)
+    """folders_loaded 事件走完真实流程：账户先被读到，再投队列；勾选按账户记录默认 INBOX。"""
+    account = current_account(app)
+    account.update({"server": V["server"], "user": V["user"], "port": "993", "ssl": True})
+    load_folders(app, NAMES)
 
     assert app.connect_state == "connected"
     assert app.connect_btn.cget("text") == "✓ 已成功连接"
@@ -280,7 +316,10 @@ def test_folder_tree_structure(app):
 
 
 def test_editing_credentials_makes_the_connection_stale(app):
-    app.server_var.set("imap.qq.com")
+    """账户在设置页被改动后（快照 ≠ 现值）连接即过期；改回原值即恢复。"""
+    account = current_account(app)
+    account["server"] = "imap.qq.com"
+    app._refresh_stale(account["id"])
     pump(app)
     assert app.connect_state == "stale"
     assert app.connect_btn.cget("text") == "⇄ 连接并加载文件夹"
@@ -293,7 +332,8 @@ def test_editing_credentials_makes_the_connection_stale(app):
     app.root.update()
     group_h_with_hint = app.conn_hint.master.winfo_height()
 
-    app.server_var.set(V["server"])
+    account["server"] = V["server"]
+    app._refresh_stale(account["id"])
     pump(app)
     app.root.update()
     assert app.connect_state == "connected"
@@ -344,8 +384,7 @@ def test_parent_check_cascades_and_shows_a_third_state(app):
 
 
 def test_single_child_folder_toggles_the_parent(app):
-    app.events.put(("folders_loaded", (SINGLE, V)))
-    pump(app)
+    load_folders(app, SINGLE)
     assert not row_by(app, OTHER)["var"].get() and not row_by(app, CHILD)["var"].get()
     assert row_by(app, OTHER)["check_btn"].cget("text") == "☐ 其他文件夹"
     assert len(app._descendant_rows(PARENT)) == 1
@@ -390,20 +429,20 @@ def test_reload_keeps_checks_and_expansion_state(app):
     row_by(app, "INBOX")["var"].set(True)
     app._toggle_folder_open(PARENT)
     app.root.update()
-    app.events.put(("folders_loaded", (NAMES, V)))
-    pump(app)
+    load_folders(app, NAMES)
     assert row_by(app, OTHER)["var"].get() is True and row_by(app, "INBOX")["var"].get() is True
     assert row_by(app, "Archive/2024")["var"].get() is False
     assert not is_open(app, PARENT) and is_open(app, SYNTH)
 
 
 def test_totals_message_and_done_events_fill_the_ui(app):
-    app.events.put(("totals", 12345, 23))
+    aid = app._selected_account_id
+    app.events.put(("totals", aid, 12345, 23))
     pump(app)
     assert "12345" in app.count_var.get() and "23" in app.count_var.get(), app.count_var.get()
     assert float(app.progress["maximum"]) == 23.0
 
-    app.events.put(("message", _message()))
+    app.events.put(("message", aid, _message()))
     pump(app)
     kids = app.tree.get_children()
     assert len(kids) == 1
@@ -416,8 +455,9 @@ def test_totals_message_and_done_events_fill_the_ui(app):
 
 def test_message_rows_are_zebra_striped(app):
     """偶数行打 zebra tag，奇数行走 Treeview 默认白底；新一轮从第 1 行重新起算。"""
+    aid = app._selected_account_id
     app._clear_message_rows()
-    app.events.put(("message", _message()))
+    app.events.put(("message", aid, _message()))
     pump(app)
 
     assert str(app.tree.tag_configure(g.ZEBRA_TAG, "background")).lower() == g.ZEBRA_BG.lower(), (
@@ -426,8 +466,8 @@ def test_message_rows_are_zebra_striped(app):
     assert row_tags(app, first) == [], row_tags(app, first)
 
     for i in range(2, 7):
-        app.events.put(("message", _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
-                                            size=100, msg_id=f"<{i}@y>")))
+        app.events.put(("message", aid, _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
+                                                 size=100, msg_id=f"<{i}@y>")))
     pump(app)
     assert [row_tags(app, iid) for iid in app.tree.get_children()] == (
         [[], [g.ZEBRA_TAG], [], [g.ZEBRA_TAG], [], [g.ZEBRA_TAG]])
@@ -437,7 +477,7 @@ def test_message_rows_are_zebra_striped(app):
     # 新一轮开始前提示重新挂出（待备份为 0 时整轮都不会有行，提示必须留着）
     assert app.list_ph.winfo_manager() == "grid", app.list_ph.winfo_manager()
 
-    app.events.put(("message", _message(subject="重跑首轮", msg_id="<z@y>")))
+    app.events.put(("message", aid, _message(subject="重跑首轮", msg_id="<z@y>")))
     pump(app)
     first = app.tree.get_children()[0]
     assert row_tags(app, first) == [], row_tags(app, first)
@@ -445,20 +485,25 @@ def test_message_rows_are_zebra_striped(app):
 
 
 def test_run_done_summaries(app):
-    app.events.put(("log", "2026-09-11 10:00:00 | INFO    | gui        | _backup_worker:1 | 测试日志行"))
-    app.events.put(("run_done", 1, 12322, 65.0, False, 23))
+    """单账户跑完 + 批量结束：完成 / 已是最新 / 已停止三种状态文案。"""
+    aid = app._selected_account_id
+    app.events.put(("log", "2026-09-11 10:00:00 | INFO    | gui        | _batch_worker:1 | 测试日志行"))
+    app.events.put(("account_done", aid, 1, 12322, 65.0, False, 23))
+    app.events.put(("batch_done", False, []))
     pump(app)
     assert "测试日志行" in app.log_text.get("1.0", "end")
     assert "完成：本次备份 1 封" in app.status_var.get() and "用时 1:05" in app.status_var.get(), (
         app.status_var.get())
     assert str(app.start_btn.cget("state")) == "normal"
 
-    app.events.put(("totals", 100, 0))
-    app.events.put(("run_done", 0, 100, 3.0, False, 0))
+    app.events.put(("totals", aid, 100, 0))
+    app.events.put(("account_done", aid, 0, 100, 3.0, False, 0))
+    app.events.put(("batch_done", False, []))
     pump(app)
     assert app.status_var.get() == "已是最新，无待备份邮件", app.status_var.get()
 
-    app.events.put(("run_done", 5, 100, 9.0, True, 20))
+    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
+    app.events.put(("batch_done", True, []))
     pump(app)
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
 
@@ -472,12 +517,12 @@ def test_config_is_locked_during_a_run(app):
     """
     app.running = True
     app._begin_run_ui()
-    lockable = [w for w, _ in app._config_widgets if isinstance(w, (tk.Entry, tk.Button))]
+    lockable = [w for w, _ in app._config_widgets if isinstance(w, (tk.Button, tk.Checkbutton))]
     assert all(str(w.cget("state")) == "disabled" for w in lockable), len(app._config_widgets)
     assert bool(app._folder_clickables)
     assert all(str(w.cget("foreground")) == "gray" and str(w.cget("cursor")) == "arrow"
                for w, _ in app._folder_clickables), len(app._folder_clickables)
-    assert app.conn_hint.cget("text") == "备份运行中，账户与服务器信息不可修改，请先停止"
+    assert app.conn_hint.cget("text") == "备份运行中，文件夹选择与输出格式不可修改，请先停止"
     assert str(app.conn_hint.cget("foreground")) == g.HINT_GRAY
     assert app.conn_hint.winfo_manager() == "grid"
     assert app.connect_btn.cget("text") == "⇄ 连接并加载文件夹"
@@ -506,13 +551,15 @@ def test_config_is_locked_during_a_run(app):
     click(app, inbox_btn)
     assert [r["var"].get() for r in app.folder_rows] == states_before
     assert all(str(w.cget("state")) == "normal" for w, _ in app._config_widgets
-               if isinstance(w, (tk.Entry, tk.Button)) and w is not app.connect_btn)
+               if isinstance(w, (tk.Button, tk.Checkbutton)) and w is not app.connect_btn)
     assert app.conn_hint.cget("text") == "" and app.conn_hint.winfo_manager() == ""
     # 连接仍有效时，结束运行后连接按钮保持"已成功连接"禁用态（原设计：避免重复登录）
     assert str(app.connect_btn.cget("state")) == "disabled"
 
     # 连接已过期时，结束运行要把按钮重新放开并给出过期提示
-    app.server_var.set("imap.qq.com")
+    account = current_account(app)
+    account["server"] = "imap.qq.com"
+    app._refresh_stale(account["id"])
     pump(app)
     app._end_run_controls()
     assert str(app.connect_btn.cget("state")) == "normal"
@@ -520,55 +567,63 @@ def test_config_is_locked_during_a_run(app):
     assert app.conn_hint.cget("text") == "连接信息已更改，请重新连接并加载文件夹"
     assert str(app.conn_hint.cget("foreground")) == g.HINT_RED
     assert app.conn_hint.winfo_manager() == "grid"
-    app.server_var.set(V["server"])
+    account["server"] = V["server"]
+    app._refresh_stale(account["id"])
     pump(app)
 
 
 def test_enter_triggers_connect_with_the_same_button_gating(app, monkeypatch):
-    """五个框都绑定 Enter，且与鼠标共用 _on_connect 的按钮态门控。"""
+    """设置页账户表单的输入框绑定 Enter = 保存；连接按钮的门控挡住重复连接。"""
     box = FakeBox()
     monkeypatch.setattr(g, "messagebox", box)
 
     # 只查绑定注册，不合成 KP_Enter：合成小键盘事件的语义不确定，断言会空过
-    entries = (app.user_entry, app.server_entry, app.port_entry, app.password_entry, app.outdir_entry)
-    assert all(str(w.bind("<Return>")) != "" and str(w.bind("<KP_Enter>")) != "" for w in entries)
+    assert all(str(w.bind("<Return>")) != "" and str(w.bind("<KP_Enter>")) != ""
+               for w in app._account_form_entries)
 
-    app._connect_worker = lambda _v: None   # 不起真实网络线程
-    app.connect_state = "idle"
+    app._connect_worker = lambda *_args: None   # 不起真实网络线程
+    account = current_account(app)
+    if not account.get("password_dpapi"):
+        pytest.skip("非 Windows 没有可用的加密密码")
+    app._states[account["id"]]["connect_state"] = "idle"   # 回到可连接状态，按钮才会放开
     app._apply_connect_state()
-    press_enter(app, app.password_entry)
+    app._on_connect()
     assert app.connect_state == "connecting"
     assert "正在连接" in str(app.connect_btn.cget("text")), (
         app.connect_state, app.connect_btn.cget("text"))
 
-    # 连接中：输入框并未禁用，只有按钮被禁用——门控必须挡住，否则起第二条连接线程
-    press_enter(app, app.password_entry)
+    # 连接中：按钮被禁用——门控必须挡住，否则起第二条连接线程
+    app._on_connect()
     assert app.connect_state == "connecting"
     assert str(app.connect_btn.cget("state")) == "disabled"
     assert app.conn_hint.winfo_manager() == "", (
         app.connect_state, app.connect_btn.cget("state"), app.conn_hint.cget("text"))
 
-    # 备份运行中：配置区被 _set_config_enabled 置灰，Enter 同样静默
-    app.connect_state = "connected"
+    # 备份运行中：配置区被 _set_config_enabled 置灰，再点同样静默
+    app._states[account["id"]]["connect_state"] = "connected"
     app.running = True
     app._begin_run_ui()
-    press_enter(app, app.outdir_entry)
+    app._on_connect()
     assert app.connect_state == "connected"
     assert str(app.connect_btn.cget("state")) == "disabled", (app.connect_state,)
     app.running = False
     app._end_run_controls()
 
-    # 字段不全时 Enter 只弹校验提示、不发起连接；清空密码让连接过期是既有行为
-    app.password_var.set("")
+    # 账户缺密码时只弹校验提示、不发起连接；清空密码让连接过期是既有行为
+    cipher = account.pop("password_dpapi", None)
+    app._refresh_stale(account["id"])   # 真实路径：设置页保存后刷新过期态
     box.warnings.clear()
-    press_enter(app, app.outdir_entry)
+    app._on_connect()
     assert app.connect_state == "stale"
-    assert ("信息不完整", "请填写密码。") in box.warnings, (app.connect_state, box.warnings)
-    app.password_var.set(V["password"])
+    assert ("信息不完整", "该账户还没有密码，请在设置页的「账户」里填写并保存。") in box.warnings, box.warnings
+    if cipher:
+        account["password_dpapi"] = cipher   # 原密文放回：快照口径一致，连接恢复有效
+    app._refresh_stale(account["id"])
     pump(app)
+    assert app.connect_state == "connected", app.connect_state
 
     # 一个文件夹都没解析出来时提示必须重新挂回，否则那块区域是一片纯白
-    app._rebuild_folders([])
+    clear_folders(app)
     assert app.folder_ph.winfo_manager() == "grid" and not app.folder_rows and not app._folder_nodes, (
         app.folder_ph.winfo_manager())
 
@@ -649,6 +704,8 @@ def test_status_and_counts_ellipsis_are_bidirectional(app):
     app.root.update()
 
     # 中间档（用户要的"先缩进度条"语义）：9 位数计数全文照显，进度条缩到地板与 220 之间
+    app.root.geometry("960x736")   # 默认窗口宽度：右栏比最小宽度宽出账户列表那一条
+    app.root.update()
     app._set_counts(MID_COUNTS)
     app.root.update()
     assert app.count_var.get() == MID_COUNTS
@@ -731,7 +788,7 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     monkeypatch.setattr(g, "messagebox", FakeBox())
     app.running = True
     app._begin_run_ui()
-    app.events.put(("run_failed", "boom"))
+    app.events.put(("batch_done", False, [("主账户", "boom")]))
     pump(app)
     assert_start_button_idle(app)
     assert app._run_spinner_job is None
@@ -756,9 +813,21 @@ def test_right_edges_share_one_baseline(app):
     # 上半区容器的左边距 vs 面板的右边距：两边都得是 8px
     client_left = app.root.winfo_rootx()
     client_right = client_left + app.root.winfo_width()
-    left_margin = left(app.folder_group.master) - client_left
+    # 左侧是账户列表栏（固定宽），右栏的内容边距由右栏自己带
+    pane = app.account_pane
+    detail = app.folder_group.master.master          # 配置区外层 → 右栏
+    assert left(pane) - client_left == 8, left(pane) - client_left
+    assert pane.winfo_width() == g.ACCOUNT_LIST_WIDTH, pane.winfo_width()
+    assert left(detail) == right(pane), (left(detail), right(pane))
+    left_margin = left(app.folder_group.master) - left(detail)
     right_margin = client_right - right(app.folder_group)
     assert left_margin == right_margin == 8, (left_margin, right_margin)
+    # 账户栏与右栏之间那条间隔 = 左右两栏各自内容之间的间隔（用户口径：与「账户信息」和
+    # 「邮箱文件夹」之间那条一样宽）。回归自：账户栏曾自带 8px 外边距，叠上右栏的 8px 内边距
+    # 成了 16px，比别处宽一倍。
+    col_gap = left(app.folder_group) - right(app.conn_group)
+    assert left(app.conn_group) - right(pane) == col_gap == 8, (
+        left(app.conn_group) - right(pane), col_gap)
 
     # 面板内滚条贴住面板边框线：与面板内沿只差一个 borderwidth
     border = int(app.folder_group.cget("borderwidth"))
@@ -846,14 +915,14 @@ def test_right_edges_share_one_baseline(app):
     assert (app.tab_edge_left.winfo_width(), app.tab_edge_right.winfo_width(),
             app.tab_edge_bottom.winfo_height()) == insets, insets
 
-    # 设置页：两栏与备份页共用同一条 8px 左右基线（左栏贴左边线、右栏贴右边线，栏间 8px），
+    # 设置页：两栏共用同一条 8px 左右基线（左栏贴左边线、右栏贴右边线，栏间 8px），
     # 左分类栏固定宽，四边留白等宽（底边与上/左/右同为 8px）。量完切回备份页，
     # 后面的用例继续在备份页上跑。
     app._show_page(g.PAGE_SETTINGS)
     app.root.update()
     nav_frame = app.settings_nav.master
     detail_frame = app._settings_sections[g.SETTINGS_WINDOW_SECTION]
-    assert left(nav_frame) == left(app.folder_group.master), (left(nav_frame), left(app.folder_group.master))
+    assert left(nav_frame) - client_left == 8, (left(nav_frame), client_left)
     assert right(detail_frame) == right(app.folder_group), (right(detail_frame), right(app.folder_group))
     assert nav_frame.winfo_width() == g.SETTINGS_SECTION_LIST_WIDTH, nav_frame.winfo_width()
     assert left(detail_frame) - right(nav_frame) == 8, (left(detail_frame), right(nav_frame))
@@ -878,15 +947,19 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
     many = [(f"Box{i:02d}", f"Box{i:02d}.mbox", f"Box{i:02d}", f"Box{i:02d}") for i in range(30)]
     many += [("Group", "Group.mbox", "Group", "Group"),
              ("Group/Leaf", "Group.Leaf.mbox", "Group/Leaf", "Group/Leaf")]
-    app.events.put(("folders_loaded", (many, V)))
-    pump(app)
+    load_folders(app, many)
     app.root.geometry("960x736")
+    app.root.update()
+    # 行距同步挂在 folder_inner 的 <Configure> 上；重建后它偶尔还没跑过，画布的单位会停在旧值上，
+    # 第一格滚轮就滚不到位（探针实测）。这里显式同步一次，后面的断言才是确定性的。
+    app._sync_folder_row_increment()
     app.root.update()
 
     canvas = app.folder_canvas
     frames = app.folder_inner.winfo_children()          # 顶层节点框
     pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
     assert len(frames) > 9 and pitch > 0, (len(frames), pitch)
+    assert int(canvas.cget("yscrollincrement")) == pitch
     notch = g.FOLDER_WHEEL_ROWS * pitch                 # 一格该滚的距离（行距现量，不钉像素值）
 
     def at_top():
@@ -940,7 +1013,7 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
     assert app.tree.yview()[0] > 0                      # 枚举没被窗口级入口吞掉：邮件列表自己滚了
 
     # 空树把单位归回 0，别把上次的行距留给没有内容的树
-    app._rebuild_folders([])
+    clear_folders(app)
     app.root.update()
     assert int(canvas.cget("yscrollincrement")) == 0
 
@@ -953,7 +1026,7 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
     第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
     """
-    app.connect_state = "connected"
+    app._states[app._selected_account_id]["connect_state"] = "connected"
     app.running = True
     app._begin_run_ui()
     app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始/连接按钮那套用例同法）
@@ -985,7 +1058,9 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
         assert_start_button_idle(app)
 
     # 运行真正结束：按钮、状态行、提示全部回位，不残留「正在停止…」
-    app.events.put(("run_done", 5, 100, 9.0, True, 20))
+    aid = app._selected_account_id
+    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
+    app.events.put(("batch_done", True, []))
     pump(app)
     assert app.running is False and app.stopping is False
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
@@ -1002,13 +1077,14 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
 def test_stopping_then_failing_restores_the_controls(app, monkeypatch):
     """停止中撞上运行失败：除弹窗外按钮与状态行也要完整复位（messagebox 换替身，别弹真框）。"""
     monkeypatch.setattr(g, "messagebox", FakeBox())
-    app.connect_state = "connected"
+    app._states[app._selected_account_id]["connect_state"] = "connected"
     app.running = True
     app._begin_run_ui()
     app._on_stop()
     assert app.stopping is True
 
-    app.events.put(("run_failed", "boom"))
+    app.events.put(("account_failed", app._selected_account_id, "boom"))
+    app.events.put(("batch_done", False, [("主账户", "boom")]))
     pump(app)
     assert app.running is False and app.stopping is False
     assert app._run_spinner_job is None
@@ -1071,8 +1147,9 @@ def test_row_selection_clears_on_click_outside(app):
     """
     app._clear_message_rows()
     for i in range(1, 4):
-        app.events.put(("message", _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
-                                            size=100, msg_id=f"<{i}@y>")))
+        app.events.put(("message", app._selected_account_id,
+                        _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
+                                 size=100, msg_id=f"<{i}@y>")))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 3, len(ids)
@@ -1108,8 +1185,8 @@ def test_row_selection_clears_on_click_outside(app):
     click(app, app.tree, 30, head_y)
     assert app.tree.selection() == (), app.tree.selection()
 
-    # 点列表外的控件（配置区输入框、文件夹面板空白与其滚条）：同样清空
-    for target in (app.user_entry, app.folder_canvas, app.folder_scroll):
+    # 点列表外的控件（账户信息卡、文件夹面板空白与其滚条）：同样清空
+    for target in (app.card_root_label, app.folder_canvas, app.folder_scroll):
         app.tree.selection_set(ids[0])
         click(app, target)
         assert app.tree.selection() == (), (target, app.tree.selection())
@@ -1230,11 +1307,9 @@ def test_mail_column_config_loads_only_complete_valid_widths(app, monkeypatch, t
 
 
 def test_mail_column_config_save_is_atomic_and_persists_user_config(app, monkeypatch, tmp_path):
-    """config 节与列宽/窗口同一原子写：5 个明文字段 + DPAPI 密文密码，明文不出现在文件里。"""
+    """列宽/窗口/账户同一原子写：写盘失败时设置文件保持旧内容、界面不受影响。"""
     config = tmp_path / "treeview-columns.json"
     monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
-    app.user_var.set("alice@example.com")
-    app.password_var.set("sëcret秘")
     app._save_column_config()
     assert app._column_config_loaded
     saved = json.loads(config.read_text(encoding="utf-8"))
@@ -1242,21 +1317,15 @@ def test_mail_column_config_save_is_atomic_and_persists_user_config(app, monkeyp
     assert saved["columns"] == {
         name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
     assert "window" in saved
-    section = saved["config"]
-    assert section["user"] == "alice@example.com"
-    assert section["port"] == app.port_var.get()
-    assert section["ssl"] == bool(app.ssl_var.get())
-    if sys.platform == "win32":
-        assert g._dpapi_decrypt(section["password_dpapi"]) == "sëcret秘"
-    else:
-        assert "password_dpapi" not in section, "非 Windows 不持久化密码"
-    assert "sëcret秘" not in config.read_text(encoding="utf-8")
+    assert saved["accounts"] and saved["accounts"][0]["user"] == current_account(app)["user"]
     before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
+    stored_before = config.read_text(encoding="utf-8")
     warnings = []
     monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
     monkeypatch.setattr(g.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("nope")))
     app._save_column_config()
     assert {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]} == before
+    assert config.read_text(encoding="utf-8") == stored_before, "写盘失败不得覆盖仍可读的旧文件"
     assert warnings
 
 
@@ -1376,79 +1445,6 @@ def test_mail_columns_expand_proportionally_when_window_grows(app, monkeypatch):
     assert sum(after.values()) <= 1600
 
 
-def test_entry_context_menu_has_three_actions(app, monkeypatch):
-    """五个输入框共用一张右键菜单：剪切/复制/粘贴，动作与快捷键同一路径；不含全选，密码框一视同仁。
-
-    菜单的 tk_popup 在测试里必须换替身：真菜单会 grab，没前台窗口的 runner 会悬死。
-    """
-    assert [app._entry_menu.entrycget(i, "label") for i in range(app._entry_menu.index("end") + 1)] == [
-        g.MENU_CUT_LABEL, g.MENU_COPY_LABEL, g.MENU_PASTE_LABEL]
-    for entry in (app.user_entry, app.server_entry, app.port_entry, app.password_entry, app.outdir_entry):
-        assert entry.bind("<Button-3>"), entry
-
-    popups = stub_popup(monkeypatch, app._entry_menu)
-    app.user_var.set("alice@example.com")
-    app.user_entry.select_range(0, "end")
-    app.user_entry.event_generate("<Button-3>", x=5, y=5)
-    app.root.update()
-    assert len(popups) == 1, popups
-    assert str(app._entry_menu_target) == str(app.user_entry)
-    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "normal"
-
-    # 剪切与粘贴走 Entry 的 <<Cut>>/<<Paste>> 类绑定，与 Ctrl+X/V 完全同效
-    app._entry_edit("<<Cut>>")
-    app.root.update()
-    assert app.user_entry.get() == "", app.user_entry.get()
-    assert app.root.clipboard_get() == "alice@example.com"
-    app._entry_edit("<<Paste>>")
-    app.root.update()
-    assert app.user_entry.get() == "alice@example.com"
-
-    # 密码框与普通输入框同菜单同路径；复制走 Tk 原生 <<Copy>>。探针实测（Tk 8.6.12，issues/13）：
-    # show="*" 的选区按显示形态导出——复制到的是星号，不是明文；框里存的仍是明文
-    app.password_var.set("hunter2")
-    app._entry_menu_target = app.password_entry
-    app.password_entry.select_range(0, "end")
-    app._entry_edit("<<Copy>>")
-    app.root.update()
-    assert app.root.clipboard_get() == "*" * len("hunter2"), app.root.clipboard_get()
-    assert app.password_entry.get() == "hunter2"
-
-
-def test_entry_context_menu_items_grey_out(app, monkeypatch):
-    """灰化口径：无选区剪切/复制灰；剪贴板为空或控件被禁用（备份运行中）时粘贴灰。"""
-    app._entry_menu_target = app.user_entry
-    app.user_entry.select_range(0, "end")
-
-    # 空剪贴板用替身触发真实的 TclError 分支，不动系统剪贴板
-    def no_text():
-        raise tk.TclError("CLIPBOARD clipboard is empty or has no text")
-
-    monkeypatch.setattr(app.root, "clipboard_get", no_text)
-    app._refresh_entry_menu_state(app.user_entry)
-    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "normal"
-    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
-
-    monkeypatch.undo()
-    app.root.clipboard_append("剪贴板内容")
-    app.root.update()
-    app._refresh_entry_menu_state(app.user_entry)
-    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "normal"
-
-    app.user_entry.select_clear()
-    app._refresh_entry_menu_state(app.user_entry)
-    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
-    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
-
-    # 备份运行中配置区整片禁用（走真实路径 _set_config_enabled）：三项全灰
-    app._set_config_enabled(False)
-    app._refresh_entry_menu_state(app.user_entry)
-    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
-    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
-    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
-    app._set_config_enabled(True)
-
-
 def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
     """邮件列表右键：行上弹「复制」并复制所在单元格（点哪列复制哪格）；空白与列标题不弹。
 
@@ -1461,7 +1457,8 @@ def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
 
     app._clear_message_rows()
     for i in range(1, 3):
-        app.events.put(("message", _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>")))
+        app.events.put(("message", app._selected_account_id,
+                        _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>")))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 2, ids
@@ -1606,11 +1603,14 @@ def test_entry_focus_clears_on_click_outside(app, monkeypatch):
             yield from walk(child)
 
     label = next(w for w in walk(app.root)
-                 if isinstance(w, tk.Label) and w.cget("text") == "帐号：")
+                 if isinstance(w, tk.Label) and w.cget("text") == "邮箱地址：")
+    entry = app._account_form_entries[1]
+    other_entry = app._account_form_entries[2]
 
     app._clear_message_rows()
     for i in range(1, 3):
-        app.events.put(("message", _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>")))
+        app.events.put(("message", app._selected_account_id,
+                        _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>")))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 2, len(ids)
@@ -1628,60 +1628,60 @@ def test_entry_focus_clears_on_click_outside(app, monkeypatch):
             click(app, target, x, y)
         assert len(asked) == before + 1, (target, "处理器应把焦点收归主窗口")
         # 前台在：立即落到主窗口；被抢前台：请求被推迟、focus_get() 仍停在输入框
-        assert focus_path() in (str(app.root), str(app.user_entry)), (target, focus_path())
+        assert focus_path() in (str(app.root), str(entry)), (target, focus_path())
 
     # 点不可聚焦的标签：选中与焦点一次点击各归各位
     app.tree.selection_set(ids[0])
-    app.user_entry.focus_force()
+    entry.focus_force()
     app.root.update()
-    assert focus_path() == str(app.user_entry), focus_path()
+    assert focus_path() == str(entry), focus_path()
     click_expecting_clear(label)
     assert app.tree.selection() == (), app.tree.selection()
 
     # 文件夹面板空白与其滚条：同为「别处」，焦点同样收归主窗口
     for target in (app.folder_canvas, app.folder_scroll):
-        app.user_entry.focus_force()
+        entry.focus_force()
         app.root.update()
         click_expecting_clear(target)
 
     # 点输入框自身：正常编辑焦点保持，且不该发收归请求
-    app.user_entry.focus_force()
+    entry.focus_force()
     app.root.update()
     before = len(asked)
-    click(app, app.user_entry, 5, 5)
+    click(app, entry, 5, 5)
     assert len(asked) == before, "点输入框自身不该发收归请求"
-    assert focus_path() == str(app.user_entry), focus_path()
+    assert focus_path() == str(entry), focus_path()
     # 点另一个输入框：类绑定自然转移，本入口不许抢占（前台被抢时类绑定的请求也会被推迟）
-    click(app, app.server_entry, 5, 5)
+    click(app, other_entry, 5, 5)
     assert len(asked) == before, "点另一个输入框时焦点归类绑定，本入口不插手"
-    assert focus_path() in (str(app.server_entry), str(app.user_entry)), focus_path()
+    assert focus_path() in (str(other_entry), str(entry)), focus_path()
 
-    # 备份运行中配置区整片禁用：禁用输入框不接焦点（探针实测，issues/14），
-    # 点它不算「点了那个框」，旧焦点同样要收走，不能滞留在框里
-    app._set_config_enabled(False)
-    app.user_entry.focus_force()
+    # 禁用输入框不接焦点（探针实测，issues/14），点它不算「点了那个框」，
+    # 旧焦点同样要收走，不能滞留在框里
+    other_entry["state"] = "disabled"
+    entry.focus_force()
     app.root.update()
-    assert focus_path() == str(app.user_entry), focus_path()
-    click_expecting_clear(app.server_entry, 5, 5)
-    app._set_config_enabled(True)
+    assert focus_path() == str(entry), focus_path()
+    click_expecting_clear(other_entry, 5, 5)
+    other_entry["state"] = "normal"
 
     # 点邮件列表（列标题区域）：Treeview 类绑定拿焦点，本入口不插手。
     # 列表页签要摆到前台：上一用例把 notebook 留在了日志页签，不可映射的控件拿不到焦点
     app.notebook.select(app.list_tab)
     app.root.update()
-    app.user_entry.focus_force()
+    entry.focus_force()
     app.root.update()
     before = len(asked)
     click(app, app.tree, 30, 2)
     got = focus_path()
-    assert got in (str(app.tree), str(app.user_entry)), got
-    if got == str(app.user_entry):
+    assert got in (str(app.tree), str(entry)), got
+    if got == str(entry):
         # 前台被抢、类绑定的 focus 请求被推迟时，处理器会补发一次收归主窗口的请求
         assert len(asked) > before, "焦点停在输入框时应补发收归请求"
 
     # 例外：邮件列表自己的滚条——滚动查看时的点击，选中与焦点都保持，也不发收归请求
     app.tree.selection_set(ids[0])
-    app.user_entry.focus_force()
+    entry.focus_force()
     app.root.update()
     before = len(asked)
     app.tree_scroll.event_generate("<Button-1>")
@@ -1689,99 +1689,460 @@ def test_entry_focus_clears_on_click_outside(app, monkeypatch):
     app.root.update()
     assert len(asked) == before, "点列表滚条不该发收归请求"
     assert app.tree.selection() == (ids[0],), app.tree.selection()
-    assert focus_path() == str(app.user_entry), focus_path()
+    assert focus_path() == str(entry), focus_path()
 
     app.root.focus_set()  # 收尾：不把聚焦与选中态留给后续用例
     app.tree.selection_set()
 
 
-def _reset_config_vars(app):
-    """把配置区输入框还给出厂状态（本模块用例共享同一个 app，顺序有意义）。"""
-    for var, value in ((app.user_var, ""), (app.server_var, ""), (app.port_var, "993"),
-                       (app.outdir_var, str(g.Path.home() / "邮箱备份")), (app.password_var, "")):
-        var.set(value)
-    app.ssl_var.set(True)
-    app._port_touched = False
-
-
-def test_user_config_save_and_restore_round_trip(app, monkeypatch, tmp_path):
-    """save → 重读 → restore：6 字段全数回到输入框；恢复出的端口挡住 SSL 联动。"""
+def test_accounts_save_and_restore_round_trip(app, monkeypatch, tmp_path):
+    """save → 重读：账户各字段、密码密文、全局备份位置与选中账户都在；明文不落盘。"""
     config = tmp_path / "treeview-columns.json"
     monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
-    app.user_var.set("bob@example.com")
-    app.server_var.set("imap.corp.com")
-    app.ssl_var.set(False)
-    app.port_var.set("1143")
-    app.outdir_var.set("D:\\bob 备份")
-    app.password_var.set("密päss")
+    account = current_account(app)
+    account.update({"name": "公司", "user": "bob@example.com", "server": "imap.corp.com",
+                    "ssl": False, "port": "1143", "folders": ["INBOX"], "mbox": True, "eml": False})
+    if DPAPI_OK:
+        account["password_dpapi"] = g._dpapi_encrypt("密päss")
+    load_folders(app, NAMES)     # 勾选按账户记录恢复：INBOX 在树上就是勾上的
+    assert row_by(app, "INBOX")["var"].get()
+    app.backup_root_var.set("D:\\bob 备份")
     app._save_column_config()
+    assert app._column_config_loaded
 
-    _reset_config_vars(app)  # 模拟重启：输入框回到出厂值，再重新读盘恢复
-    app._ui_settings = app._read_ui_settings()
-    app._restore_user_config()
-    assert app.user_var.get() == "bob@example.com"
-    assert app.server_var.get() == "imap.corp.com"
-    assert app.ssl_var.get() is False
-    assert app.port_var.get() == "1143"
-    assert app.outdir_var.get() == "D:\\bob 备份"
-    if sys.platform == "win32":
-        assert app.password_var.get() == "密päss"
-    else:
-        assert app.password_var.get() == "", "非 Windows 不恢复密码"
-
-    assert app._port_touched, "恢复出的端口应视为用户确认过的值"
-    app.ssl_var.set(True)
-    app._on_ssl_toggle()
-    assert app.port_var.get() == "1143", "SSL 联动不许盖掉持久化的端口"
-
-    app.password_var.set("")  # 空密码不落盘：文件里连键都不留
-    app._save_column_config()
     saved = json.loads(config.read_text(encoding="utf-8"))
-    assert "password_dpapi" not in saved["config"], saved["config"]
+    assert saved["version"] == g.UI_SETTINGS_VERSION
+    assert saved["backup_root"] == "D:\\bob 备份"
+    assert saved["selected_account"] == account["id"]
+    record = saved["accounts"][0]
+    assert (record["name"], record["user"], record["server"]) == ("公司", "bob@example.com", "imap.corp.com")
+    assert record["ssl"] is False and record["port"] == "1143"
+    assert record["mbox"] is True and record["eml"] is False
+    assert record["folders"] == ["INBOX"]
+    if DPAPI_OK:
+        assert g._dpapi_decrypt(record["password_dpapi"]) == "密päss"
+        assert "密päss" not in config.read_text(encoding="utf-8"), "明文密码不落盘"
 
-    if sys.platform == "win32":  # 加密真失败：键缺席 + 记一条警告，其余字段照常
-        warnings = []
-        monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
-        monkeypatch.setattr(g, "_dpapi_encrypt", lambda _text: None)
-        app.password_var.set("存不下")
-        app._save_column_config()
-        saved = json.loads(config.read_text(encoding="utf-8"))
-        assert "password_dpapi" not in saved["config"], saved["config"]
-        assert saved["config"]["user"] == "bob@example.com"
-        assert warnings
+    # 重读（等价于重启后的解析）：字段逐个回到账户记录
+    reloaded = app._read_ui_settings()
+    assert reloaded["backup_root"] == "D:\\bob 备份"
+    assert reloaded["selected_account"] == account["id"]
+    parsed = reloaded["accounts"][0]
+    assert (parsed["name"], parsed["user"], parsed["server"], parsed["port"]) == (
+        "公司", "bob@example.com", "imap.corp.com", "1143")
+    assert parsed["ssl"] is False and parsed["mbox"] is True and parsed["eml"] is False
+    assert parsed["folders"] == ["INBOX"]
+    if DPAPI_OK:
+        assert g._dpapi_decrypt(parsed["password_dpapi"]) == "密päss"
 
-    _reset_config_vars(app)
+    # 写盘失败：设置文件保持上一份可读内容，界面不受影响
+    before = config.read_text(encoding="utf-8")
+    warnings = []
+    monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(g.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("nope")))
+    app._save_column_config()
+    assert warnings
+    assert config.read_text(encoding="utf-8") == before
+
+    # 收尾：把共享实例还原成用例链后续需要的状态
+    monkeypatch.undo()
+    account.update({"name": "主账户", "user": V["user"], "server": V["server"], "ssl": True, "port": "993",
+                    "folders": [], "mbox": False, "eml": True})
+    if DPAPI_OK:
+        account["password_dpapi"] = g._dpapi_encrypt(V["password"])
+    app.backup_root_var.set(g.DEFAULT_BACKUP_ROOT)
+    app._refresh_account_list()
+    app._render_account_detail()
 
 
-def test_user_config_restore_tolerates_bad_data(app, monkeypatch):
-    """坏节/坏字段逐个跳过：整节非 dict 只警告；坏类型字段回退默认；坏密文当没存过。"""
+def test_accounts_v1_settings_migrate_to_accounts(app, monkeypatch, tmp_path):
+    """v1（单账号 config 节）迁到 v2：账号成列表首项，outdir 变 backup_root，其余节保留。"""
+    config = tmp_path / "treeview-columns.json"
+    widths = {name: int(app.tree.column(name, "minwidth")) + 21 for name in app.tree["columns"]}
+    legacy = {
+        "version": 1,
+        "columns": widths,
+        "window": {"normal_geometry": {"width": 900, "height": 700, "x": 20, "y": 30}, "maximized": False},
+        g.CLOSE_ACTION_KEY: g.CLOSE_ACTION_TRAY,
+        "config": {"user": "old@example.com", "server": "imap.old.com", "ssl": False, "port": "1143",
+                   "outdir": "E:\\旧备份"},
+    }
+    if DPAPI_OK:
+        legacy["config"]["password_dpapi"] = g._dpapi_encrypt("旧密码")
+    config.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
+
+    parsed = app._read_ui_settings()
+    assert parsed["version"] == g.UI_SETTINGS_VERSION
+    assert parsed["columns"] == widths
+    assert parsed["backup_root"] == "E:\\旧备份"
+    assert parsed[g.CLOSE_ACTION_KEY] == g.CLOSE_ACTION_TRAY
+    assert parsed["window"] == legacy["window"]
+    assert len(parsed["accounts"]) == 1
+    account = parsed["accounts"][0]
+    assert account["user"] == "old@example.com" and account["server"] == "imap.old.com"
+    assert account["ssl"] is False and account["port"] == "1143"
+    assert account["folders"] == [] and account["mbox"] is False and account["eml"] is True
+    assert parsed["selected_account"] == account["id"]
+    if DPAPI_OK:
+        assert g._dpapi_decrypt(account["password_dpapi"]) == "旧密码"
+
+    # 坏 config 节：不造账户，其余节照常
+    legacy["config"] = "nope"
+    config.write_text(json.dumps(legacy), encoding="utf-8")
+    parsed = app._read_ui_settings()
+    assert parsed["accounts"] == [] and parsed["selected_account"] is None
+    assert parsed["columns"] == widths
+
+
+def test_accounts_restore_tolerates_bad_records(app, monkeypatch, tmp_path):
+    """账户列表的坏项逐个跳过：非列表整节丢弃；缺 id / 类型不符按字段降级。"""
+    config = tmp_path / "treeview-columns.json"
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", config)
     warnings = []
     monkeypatch.setattr(app.log, "warning", lambda *args: warnings.append(args))
 
-    app._ui_settings = {"version": g.UI_SETTINGS_VERSION, "config": "nope"}
-    app._restore_user_config()
-    assert warnings
-    assert app.user_var.get() == "", app.user_var.get()  # 上一个用例已复位出厂值
+    config.write_text(json.dumps({"version": g.UI_SETTINGS_VERSION, "accounts": "nope"}), encoding="utf-8")
+    parsed = app._read_ui_settings()
+    assert parsed["accounts"] == [] and warnings
 
     warnings.clear()
-    app._ui_settings = {"version": g.UI_SETTINGS_VERSION,
-                        "config": {"user": 42, "server": "imap.ok.com", "ssl": "yes",
-                                   "port": 993, "outdir": "好的目录"}}
-    app._restore_user_config()
-    assert app.user_var.get() == ""               # 非字符串，跳过该字段
-    assert app.server_var.get() == "imap.ok.com"
-    assert app.ssl_var.get() is True              # "yes" 不是 bool，保持默认
-    assert app.port_var.get() == "993"            # int 不是 str，保持默认
-    assert app.outdir_var.get() == "好的目录"
+    config.write_text(json.dumps({
+        "version": g.UI_SETTINGS_VERSION,
+        "backup_root": 42,
+        "accounts": [
+            {"user": "no-id@example.com"},                       # 缺稳定 id：跳过
+            {"id": "keep", "user": 42, "server": "imap.ok.com", "ssl": "yes", "port": 993,
+             "folders": ["INBOX", 7, ""], "mbox": "yes"},
+        ],
+    }), encoding="utf-8")
+    parsed = app._read_ui_settings()
+    assert parsed["backup_root"] is None                      # 非字符串回退默认
+    assert len(parsed["accounts"]) == 1
+    account = parsed["accounts"][0]
+    assert account["user"] == ""                              # 非字符串，回落默认
+    assert account["server"] == "imap.ok.com"
+    assert account["ssl"] is True                             # "yes" 不是 bool，回落默认
+    assert account["port"] == g.DEFAULT_ACCOUNT_PORT          # int 不是 str，回落默认
+    assert account["folders"] == ["INBOX"]                    # 只留非空字符串
+    assert account["mbox"] is False                           # "yes" 不是 bool，回落默认
+    assert parsed["selected_account"] == "keep"               # 选中的就是留下的那个
 
-    # 坏密文：base64 损坏与解不开（合法 base64 但不是 DPAPI 密文）都视为没存过，各警告一次；
-    # 非字符串的 password_dpapi 静默跳过（不警告、不动密码框）
-    warnings.clear()
-    for blob in ("!!!not-base64!!!", "AAAA", 42):
-        app._ui_settings = {"version": g.UI_SETTINGS_VERSION,
-                            "config": {"password_dpapi": blob}}
-        app._restore_user_config()
-    assert app.password_var.get() == ""
-    assert len(warnings) == 2, warnings
 
-    _reset_config_vars(app)
+def test_backup_detail_has_no_entry_widgets(app):
+    """备份详情页没有输入框：连接信息与备份地址都是只读信息卡（用户口径）。"""
+    def walk(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from walk(child)
+
+    entries = [w for w in walk(app.backup_page) if isinstance(w, tk.Entry)]
+    assert entries == [], entries
+    assert current_account(app) is not None
+    assert app.card_root_label.cget("text") == app.backup_root_var.get().strip()
+    assert app._card_labels["password"].cget("text") in (g.PASSWORD_SAVED_TEXT, g.PASSWORD_MISSING_TEXT)
+
+
+def test_format_checkboxes_are_per_account(app):
+    """格式复选框按账户独立：切到另一个账户看到的是它自己的勾选。"""
+    first = current_account(app)
+    app.mbox_var.set(True)
+    app.eml_var.set(False)
+    app._on_format_change()
+    assert first["mbox"] is True and first["eml"] is False
+
+    second = g.new_account()
+    second.update({"name": "第二账户", "user": "second@example.com", "server": "imap.second.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._switch_account(second["id"])
+    assert app.mbox_var.get() is False and app.eml_var.get() is True   # 新账户默认 mbox 关、eml 开
+    assert app.card_root_label.cget("text") == app.backup_root_var.get().strip()
+
+    app._switch_account(first["id"])
+    assert app.mbox_var.get() is True and app.eml_var.get() is False   # 切回来还是它自己的勾选
+    assert app._card_labels["user"].cget("text") == first["user"]
+
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+
+
+def test_account_rows_are_gray_until_selected(app):
+    """行底色：未选中是对话框灰（不再是 Listbox 的白底），选中那行整行系统高亮蓝（用户口径）。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "灰底对照", "user": "gray@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._switch_account(first["id"])
+
+    def paint(account_id):
+        row = app._account_rows[account_id]
+        return {"row_bg": row["frame"].cget("background"), "label_bg": row["label"].cget("background"),
+                "label_fg": row["label"].cget("foreground"), "check_bg": row["check"].cget("background")}
+
+    def selected():   # 整行同色，含复选框：不然在蓝行上按它会闪出灰方块
+        return {"row_bg": g.ACCOUNT_ROW_SELECTED_BG, "label_bg": g.ACCOUNT_ROW_SELECTED_BG,
+                "label_fg": g.ACCOUNT_ROW_SELECTED_FG, "check_bg": g.ACCOUNT_ROW_SELECTED_BG}
+
+    def plain():
+        return {"row_bg": g.ACCOUNT_ROW_BG, "label_bg": g.ACCOUNT_ROW_BG,
+                "label_fg": g.ACCOUNT_ROW_FG, "check_bg": g.ACCOUNT_ROW_BG}
+
+    assert paint(first["id"]) == selected()
+    assert paint(second["id"]) == plain()
+
+    app.root.update()   # 合成点击前先让新行落地：控件还没映射时事件不会派发
+    click(app, app._account_rows[second["id"]]["label"])
+    assert app._selected_account_id == second["id"]
+    assert paint(second["id"]) == selected()
+    assert paint(first["id"]) == plain()
+
+    app._switch_account(first["id"])
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+
+
+def test_account_checkboxes_are_independent_of_selection(app):
+    """复选框与选中是两件事：翻勾选不切详情、点行不改勾选；全选/反选/清空只作用在勾选上。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "勾选对照", "user": "check@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()                # 新账户默认勾上（勾是默认态）
+    app._switch_account(first["id"])
+    assert app._account_rows[second["id"]]["var"].get()
+
+    assert app._checked_accounts == {first["id"], second["id"]}
+    app._account_rows[second["id"]]["check"].invoke()
+    assert second["id"] not in app._checked_accounts
+    assert app._selected_account_id == first["id"]      # 翻勾选不切详情
+
+    app.root.update()   # 合成点击前先让行落地：控件还没映射时事件不会派发
+    click(app, app._account_rows[second["id"]]["label"])
+    assert app._selected_account_id == second["id"]
+    assert second["id"] not in app._checked_accounts    # 点行不改勾选
+
+    app._set_all_account_checks(True)
+    assert app._checked_accounts == {first["id"], second["id"]}
+    assert all(row["var"].get() for row in app._account_rows.values())
+
+    app._invert_account_checks()
+    assert app._checked_accounts == set()
+    assert not any(row["var"].get() for row in app._account_rows.values())
+
+    app._invert_account_checks()
+    assert app._checked_accounts == {first["id"], second["id"]}
+
+    app._set_all_account_checks(False)
+    assert app._checked_accounts == set()
+    app._refresh_account_list()                # 重画列表不会把用户取消的勾选又补回来
+    assert app._checked_accounts == set()
+
+    app._switch_account(first["id"])
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+    assert app._checked_accounts == set()               # 删掉的账户不再占勾选
+    app._set_all_account_checks(True)                   # 交还给模块时恢复默认全勾
+    assert app._checked_accounts == {first["id"]}
+
+
+def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
+    """「备份所选」只跑勾选的账户；一个都没勾时只提示、不进运行态。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "不选它", "user": "skip@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._switch_account(first["id"])
+
+    started: list[list[str]] = []
+    monkeypatch.setattr(app, "_begin_run", started.append)
+    monkeypatch.setattr(app, "_account_credentials", lambda account, warn=True: {"server": "s"})
+    monkeypatch.setattr(app, "_backup_root_ready", lambda: True)
+    box = FakeBox()
+    monkeypatch.setattr(g, "messagebox", box)
+
+    app._set_all_account_checks(False)
+    app._on_start_selected()
+    assert started == []                                    # 一个都没勾：不进运行态
+    assert box.warnings and box.warnings[-1][0] == "未勾选账户"
+
+    box.warnings.clear()
+    app._account_rows[second["id"]]["var"].set(False)
+    app._account_rows[first["id"]]["var"].set(True)
+    app._sync_account_checks()
+    app._on_start_selected()
+    assert started == [[first["id"]]]                        # 只跑勾上的那一个
+    assert box.warnings == []
+
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+    assert app._checked_accounts == {first["id"]}
+
+
+def test_batch_worker_runs_accounts_in_order_and_isolates_failures(app, monkeypatch):
+    """批量串行：按列表顺序逐个跑，单个账户失败不影响其余；停止后不再开新账户。"""
+    first = g.new_account()
+    first.update({"name": "甲", "user": "a@example.com", "server": "imap.example.com", "password": "p"})
+    second = g.new_account()
+    second.update({"name": "乙", "user": "b@example.com", "server": "imap.example.com", "password": "p"})
+    third = g.new_account()
+    third.update({"name": "丙", "user": "c@example.com", "server": "imap.example.com", "password": "p"})
+    calls: list[str] = []
+
+    def fake_backup(account, outdir, eq, log):
+        calls.append(account["id"])
+        if account["id"] == second["id"]:
+            raise RuntimeError("boom")
+        eq.put(("account_done", account["id"], 1, 0, 0.5, False, 1))
+
+    monkeypatch.setattr(app, "_backup_account", fake_backup)
+    snapshots = [{"id": a["id"], "user": a["user"], "server": a["server"], "password": "p",
+                  "ssl": True, "port": "993", "folders": [], "mbox": False, "eml": True,
+                  "name": a["name"]}
+                 for a in (first, second, third)]
+    app.stop_flag.clear()
+    app._batch_worker(snapshots, "D:\\out")
+    assert calls == [first["id"], second["id"], third["id"]]
+
+    events = []
+    while True:
+        try:
+            events.append(app.events.get_nowait())
+        except g.queue.Empty:
+            break
+    kinds = [e[0] for e in events if e[0] != "log"]
+    assert kinds == ["account_begin", "account_done", "account_begin", "account_failed",
+                     "account_begin", "account_done", "batch_done"]
+    assert events[-1][2] == [("乙", "RuntimeError: boom")]
+
+    # 停止后：剩下的账户只收到 account_skipped，不再发起备份
+    calls.clear()
+    app.stop_flag.set()
+    app._batch_worker(snapshots, "D:\\out")
+    app.stop_flag.clear()
+    assert calls == []
+    events = []
+    while True:
+        try:
+            events.append(app.events.get_nowait())
+        except g.queue.Empty:
+            break
+    kinds = [e[0] for e in events if e[0] != "log"]
+    assert kinds == ["account_skipped", "account_skipped", "account_skipped", "batch_done"]
+
+
+def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, tmp_path):
+    """账号目录名取邮箱地址（ADR 0002），账户名称只是显示名、不参与输出路径（ADR 0010）。"""
+    account = {"id": "acc-dir", "name": "工作邮箱", "user": "a@example.com", "server": "imap.example.com",
+               "ssl": True, "port": "993", "password": "p", "folders": ["INBOX"], "mbox": True, "eml": False}
+    scanned: dict = {}
+
+    class FakeServer:
+        def select(self, *_args, **_kwargs):
+            return "OK", b""
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: FakeServer())
+    monkeypatch.setattr(g.core, "get_names",
+                        lambda *a, **k: [("INBOX", "INBOX.mbox", "INBOX", "INBOX")])
+    monkeypatch.setattr(g.core, "scan_folder", lambda *a, **k: {"<m@x>": 1})
+
+    def fake_scan_file(label, *_a, **_k):
+        scanned["label"] = label
+        return {}
+
+    monkeypatch.setattr(g.core, "scan_file", fake_scan_file)
+    monkeypatch.setattr(g.core, "scan_eml_dir", lambda *a, **k: {})
+    monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
+    monkeypatch.setattr(g.core, "create_folder_structure",
+                        lambda names, basedir, account: scanned.setdefault("dir", account))
+    monkeypatch.setattr(g.core, "download_messages", lambda *a, **k: None)
+
+    app.stop_flag.clear()
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"))
+    assert scanned["dir"] == "a@example.com", scanned
+    assert scanned["label"] == "a@example.com/INBOX.mbox", scanned
+    assert "工作邮箱" not in str(scanned)
+
+
+def test_entry_context_menu_has_three_actions(app, monkeypatch):
+    """账户表单输入框共用一张右键菜单：剪切/复制/粘贴，动作与快捷键同一路径；不含全选。"""
+    assert [app._entry_menu.entrycget(i, "label") for i in range(app._entry_menu.index("end") + 1)] == [
+        g.MENU_CUT_LABEL, g.MENU_COPY_LABEL, g.MENU_PASTE_LABEL]
+    for entry in [*app._account_form_entries, app.backup_root_entry]:
+        assert entry.bind("<Button-3>"), entry
+
+    popups = stub_popup(monkeypatch, app._entry_menu)
+    app._acct_user_var.set("alice@example.com")
+    app._account_form_entries[1].select_range(0, "end")
+    app._account_form_entries[1].event_generate("<Button-3>", x=5, y=5)
+    app.root.update()
+    assert len(popups) == 1, popups
+    assert str(app._entry_menu_target) == str(app._account_form_entries[1])
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "normal"
+
+    # 剪切与粘贴走 Entry 的 <<Cut>>/<<Paste>> 类绑定，与 Ctrl+X/V 完全同效
+    app._entry_edit("<<Cut>>")
+    app.root.update()
+    assert app._account_form_entries[1].get() == "", app._account_form_entries[1].get()
+    assert app.root.clipboard_get() == "alice@example.com"
+    app._entry_edit("<<Paste>>")
+    app.root.update()
+    assert app._account_form_entries[1].get() == "alice@example.com"
+
+    # 密码框与普通输入框同菜单同路径；复制走 Tk 原生 <<Copy>>。探针实测（Tk 8.6.12，issues/13）：
+    # show="*" 的选区按显示形态导出——复制到的是星号，不是明文；框里存的仍是明文
+    app._acct_password_var.set("hunter2")
+    app._entry_menu_target = app._acct_password_entry
+    app._acct_password_entry.select_range(0, "end")
+    app._entry_edit("<<Copy>>")
+    app.root.update()
+    assert app.root.clipboard_get() == "*" * len("hunter2"), app.root.clipboard_get()
+    assert app._acct_password_entry.get() == "hunter2"
+
+
+def test_entry_context_menu_items_grey_out(app, monkeypatch):
+    """灰化口径：无选区剪切/复制灰；剪贴板为空或控件被禁用时粘贴灰。"""
+    entry = app._account_form_entries[1]
+    app._entry_menu_target = entry
+    entry.select_range(0, "end")
+
+    # 空剪贴板用替身触发真实的 TclError 分支，不动系统剪贴板
+    def no_text():
+        raise tk.TclError("CLIPBOARD clipboard is empty or has no text")
+
+    monkeypatch.setattr(app.root, "clipboard_get", no_text)
+    app._refresh_entry_menu_state(entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "normal"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+
+    monkeypatch.undo()
+    app.root.clipboard_append("剪贴板内容")
+    app.root.update()
+    app._refresh_entry_menu_state(entry)
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "normal"
+
+    entry.select_clear()
+    app._refresh_entry_menu_state(entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+
+    # 禁用态的输入框（如运行中锁定的那种）：三项全灰，处理路径与真实禁用一致
+    entry["state"] = "disabled"
+    app._refresh_entry_menu_state(entry)
+    assert app._entry_menu.entrycget(g.MENU_CUT_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
+    assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
+    entry["state"] = "normal"

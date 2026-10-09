@@ -6,6 +6,10 @@ Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
  - Reuses imapbackup312 module-level functions (connect_and_login, get_names,
    scan_folder, scan_file, scan_eml_dir, pending_messages, download_messages);
    no core logic is copied.
+ - Accounts (name/address/server/SSL/port/DPAPI-encrypted password, folder and
+   format choices) live in the settings page; the backup page shows the selected
+   account's detail read-only and runs one account at a time, or all of them in
+   list order (ADR 0010). The account directory name is always the email address.
  - All IMAP work runs on a worker thread; UI updates flow through a queue polled
    by Tk's after() — widgets are never touched off the main thread.
  - Per-message rows come from the structured report dict; Stop uses the
@@ -13,8 +17,9 @@ Design decisions live in docs/adr/ and CONTEXT.md; the issue trail is under
  - The core's Spinner auto-disables and nospinner=True is passed anyway: nothing
    is ever written to stdout.
  - Logs go to %LOCALAPPDATA%\\imapbackup-gui\\log\\run-YYYY-MM-DD.log (daily file);
-   mail-list column widths go to the same app-data directory and are independently
-   removable by the uninstaller.
+   UI settings (column widths, window state, accounts and the shared backup root)
+   go to the same app-data directory and are independently removable by the
+   uninstaller.
 
 Original contributors (abridged): Rui Carmo and the upstream imapbackup
 contributors listed in imapbackup312.py.
@@ -39,6 +44,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import uuid
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -69,7 +75,7 @@ RUNNING_BTN_LABEL = "正在备份…"
 STOP_BTN_LABEL = "停止"
 STOPPING_BTN_LABEL = "正在停止…"  # 停止中：转圈挪到停止按钮上，开始按钮退回静止外观
 STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
-RUNNING_HINT_TEXT = "备份运行中，账户与服务器信息不可修改，请先停止"
+RUNNING_HINT_TEXT = "备份运行中，文件夹选择与输出格式不可修改，请先停止"
 STOPPING_HINT_TEXT = "备份正在停止，完成后即可修改"  # 已按过停止，再说「请先停止」就是过期信息
 
 # 加载动画：连接与备份共用同一套帧与节奏——用户要求两处的加载图标看起来一样。
@@ -106,7 +112,7 @@ LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封�
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui"
 COLUMN_CONFIG_PATH = APP_DATA_DIR / "treeview-columns.json"
 MAIL_COLUMNS = ("from", "subject", "when", "folder", "size")
-UI_SETTINGS_VERSION = 1
+UI_SETTINGS_VERSION = 2
 DEFAULT_WINDOW_WIDTH = 960
 DEFAULT_WINDOW_HEIGHT = 736
 MIN_WINDOW_WIDTH = 800
@@ -134,12 +140,43 @@ CLOSE_ACTION_LABELS = ((CLOSE_ACTION_ASK, "关闭窗口时询问我"),
                        (CLOSE_ACTION_TRAY, "关闭窗口时隐藏到托盘，继续在后台运行"),
                        (CLOSE_ACTION_EXIT, "关闭窗口时退出程序"))
 SETTINGS_WINDOW_SECTION = "window"
+SETTINGS_ACCOUNTS_SECTION = "accounts"
+SETTINGS_BACKUP_SECTION = "backup"
 # 设置页左栏分类表：(表键, 分类名)。加分类＝加一行 + 建一个详情 Frame（见 _build_settings_page）。
-SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = ((SETTINGS_WINDOW_SECTION, "窗口与后台"),)
+SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = ((SETTINGS_ACCOUNTS_SECTION, "账户"),
+                                                  (SETTINGS_BACKUP_SECTION, "备份"),
+                                                  (SETTINGS_WINDOW_SECTION, "窗口与后台"))
 SETTINGS_SECTION_LIST_WIDTH = 160   # 左分类栏固定宽度(px)：右栏吃掉剩余宽度
 PAGE_BACKUP = "backup"
 PAGE_SETTINGS = "settings"
 PAGE_LABELS = ((PAGE_BACKUP, "备份"), (PAGE_SETTINGS, "设置"))
+
+# 账户（多账户配置）：连接设置在设置页「账户」分类维护；备份页左列表 + 右只读详情。
+# 账户名称是纯显示名，不参与 <备份根>/<账号>/ 目录名生成（账号目录取邮箱地址，见 ADR 0002/0010）。
+ACCOUNT_LIST_WIDTH = 160            # 备份页左侧账户列表宽度(px)：与设置页左分类栏同宽
+ACCOUNT_LIST_TITLE = "账户"          # 备份页左侧列表的带标题边框（与「账户信息」卡同款）
+ACCOUNT_NAME_FALLBACK = "未命名账户"
+DEFAULT_ACCOUNT_SSL = True
+DEFAULT_ACCOUNT_PORT = "993"
+DEFAULT_BACKUP_ROOT = str(Path.home() / "邮箱备份")
+CARD_EMPTY_TEXT = "—"               # 未选中账户时只读信息卡的占位
+PASSWORD_SAVED_TEXT = "已保存"       # 密码行不回显任何明文或掩码位数
+PASSWORD_MISSING_TEXT = "未设置"
+# 账户行配色：底色取对话框灰（行是自绘控件，不再有 Listbox 的白底），选中行沿用系统高亮色，
+# 与原 Listbox 的选中蓝完全一致，且跟随系统主题。
+ACCOUNT_ROW_BG = "SystemButtonFace"
+ACCOUNT_ROW_FG = "SystemButtonText"
+ACCOUNT_ROW_SELECTED_BG = "SystemHighlight"
+ACCOUNT_ROW_SELECTED_FG = "SystemHighlightText"
+# 账户列表底部的批量入口按钮（勾选工具三格见 _build_accounts_pane）
+BACKUP_SELECTED_BTN_LABEL = "备份所选"
+QUEUED_STATUS_TEXT = "排队中…"
+CONNECTING_STATUS_TEXT = "正在连接…"
+ACCOUNTS_HINT_TEXT = ("在这里维护每个账户的连接信息；密码经系统加密后只保存在本机。\n"
+                      "账户名称只用于界面区分，备份目录始终按邮箱地址命名。")
+BACKUP_ROOT_HINT_TEXT = ("所有账户共用这一个备份位置；每个账户的备份分别保存在该位置下、"
+                         "以邮箱地址命名的目录里。")
+BACKUP_ROOT_SETTINGS_HINT = "（在设置页「备份」中修改）"
 
 # 托盘：图标只在窗口隐藏期间存在；tooltip 随备份是否运行切换
 TRAY_TOOLTIP_IDLE = "IMAP Backup GUI"
@@ -280,6 +317,75 @@ def decide_close(preference: str, *, hidden: bool) -> str:
     if preference == CLOSE_ACTION_EXIT:
         return "exit"
     return "ask"
+
+
+def new_account() -> dict:
+    """新建一个账户记录：除稳定 id 外都是默认值（还没有地址、服务器与密码）。"""
+    return {"id": uuid.uuid4().hex, "name": "", "user": "", "server": "",
+            "ssl": DEFAULT_ACCOUNT_SSL, "port": DEFAULT_ACCOUNT_PORT,
+            "folders": [], "mbox": False, "eml": True}
+
+
+def parse_account(raw: object) -> dict | None:
+    """校验并规范化一条持久化的账户记录。
+
+    Args:
+        raw: 设置文件 `accounts` 列表里的一项。
+
+    Returns:
+        规范化后的账户字典；缺少稳定 id（或根本不是字典）时返回 None，调用方跳过该账户。
+
+    Note:
+        id 之外按「单字段非法只跳过该字段」降级（ADR 0008 的容错风格）：类型不符回落默认值，
+        一条脏字段不该毁掉整个账户；`id` 是列表勾选、批量运行与事件分发的引用键，缺了就只能丢弃。
+    """
+    if not isinstance(raw, dict):
+        return None
+    account_id = raw.get("id")
+    if not isinstance(account_id, str) or not account_id:
+        return None
+    account = {"id": account_id,
+               "name": raw.get("name") if isinstance(raw.get("name"), str) else "",
+               "user": raw.get("user") if isinstance(raw.get("user"), str) else "",
+               "server": raw.get("server") if isinstance(raw.get("server"), str) else "",
+               "port": raw.get("port") if isinstance(raw.get("port"), str) else DEFAULT_ACCOUNT_PORT,
+               "ssl": raw.get("ssl") if isinstance(raw.get("ssl"), bool) else DEFAULT_ACCOUNT_SSL,
+               "mbox": raw.get("mbox") if isinstance(raw.get("mbox"), bool) else False,
+               "eml": raw.get("eml") if isinstance(raw.get("eml"), bool) else True,
+               "folders": []}
+    cipher = raw.get("password_dpapi")
+    if isinstance(cipher, str) and cipher:
+        account["password_dpapi"] = cipher
+    folders = raw.get("folders")
+    if isinstance(folders, list):
+        account["folders"] = [name for name in folders if isinstance(name, str) and name]
+    return account
+
+
+def account_record(account: dict) -> dict:
+    """账户 → 落盘记录：只保留已知字段，空密码连键都不写（与旧 config 节同一口径）。"""
+    record = {"id": account["id"],
+              "name": account.get("name", ""),
+              "user": account.get("user", ""),
+              "server": account.get("server", ""),
+              "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)),
+              "port": str(account.get("port", DEFAULT_ACCOUNT_PORT)),
+              "folders": [name for name in account.get("folders", []) if isinstance(name, str) and name],
+              "mbox": bool(account.get("mbox", False)),
+              "eml": bool(account.get("eml", True))}
+    cipher = account.get("password_dpapi")
+    if isinstance(cipher, str) and cipher:
+        record["password_dpapi"] = cipher
+    return record
+
+
+def account_display(account: dict) -> str:
+    """账户在界面上的显示名：自定义名称优先，其次邮箱地址，都空则用占位名。"""
+    for key in ("name", "user"):
+        value = account.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ACCOUNT_NAME_FALLBACK
 
 
 def _make_tray(events: queue.Queue[tuple], log: logging.Logger) -> imapbackup_tray.TrayHost | None:
@@ -440,7 +546,9 @@ def _dpapi_decrypt(cipher: str) -> str | None:
 
 
 class BackupApp:
-    """Single-window layout: config zones on top, Notebook (邮件列表/运行日志) below, status bar at the bottom."""
+    """Single-window layout: the backup page is an account list plus the selected account's
+    detail (read-only card, folder tree, Notebook 邮件列表/运行日志, status bar); the settings
+    page holds the accounts and the shared backup root."""
 
     def __init__(self) -> None:
         self.root = tk.Tk()
@@ -460,15 +568,29 @@ class BackupApp:
         self._ui_settings = self._read_ui_settings()
         self._normal_geometry = self._restore_window_settings()
 
+        # ---- accounts（多账户配置；accounts 与设置文件里的列表是同一个对象，改动即内存态）----
+        self.accounts: list[dict] = self._ui_settings.get("accounts") or []
+        self._ui_settings["accounts"] = self.accounts
+        selected = self._ui_settings.get("selected_account")
+        self._selected_account_id: str | None = selected if selected in {a["id"] for a in self.accounts} \
+            else (self.accounts[0]["id"] if self.accounts else None)
+        self._ui_settings["selected_account"] = self._selected_account_id
+        self.backup_root_var = tk.StringVar(value=self._ui_settings.get("backup_root") or DEFAULT_BACKUP_ROOT)
+        self._states: dict[str, dict] = {}      # 每账户独立状态（连接、文件夹树、邮件行、计数、进度）
+        self._editing_account_id: str | None = None
+        self._run_account_ids: list[str] = []   # 本次批量运行参与的账户（按运行顺序）
+        self._run_t0 = 0.0
+        # 左栏勾选（「备份所选」跑哪些账户）：纯界面态，不落盘；新建/读入的账户默认勾上
+        self._checked_accounts: set[str] = {account["id"] for account in self.accounts}
+        self._account_rows: dict[str, dict] = {}
+
         # ---- state ----
-        self.connect_state = "idle"  # idle | connecting | connected | stale
-        self._snapshot: tuple[str, str, str] | None = None  # (server, user, password) at connect time
+        self.connect_state = "idle"  # idle | connecting | connected | stale（当前可见账户的口径）
         self.running = False
         self.stopping = False  # 运行中的子阶段：已按停止、工作线程还在收尾（按钮与提示都跟着换口径）
         self.folder_rows: list[dict] = []
         self._folder_nodes: dict[tuple[str, ...], dict] = {}
         self._folder_clickables: list[tuple[tk.Label, str]] = []
-        self._port_touched = False
         self._spinner_job: str | None = None  # root.after id while the button shows a spinner
         self._run_spinner_job: str | None = None  # 同上，备份运行中的开始按钮
         self._config_widgets: list[tuple[tk.Widget, str]] = []
@@ -477,6 +599,7 @@ class BackupApp:
         self.backed_count = 0
         self._row_index = 0  # 邮件列表插入序号；清表归零，斑马纹按它的奇偶决定
         self._status_full = ""              # 状态行全文；status_var 里可能是它的截断形
+        self._status_error = False          # 状态行当前是否错误色（切账户时要跟着状态一起还原）
         self._count_full = "尚未开始备份"    # 计数行全文；count_var 同理
         self._fit_font: tkfont.Font | None = None  # 量字宽的缓存，两行标签同一默认字体
         self._tip: tk.Toplevel | None = None
@@ -501,13 +624,14 @@ class BackupApp:
         # 托盘宿主：非 Windows 或创建失败时为 None，关闭窗口选「隐藏到后台」会退化为最小化
         self._tray = _make_tray(self.events, self.log)
 
-        self._build_config_area()
-        self._restore_user_config()
-        self._build_run_area()
+        self._build_backup_page()
         self._build_settings_page()
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self._refresh_account_list()
+        self._refresh_edit_list(self.accounts[0]["id"] if self.accounts else None)
+        self._render_account_detail()
         self._apply_connect_state()
         self._update_start_state()
         self._show_page(PAGE_BACKUP)
@@ -549,8 +673,46 @@ class BackupApp:
         self._config_widgets.append((widget, str(widget.cget("state"))))
         return widget
 
-    def _build_config_area(self) -> None:
-        outer = tk.Frame(self.backup_page)
+    def _build_backup_page(self) -> None:
+        """备份页外壳：左侧账户列表 + 右侧账户备份详情（邮件客户端式主从布局）。"""
+        body = tk.Frame(self.backup_page)
+        body.pack(fill="both", expand=True)
+        pane = self._build_accounts_pane(body)
+        # 右边不留白：右侧内容区（配置区/运行区）自带 8px 内边距，这里再留一条就成了 16px，
+        # 比「账户信息」与「邮箱文件夹」之间那条 8px 明显宽一截。
+        pane.pack(side="left", fill="y", padx=(8, 0), pady=8)
+        right = tk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        self._build_config_area(right)
+        self._build_run_area(right)
+
+    def _build_accounts_pane(self, parent: tk.Frame) -> tk.LabelFrame:
+        """左侧账户列表：点选切换右侧详情，勾选决定「备份所选」跑哪些账户。
+
+        边框用带标题的 LabelFrame，与右栏「账户信息」卡同款；行是自绘的（复选框 + 名称），
+        一个控件只表达一件事——Listbox 一行放不下「点选切换」与「勾选备份」两个动作。
+        """
+        pane = self.account_pane = tk.LabelFrame(parent, text=ACCOUNT_LIST_TITLE)
+        pane.configure(width=ACCOUNT_LIST_WIDTH)
+        pane.pack_propagate(False)  # 固定宽：账户名再长也不挤动右栏（右栏吃剩余宽度）
+        self.account_list = tk.Frame(pane)
+        self.backup_selected_btn = tk.Button(pane, text=BACKUP_SELECTED_BTN_LABEL,
+                                             command=self._on_start_selected)
+        tools = tk.Frame(pane)
+        tool_actions = (("全选", lambda: self._set_all_account_checks(True)),
+                        ("反选", self._invert_account_checks),
+                        ("清空", lambda: self._set_all_account_checks(False)))
+        for column, (label, command) in enumerate(tool_actions):
+            tools.columnconfigure(column, weight=1, uniform="account-tools")  # 三格等宽
+            tk.Button(tools, text=label, command=command).grid(row=0, column=column, sticky="we", padx=2)
+        # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
+        self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
+        tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
+        self.account_list.pack(fill="both", expand=True, padx=2, pady=(4, 0))
+        return pane
+
+    def _build_config_area(self, parent: tk.Frame) -> None:
+        outer = tk.Frame(parent)
         outer.pack(fill="x", padx=8, pady=(8, 2))
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
@@ -561,53 +723,42 @@ class BackupApp:
         self._build_folder_group(outer)
 
     def _build_conn_group(self, parent: tk.Frame) -> None:
-        group = tk.LabelFrame(parent, text="连接")
+        """账户信息卡：连接设置已在设置页维护，这里只读展示（无任何输入框）。"""
+        group = self.conn_group = tk.LabelFrame(parent, text="账户信息")
         group.pack(fill="x", pady=(0, 6))
         group.columnconfigure(1, weight=1)
 
         tk.Label(group, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
         tk.Label(group, text="IMAP（仅接收，不发送）", anchor="w").grid(row=0, column=1, columnspan=4, sticky="w", pady=3)
 
-        tk.Label(group, text="帐号：").grid(row=1, column=0, sticky="e", padx=(8, 0))
-        self.user_var = tk.StringVar()
-        self.user_entry = self._register(tk.Entry(group, textvariable=self.user_var))
-        self.user_entry.grid(row=1, column=1, columnspan=4, sticky="we", padx=4, pady=3)
+        self._card_labels: dict[str, tk.Label] = {}
+        for row, (key, caption) in enumerate((("user", "邮箱地址："), ("server", "收件服务器：")), start=1):
+            tk.Label(group, text=caption).grid(row=row, column=0, sticky="e", padx=(8, 0), pady=3)
+            label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+            label.grid(row=row, column=1, columnspan=4, sticky="we", padx=4, pady=3)
+            self._card_labels[key] = label
 
-        tk.Label(group, text="收件服务器：").grid(row=2, column=0, sticky="e", padx=(8, 0))
-        self.server_var = tk.StringVar()
-        self.server_entry = self._register(tk.Entry(group, textvariable=self.server_var))
-        self.server_entry.grid(row=2, column=1, sticky="we", padx=4, pady=3)
-        self.ssl_var = tk.BooleanVar(value=True)
-        self._register(tk.Checkbutton(group, text="SSL", variable=self.ssl_var,
-                                      command=self._on_ssl_toggle)).grid(row=2, column=2, sticky="w")
-        tk.Label(group, text="端口：").grid(row=2, column=3, sticky="e", padx=(8, 0))
-        self.port_var = tk.StringVar(value="993")
-        self.port_entry = self._register(tk.Entry(group, textvariable=self.port_var, width=7))
-        self.port_entry.grid(row=2, column=4, sticky="e", padx=(4, 4), pady=3)
-        self.port_entry.bind("<Key>", self._on_port_key, add="+")
+        tk.Label(group, text="SSL：").grid(row=3, column=0, sticky="e", padx=(8, 0), pady=3)
+        ssl_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        ssl_label.grid(row=3, column=1, sticky="w", padx=4, pady=3)
+        self._card_labels["ssl"] = ssl_label
+        tk.Label(group, text="端口：").grid(row=3, column=2, sticky="e", padx=(8, 0), pady=3)
+        port_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        port_label.grid(row=3, column=3, columnspan=2, sticky="w", padx=4, pady=3)
+        self._card_labels["port"] = port_label
 
-        tk.Label(group, text="密码：").grid(row=3, column=0, sticky="e", padx=(8, 0))
-        self.password_var = tk.StringVar()
-        self.password_entry = self._register(tk.Entry(group, textvariable=self.password_var, show="*"))
-        self.password_entry.grid(row=3, column=1, columnspan=4, sticky="we", padx=4, pady=3)
-        self.show_var = tk.BooleanVar(value=False)
-        self._register(tk.Checkbutton(group, text="显示", variable=self.show_var,
-                                      command=self._on_show_toggle)).grid(row=3, column=5, sticky="e", padx=(0, 8))
+        tk.Label(group, text="密码：").grid(row=4, column=0, sticky="e", padx=(8, 0), pady=3)
+        password_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        password_label.grid(row=4, column=1, columnspan=4, sticky="we", padx=4, pady=3)
+        self._card_labels["password"] = password_label
 
         self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=CONNECT_BTN_CHARS,
                                                      command=self._on_connect))
-        self.connect_btn.grid(row=4, column=0, columnspan=6, pady=(10, 10))
+        self.connect_btn.grid(row=5, column=0, columnspan=6, pady=(10, 10))
         # 按需挂出：无提示时 grid_remove 让出这一行，按钮位置不变，让出的高度由下方邮件列表吸收
         self.conn_hint = tk.Label(group, text="")
-        self.conn_hint.grid(row=5, column=0, columnspan=6, pady=(0, 8))
+        self.conn_hint.grid(row=6, column=0, columnspan=6, pady=(0, 8))
         self.conn_hint.grid_remove()
-
-        self._bind_enter(self.user_entry, self.server_entry, self.port_entry, self.password_entry)
-        # 密码框与其他输入框同菜单同路径；show="*" 下复制走 Tk 原生导出，得到的是显示字符（星号）而非明文
-        self._bind_context_menu(self.user_entry, self.server_entry, self.port_entry, self.password_entry)
-
-        for var in (self.server_var, self.user_var, self.password_var):
-            var.trace_add("write", self._check_stale)
 
     def _build_output_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="输出")
@@ -615,22 +766,20 @@ class BackupApp:
         group.columnconfigure(1, weight=1)
 
         tk.Label(group, text="备份保存位置：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
-        self.outdir_var = tk.StringVar(value=str(Path.home() / "邮箱备份"))
-        self.outdir_entry = self._register(tk.Entry(group, textvariable=self.outdir_var))
-        self.outdir_entry.grid(row=0, column=1, sticky="we", padx=4, pady=3)
-        self._register(tk.Button(group, text="浏览…", command=self._on_browse)).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.card_root_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        self.card_root_label.grid(row=0, column=1, sticky="we", padx=4, pady=3)
+        tk.Label(group, text=BACKUP_ROOT_SETTINGS_HINT, anchor="w",
+                 foreground=EMPTY_HINT_FG).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.backup_root_var.trace_add("write", lambda *_a: self._render_backup_root())
 
         fmt_row = tk.Frame(group)
         fmt_row.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
         self.mbox_var = tk.BooleanVar(value=False)
         self.eml_var = tk.BooleanVar(value=True)
         self._register(tk.Checkbutton(fmt_row, text="mbox 输出", variable=self.mbox_var,
-                                      command=self._update_start_state)).pack(side="left")
+                                      command=self._on_format_change)).pack(side="left")
         self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var,
-                                      command=self._update_start_state)).pack(side="left", padx=(12, 0))
-
-        self._bind_enter(self.outdir_entry)
-        self._bind_context_menu(self.outdir_entry)
+                                      command=self._on_format_change)).pack(side="left", padx=(12, 0))
 
     def _build_folder_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="邮箱文件夹")
@@ -729,9 +878,103 @@ class BackupApp:
             page = self._panel_style_frame(detail)
             page.grid(row=0, column=0, sticky="nsew")
             self._settings_sections[key] = page
-            if key == SETTINGS_WINDOW_SECTION:
+            if key == SETTINGS_ACCOUNTS_SECTION:
+                self._build_accounts_settings(page, title)
+            elif key == SETTINGS_BACKUP_SECTION:
+                self._build_backup_settings(page, title)
+            elif key == SETTINGS_WINDOW_SECTION:
                 self._build_window_settings(page, title)
         self._settings_section = SETTINGS_SECTIONS[0][0]
+
+    def _build_accounts_settings(self, parent: tk.Frame, title: str) -> None:
+        """「账户」分类：左账户列表 + 新增/删除，右连接设置编辑表单 + 保存。
+
+        Note:
+            保存是显式动作（含校验与落盘）：表单里可能只填了一半，逐键生效会把半成品写进设置。
+        """
+        body = tk.Frame(parent)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(body, text=title, anchor="w",
+                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+        tk.Label(body, text=ACCOUNTS_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
+                 wraplength=TIP_WRAP).pack(fill="x", pady=(4, 0))
+
+        wrap = tk.Frame(body)
+        wrap.pack(fill="both", expand=True, pady=(10, 0))
+        nav = self._panel_style_frame(wrap)
+        nav.configure(width=SETTINGS_SECTION_LIST_WIDTH)
+        nav.pack_propagate(False)
+        nav.pack(side="left", fill="y")
+        tools = tk.Frame(nav)
+        tools.pack(side="bottom", fill="x", padx=4, pady=4)
+        tk.Button(tools, text="新增", width=7, command=self._on_account_add).pack(side="left")
+        tk.Button(tools, text="删除", width=7, command=self._on_account_delete).pack(side="left", padx=(6, 0))
+        self.account_edit_list = tk.Listbox(nav, exportselection=False, activestyle="none",
+                                            background="#ffffff", highlightthickness=0, borderwidth=0)
+        self.account_edit_list.pack(fill="both", expand=True)
+        self.account_edit_list.bind("<<ListboxSelect>>", self._on_account_edit_select)
+
+        form = tk.Frame(wrap)
+        form.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        form.columnconfigure(1, weight=1)
+        self._acct_name_var = tk.StringVar()
+        self._acct_user_var = tk.StringVar()
+        self._acct_server_var = tk.StringVar()
+        self._acct_ssl_var = tk.BooleanVar(value=DEFAULT_ACCOUNT_SSL)
+        self._acct_port_var = tk.StringVar(value=DEFAULT_ACCOUNT_PORT)
+        self._acct_password_var = tk.StringVar()
+        form_entries = [
+            self._account_form_row(form, 0, "名称：", self._acct_name_var),
+            self._account_form_row(form, 1, "邮箱地址：", self._acct_user_var),
+        ]
+        server_entry = self._account_form_row(form, 2, "收件服务器：", self._acct_server_var)
+        form_entries.append(server_entry)
+
+        ssl_row = tk.Frame(form)
+        ssl_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
+        tk.Checkbutton(ssl_row, text="SSL", variable=self._acct_ssl_var,
+                       command=self._on_acct_ssl_toggle).pack(side="left")
+        tk.Label(ssl_row, text="端口：").pack(side="left", padx=(16, 4))
+        port_entry = tk.Entry(ssl_row, textvariable=self._acct_port_var, width=7)
+        port_entry.pack(side="left")
+        form_entries.append(port_entry)
+
+        tk.Label(form, text="密码：").grid(row=4, column=0, sticky="e", padx=(0, 4), pady=3)
+        self._acct_password_entry = tk.Entry(form, textvariable=self._acct_password_var, show="*")
+        self._acct_password_entry.grid(row=4, column=1, sticky="we", pady=3)
+        tk.Label(form, text="留空则不修改已保存的密码", anchor="w", foreground=EMPTY_HINT_FG).grid(
+            row=5, column=1, sticky="w", pady=(0, 6))
+        tk.Button(form, text="保存", width=10, command=self._on_account_save).grid(row=6, column=1, sticky="w")
+
+        for entry in [*form_entries, self._acct_password_entry]:
+            for key in ("<Return>", "<KP_Enter>"):
+                entry.bind(key, lambda _e: self._on_account_save())
+            entry.bind("<Button-3>", self._on_entry_context)
+        self._account_form_entries = [*form_entries, self._acct_password_entry]
+
+    def _account_form_row(self, form: tk.Frame, row: int, caption: str, var: tk.StringVar) -> tk.Entry:
+        """连接设置表单的一行：右对齐标签 + 吃满剩余宽度的输入框。"""
+        tk.Label(form, text=caption).grid(row=row, column=0, sticky="e", padx=(0, 4), pady=3)
+        entry = tk.Entry(form, textvariable=var)
+        entry.grid(row=row, column=1, sticky="we", pady=3)
+        return entry
+
+    def _build_backup_settings(self, parent: tk.Frame, title: str) -> None:
+        """「备份」分类：全局唯一的备份保存位置（所有账户共用，见 ADR 0010）。"""
+        body = tk.Frame(parent)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(body, text=title, anchor="w",
+                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+
+        row = tk.Frame(body)
+        row.pack(fill="x", pady=(10, 0))
+        tk.Label(row, text="备份保存位置：").pack(side="left")
+        self.backup_root_entry = tk.Entry(row, textvariable=self.backup_root_var)
+        self.backup_root_entry.pack(side="left", fill="x", expand=True, padx=4)
+        tk.Button(row, text="浏览…", command=self._on_browse_backup_root).pack(side="left")
+        self.backup_root_entry.bind("<Button-3>", self._on_entry_context)
+        tk.Label(body, text=BACKUP_ROOT_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
+                 wraplength=TIP_WRAP).pack(fill="x", pady=(8, 0))
 
     def _build_window_settings(self, parent: tk.Frame, title: str) -> None:
         """「窗口与后台」分类的详情：关闭行为三态 + 说明文字。
@@ -812,8 +1055,8 @@ class BackupApp:
         return tk.Frame(parent, relief="groove",
                         borderwidth=int(self.folder_group.cget("borderwidth")))
 
-    def _build_run_area(self) -> None:
-        run = tk.Frame(self.backup_page)
+    def _build_run_area(self, parent: tk.Frame) -> None:
+        run = tk.Frame(parent)
         # 左右内边距是 7/5 而不是 8：notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px，
         # 先把它补掉，页签包裹边框的左右线才能与上方面板线、下方按钮行落在同一条 8px 基线上
         # （探针实测，issues/15）；按钮行与状态行再用 padx=(1, 3) 把自己的 8px 边距补回去。
@@ -971,50 +1214,99 @@ class BackupApp:
 
     # ------------------------------------------------------- connect handlers
 
-    def _conn_values(self) -> dict | None:
-        server = self.server_var.get().strip()
-        user = self.user_var.get().strip()
-        password = self.password_var.get()
+    def _visible_state(self) -> dict | None:
+        """当前可见账户的状态字典；没有账户时返回 None（账户存在时按需建立）。"""
+        if self._selected_account_id is None or self._find_account(self._selected_account_id) is None:
+            return None
+        return self._state(self._selected_account_id)
+
+    def _state(self, account_id: str) -> dict:
+        """取（必要时建立）某账户的独立状态：连接、文件夹树、邮件行、计数与进度。"""
+        state = self._states.get(account_id)
+        if state is None:
+            state = {"connect_state": "idle",       # idle | connecting | connected | stale
+                     "snapshot": None,              # (server, user, password_dpapi) 连接当刻的值
+                     "folder_rows": [], "open_keys": None,  # open_keys=None → 首次全部展开
+                     "messages": [], "row_index": 0,
+                     "server_total": 0, "pending_total": 0, "backed": 0,
+                     "count_text": "尚未开始备份", "status_text": "", "status_error": False,
+                     "progress": None, "result": None}
+            self._states[account_id] = state
+        return state
+
+    def _find_account(self, account_id: str | None) -> dict | None:
+        for account in self.accounts:
+            if account["id"] == account_id:
+                return account
+        return None
+
+    def _account_password(self, account: dict) -> str:
+        """解出账户密码明文；没存过或解不开（换机器/换账户）都按空串处理。"""
+        cipher = account.get("password_dpapi")
+        if isinstance(cipher, str) and cipher:
+            return _dpapi_decrypt(cipher) or ""
+        return ""
+
+    def _account_snapshot(self, account: dict) -> tuple[str, str, str]:
+        """连接参数快照（密码取密文）：与快照不同即「文件夹快照过期」。"""
+        cipher = account.get("password_dpapi")
+        return (str(account.get("server", "")), str(account.get("user", "")),
+                cipher if isinstance(cipher, str) else "")
+
+    def _account_credentials(self, account: dict, *, warn: bool = True) -> dict | None:
+        """账户记录 → 一次连接所需的取值；缺项时提示（warn=False 则静默）并返回 None。"""
+        server = str(account.get("server", "")).strip()
+        user = str(account.get("user", "")).strip()
+        password = self._account_password(account)
         if not server:
-            messagebox.showwarning("信息不完整", "请填写收件服务器。", parent=self.root)
+            if warn:
+                messagebox.showwarning("信息不完整", "请填写收件服务器。", parent=self.root)
             return None
         if not user:
-            messagebox.showwarning("信息不完整", "请填写帐号。", parent=self.root)
+            if warn:
+                messagebox.showwarning("信息不完整", "请填写邮箱地址。", parent=self.root)
             return None
         if not password:
-            messagebox.showwarning("信息不完整", "请填写密码。", parent=self.root)
+            if warn:
+                messagebox.showwarning("信息不完整",
+                                       "该账户还没有密码，请在设置页的「账户」里填写并保存。", parent=self.root)
             return None
         try:
-            port = int(self.port_var.get().strip())
+            port = int(str(account.get("port", DEFAULT_ACCOUNT_PORT)).strip())
             if not 0 < port < 65536:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("端口无效", "端口必须是 1-65535 的整数。", parent=self.root)
+            if warn:
+                messagebox.showwarning("端口无效", "端口必须是 1-65535 的整数。", parent=self.root)
             return None
         return {"server": server, "user": user, "password": password,
-                "ssl": bool(self.ssl_var.get()), "port": port,
-                "mbox": bool(self.mbox_var.get()), "eml": bool(self.eml_var.get()),
-                "outdir": self.outdir_var.get().strip()}
+                "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)), "port": port,
+                "mbox": bool(account.get("mbox", False)), "eml": bool(account.get("eml", True))}
 
     def _on_connect(self) -> None:
         if str(self.connect_btn.cget("state")) != "normal":
-            # 连接中/已连接/备份运行时按钮被禁用，输入框在连接中并未禁用——
-            # 门控不挡住的话，连接中再按一次 Enter 会起第二条连接线程。
+            # 连接中/已连接/备份运行时按钮被禁用；门控不挡住的话会起第二条连接线程。
             return
-        v = self._conn_values()
+        account = self._find_account(self._selected_account_id)
+        if account is None:
+            return
+        v = self._account_credentials(account)
         if v is None:
             return
+        state = self._state(account["id"])
+        state["connect_state"] = "connecting"
         self.connect_state = "connecting"
         self._apply_connect_state()
         self._update_start_state()
-        threading.Thread(target=self._connect_worker, args=(v,), daemon=True).start()
+        threading.Thread(target=self._connect_worker,
+                         args=(account["id"], v, self._account_snapshot(account)), daemon=True).start()
 
     def _core_config(self, v: dict, basedir: Path | None = None, eml_dir: Path | None = None) -> core.Config:
         return core.Config(overwrite=False, usessl=v["ssl"], thunderbird=False, nospinner=True,
                            basedir=basedir, icloud=False, quiet=False, user=v["user"], server=v["server"],
                            password=v["password"], timeout=60, port=v["port"], eml_dir=eml_dir)
 
-    def _connect_worker(self, v: dict) -> None:
+    def _connect_worker(self, account_id: str, v: dict, snapshot: tuple[str, str, str]) -> None:
         """连接线程入口：登录并拉取文件夹清单，结果经事件队列回主线程。"""
         log = logging.getLogger("imapbackup")
         cfg = self._core_config(v)
@@ -1025,31 +1317,37 @@ class BackupApp:
             finally:
                 with contextlib.suppress(Exception):
                     server.logout()
-            self.events.put(("folders_loaded", (names, v)))
+            self.events.put(("folders_loaded", (account_id, names, snapshot)))
         except SystemExit as e:
-            self.events.put(("connect_failed", str(e)))
+            self.events.put(("connect_failed", (account_id, str(e))))
         except Exception as e:
             log.exception("连接失败")
-            self.events.put(("connect_failed", f"{type(e).__name__}: {e}"))
+            self.events.put(("connect_failed", (account_id, f"{type(e).__name__}: {e}")))
 
-    def _on_folders_loaded(self, names: list[tuple], v: dict) -> None:
-        self._rebuild_folders(names)
-        self._snapshot = (v["server"], v["user"], v["password"])
-        self.connect_state = "connected"
-        self.log.info("已加载 %d 个邮箱文件夹", len(names))
-        self._check_stale()  # user may have edited fields while connecting
-        self._update_start_state()
+    def _on_folders_loaded(self, account_id: str, names: list[tuple], snapshot: tuple[str, str, str]) -> None:
+        """连接成功：为该账户建文件夹行、记下连接参数快照，可见时才动界面。"""
+        account = self._find_account(account_id)
+        if account is None:
+            return
+        state = self._state(account_id)
+        if account_id == self._selected_account_id:
+            self._sync_visible_folder_choices()  # 重连前先把界面上的勾选收回账户，重建不丢改动
+        self._fill_folder_rows(state, account, names)
+        state["snapshot"] = snapshot
+        state["connect_state"] = "connected"
+        self._refresh_stale(account_id)  # 连接期间账户若被改过，立刻转 stale（快照口径）
+        self.log.info("账户 %s：已加载 %d 个邮箱文件夹", account_display(account), len(names))
+        if account_id == self._selected_account_id:
+            self._render_folder_tree(state)
+            self.connect_state = state["connect_state"]
+            self._apply_connect_state()
+            self._update_start_state()
 
-    def _rebuild_folders(self, names: list[tuple]) -> None:
-        checked = ({r["foldername"] for r in self.folder_rows if r["var"].get()}
-                   if self.folder_rows else {"INBOX"})
-        open_keys = None
-        if self._folder_nodes:
-            open_keys = {key for key, node in self._folder_nodes.items() if node["open"]}
-        for child in self.folder_inner.winfo_children():
-            child.destroy()
-        self.folder_rows, self._folder_nodes, self._folder_clickables = [], {}, []
-
+    def _fill_folder_rows(self, state: dict, account: dict, names: list[tuple]) -> None:
+        """按账户记录的勾选构建文件夹行：现存勾选保留，缺省或全部失效时默认仅 INBOX。"""
+        available = {name[0] for name in names}
+        persisted = {name for name in account.get("folders", []) if name in available}
+        checked = persisted or {"INBOX"}
         rows: list[dict] = []
         for foldername, filename, eml_relpath, display in names:
             path = tuple(eml_relpath.split("/"))
@@ -1058,6 +1356,19 @@ class BackupApp:
                          "label": last_folder_segment(display, path),
                          "var": tk.BooleanVar(value=foldername in checked),
                          "check_btn": None})
+        state["folder_rows"] = sorted(rows, key=lambda r: r["path"])
+
+    def _render_folder_tree(self, state: dict) -> None:
+        """把某账户的文件夹行渲染成勾选树（切账户与连接完成共用）。
+
+        Note:
+            行本身留在状态字典里（勾选值随行存活），这里只重建控件；展开态按 open_keys 还原，
+            None 表示首次加载——全部展开。重建只影响可见账户，别的账户的树不占控件。
+        """
+        rows = list(state["folder_rows"])
+        self.folder_rows, self._folder_nodes, self._folder_clickables = [], {}, []
+        for child in self.folder_inner.winfo_children():
+            child.destroy()
 
         real: dict[tuple, list[dict]] = {}
         for row in rows:
@@ -1067,9 +1378,14 @@ class BackupApp:
                       key=lambda k: (len(k), k))
         with_kids = {k for k in keys if any(o != k and o[:len(k)] == k for o in keys)}
         for key in keys:  # 父节点必然先于子节点建成
-            self._make_folder_node(key, real.get(key), with_kids, open_keys)
+            self._make_folder_node(key, real.get(key), with_kids, state["open_keys"])
 
         self.folder_rows.sort(key=lambda r: r["path"])
+        state["folder_rows"] = self.folder_rows
+        # 空树不改展开记忆：open_keys 保持原值（None 表示「下次加载全展开」），
+        # 免得空态渲染把 None 变成空集合、下一次加载整棵树都是收起的
+        if self.folder_rows:
+            state["open_keys"] = {key for key, node in self._folder_nodes.items() if node["open"]}
         self._render_folder_checks()
         self._wheel_accum = 0   # 换了棵树，上一棵树没攒满一格的滚轮余量作废
         # 行距的同步挂在前面的 folder_inner <Configure> 上：此刻新建控件的几何还没结算，
@@ -1174,11 +1490,14 @@ class BackupApp:
 
     def _toggle_folder_open(self, key: tuple[str, ...]) -> None:
         if self.running:
-            return
+            return  # 运行中配置区锁定；标签只能置灰，点击要靠这里挡住
         node = self._folder_nodes[key]
         node["open"] = not node["open"]
         self._pack_kids(node)
         node["arrow"].configure(text=ARROW_OPEN if node["open"] else ARROW_CLOSED)
+        state = self._visible_state()
+        if state is not None:
+            state["open_keys"] = {k for k, n in self._folder_nodes.items() if n["open"]}
 
     def _render_folder_checks(self) -> None:
         for node in self._folder_nodes.values():
@@ -1234,15 +1553,318 @@ class BackupApp:
         if pitch != int(self.folder_canvas.cget("yscrollincrement")):
             self.folder_canvas.configure(yscrollincrement=pitch)
 
-    # ------------------------------------------------------- stale state rules
+    # -------------------------------------------- 账户列表、详情与设置页编辑
 
-    def _check_stale(self, *_args) -> None:
-        if self.running or self._snapshot is None or self.connect_state not in ("connected", "stale"):
+    def _refresh_account_list(self) -> None:
+        """重画备份页左栏账户列表并保持选中（新增/删除/改名后调用）。
+
+        Note:
+            勾选集合在这里同步到账户表：删掉的账户不再占勾选，上一次画列表时还没有的账户
+            默认勾上——「勾」是默认态，用户只在行上表达「不勾」。
+        """
+        previous = set(self._account_rows)
+        ids = {account["id"] for account in self.accounts}
+        self._checked_accounts = (self._checked_accounts & ids) | (ids - previous)
+        self._account_rows = {}
+        for child in self.account_list.winfo_children():
+            child.destroy()
+        for account in self.accounts:
+            self._make_account_row(account)
+        self._render_account_rows()
+        self._update_start_state()
+
+    def _make_account_row(self, account: dict) -> None:
+        """画一行：底子 Frame + 复选框 + 名称，后两者的命中区分得开。
+
+        行不是 Listbox 的一行，是为了让复选框只翻勾选、点行的其他地方只切详情——一个控件
+        一次只能表达一件事。
+        """
+        account_id = account["id"]
+        frame = tk.Frame(self.account_list, background=ACCOUNT_ROW_BG, cursor="hand2")
+        frame.pack(fill="x", pady=1)
+        var = tk.BooleanVar(value=account_id in self._checked_accounts)
+        check = tk.Checkbutton(frame, variable=var, background=ACCOUNT_ROW_BG,
+                               activebackground=ACCOUNT_ROW_BG, highlightthickness=0, borderwidth=0,
+                               cursor="hand2", command=self._sync_account_checks)
+        check.pack(side="left", padx=(2, 2))
+        label = tk.Label(frame, text=account_display(account), anchor="w", cursor="hand2",
+                         background=ACCOUNT_ROW_BG, foreground=ACCOUNT_ROW_FG)
+        label.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._account_rows[account_id] = {"frame": frame, "check": check, "label": label, "var": var}
+        for widget in (frame, label):
+            widget.bind("<Button-1>", lambda _e, _id=account_id: self._on_account_row_click(_id))
+
+    def _render_account_rows(self) -> None:
+        """按选中态给行上色：选中行整行系统高亮蓝（与原 Listbox 的选中色是同一个系统色）。"""
+        for account_id, row in self._account_rows.items():
+            selected = account_id == self._selected_account_id
+            background = ACCOUNT_ROW_SELECTED_BG if selected else ACCOUNT_ROW_BG
+            row["frame"].configure(background=background)
+            row["label"].configure(background=background,
+                                   foreground=ACCOUNT_ROW_SELECTED_FG if selected else ACCOUNT_ROW_FG)
+            # activebackground 跟着行底色走：不然按复选框时会在蓝行上闪出灰方块
+            row["check"].configure(background=background, activebackground=background)
+
+    def _on_account_row_click(self, account_id: str) -> None:
+        """点行（复选框以外的地方）= 切换右侧详情，与勾选互不牵连。"""
+        if account_id != self._selected_account_id:
+            self._switch_account(account_id)
+
+    def _sync_account_checks(self) -> None:
+        """把行的勾选收成账户 id 集合（三个工具按钮与单个复选框共用这一个入口）。"""
+        self._checked_accounts = {account_id for account_id, row in self._account_rows.items()
+                                  if row["var"].get()}
+        self._update_start_state()
+
+    def _set_all_account_checks(self, value: bool) -> None:
+        for row in self._account_rows.values():
+            row["var"].set(value)
+        self._sync_account_checks()
+
+    def _invert_account_checks(self) -> None:
+        for row in self._account_rows.values():
+            row["var"].set(not row["var"].get())
+        self._sync_account_checks()
+
+    def _switch_account(self, account_id: str) -> None:
+        """切换可见账户：先收当前账户的进度态，再渲染目标账户的整套详情。"""
+        self._save_visible_state()
+        self._selected_account_id = account_id
+        self._ui_settings["selected_account"] = account_id
+        account = self._find_account(account_id)
+        if account is not None:
+            self.log.info("切换到账户 %s", account_display(account))
+        self._render_account_detail()
+        self._render_account_rows()
+
+    def _save_visible_state(self) -> None:
+        """把可见账户的进度条值收进状态字典（计数与状态文案在各自写入点已同步）。"""
+        state = self._visible_state()
+        if state is not None and self._msg_bar.winfo_manager():
+            state["progress"] = (float(self.progress["value"]), float(self.progress["maximum"]))
+
+    def _render_account_detail(self) -> None:
+        """把选中账户的整套详情画进右栏：卡片、文件夹树、邮件列表、计数与状态。
+
+        Note:
+            切换账户不打断别的账户正在跑的连接或备份——那些事件都带 account_id，只更新各自状态；
+            这个入口只负责「可见账户」这一份。
+        """
+        account = self._find_account(self._selected_account_id)
+        state = self._visible_state()
+        self._render_card(account)
+        if account is None or state is None:
+            self.folder_rows, self._folder_nodes, self._folder_clickables = [], {}, []
+            for child in self.folder_inner.winfo_children():
+                child.destroy()
+            self._sync_folder_row_increment()
+            self._toggle_hint(self.folder_ph, True)
+            self._render_messages(None)
+            self.server_total = self.pending_total = self.backed_count = 0
+            self.progress.configure(maximum=1, value=0)
+            self._set_counts("尚未开始备份")
+            self._set_status("", error=False)
+            self._set_config_enabled(False)
+            self.mbox_var.set(False)
+            self.eml_var.set(True)
+            self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="disabled")
+            self._show_conn_hint("", HINT_GRAY)
+            self._update_start_state()
             return
-        cur = (self.server_var.get(), self.user_var.get(), self.password_var.get())
-        self.connect_state = "connected" if cur == self._snapshot else "stale"
+        self._refresh_stale(account["id"])
+        self._render_folder_tree(state)
+        self._render_messages(state)
+        self._restore_run_state(state)
+        # 格式复选框按账户还原（command 只在用户点击时触发，这里 set 不会写回账户）
+        self.mbox_var.set(bool(account.get("mbox", False)))
+        self.eml_var.set(bool(account.get("eml", True)))
+        self._set_config_enabled(not self.running)
         self._apply_connect_state()
         self._update_start_state()
+
+    def _render_card(self, account: dict | None) -> None:
+        """只读信息卡：账户缺失时全部显示占位符，密码只报「已保存/未设置」。"""
+        if account is None:
+            values = {"user": CARD_EMPTY_TEXT, "server": CARD_EMPTY_TEXT, "ssl": CARD_EMPTY_TEXT,
+                      "port": CARD_EMPTY_TEXT, "password": CARD_EMPTY_TEXT}
+        else:
+            values = {"user": account.get("user") or CARD_EMPTY_TEXT,
+                      "server": account.get("server") or CARD_EMPTY_TEXT,
+                      "ssl": "是" if account.get("ssl", DEFAULT_ACCOUNT_SSL) else "否",
+                      "port": str(account.get("port") or CARD_EMPTY_TEXT),
+                      "password": PASSWORD_SAVED_TEXT if account.get("password_dpapi") else PASSWORD_MISSING_TEXT}
+        for key, label in self._card_labels.items():
+            label.configure(text=values[key])
+        self._render_backup_root()
+
+    def _render_backup_root(self) -> None:
+        self.card_root_label.configure(text=self.backup_root_var.get().strip() or DEFAULT_BACKUP_ROOT)
+
+    def _render_messages(self, state: dict | None) -> None:
+        """把账户的邮件行重画进邮件列表（切换账户时的一次性重绘）。"""
+        self._clear_message_rows()
+        if state is None:
+            return
+        for data in state["messages"]:
+            self._row_index += 1
+            self._insert_message_row(data, self._row_index)
+        state["row_index"] = self._row_index
+        self._toggle_hint(self.list_ph, not state["messages"])
+
+    def _restore_run_state(self, state: dict) -> None:
+        """把某账户的计数/状态/进度还原到界面（切换账户与运行事件共用同一口径）。"""
+        self.server_total = state["server_total"]
+        self.pending_total = state["pending_total"]
+        self.backed_count = state["backed"]
+        progress = state["progress"]
+        if progress is None:
+            self.progress.configure(maximum=1, value=0)
+        else:
+            value, maximum = progress
+            self.progress.configure(maximum=max(maximum, 1), value=min(value, max(maximum, 1)))
+        self._set_counts(state["count_text"])
+        self._set_status(state["status_text"], state["status_error"])
+
+    def _refresh_edit_list(self, select_id: str | None) -> None:
+        """重画设置页账户列表；选中项回填表单，没有账户时表单清空。"""
+        self.account_edit_list.delete(0, "end")
+        for account in self.accounts:
+            self.account_edit_list.insert("end", account_display(account))
+        ids = [account["id"] for account in self.accounts]
+        if select_id is None or select_id not in ids:
+            select_id = ids[0] if ids else None
+        self._editing_account_id = select_id
+        if select_id is None:
+            self._clear_account_form()
+            return
+        index = ids.index(select_id)
+        self.account_edit_list.selection_clear(0, "end")
+        self.account_edit_list.selection_set(index)
+        self.account_edit_list.activate(index)
+        self._load_account_form(self.accounts[index])
+
+    def _on_account_edit_select(self, _event=None) -> None:
+        selection = self.account_edit_list.curselection()
+        if not selection:
+            return
+        account = self.accounts[selection[0]]
+        self._editing_account_id = account["id"]
+        self._load_account_form(account)
+
+    def _load_account_form(self, account: dict) -> None:
+        """把账户记录填进表单；密码框始终留空（留空 = 不修改已保存的密码）。"""
+        self._acct_name_var.set(account.get("name", ""))
+        self._acct_user_var.set(account.get("user", ""))
+        self._acct_server_var.set(account.get("server", ""))
+        self._acct_ssl_var.set(bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)))
+        self._acct_port_var.set(str(account.get("port", DEFAULT_ACCOUNT_PORT)))
+        self._acct_password_var.set("")
+
+    def _clear_account_form(self) -> None:
+        self._acct_name_var.set("")
+        self._acct_user_var.set("")
+        self._acct_server_var.set("")
+        self._acct_ssl_var.set(DEFAULT_ACCOUNT_SSL)
+        self._acct_port_var.set(DEFAULT_ACCOUNT_PORT)
+        self._acct_password_var.set("")
+
+    def _on_acct_ssl_toggle(self) -> None:
+        """SSL 勾选联动默认端口：只在端口仍是 993/143 这两个默认值时替换。"""
+        if self._acct_port_var.get().strip() in ("993", "143"):
+            self._acct_port_var.set("993" if self._acct_ssl_var.get() else "143")
+
+    def _on_account_add(self) -> None:
+        """新增一个空账户并立刻落盘：先有账户，再去表单里填连接信息。"""
+        account = new_account()
+        self.accounts.append(account)
+        self._refresh_edit_list(account["id"])   # 勾选默认态由 _refresh_account_list 统一给出
+        self._refresh_account_list()
+        if self._selected_account_id is None:
+            self._switch_account(account["id"])
+        self._save_column_config()
+        self.log.info("新增账户 %s", account_display(account))
+
+    def _on_account_delete(self) -> None:
+        """删除当前编辑的账户；磁盘上已备份的邮件不归这里管。"""
+        account = self._find_account(self._editing_account_id)
+        if account is None:
+            return
+        if not messagebox.askokcancel("删除账户",
+                                      f"确定删除账户「{account_display(account)}」吗？\n"
+                                      "已备份到磁盘的邮件不会被删除。", parent=self.root):
+            return
+        self.accounts.remove(account)
+        self._states.pop(account["id"], None)
+        if self._selected_account_id == account["id"]:
+            self._selected_account_id = self.accounts[0]["id"] if self.accounts else None
+            self._ui_settings["selected_account"] = self._selected_account_id
+            self._render_account_detail()
+        self._refresh_account_list()
+        self._refresh_edit_list(None)
+        self._save_column_config()
+        self.log.info("删除账户 %s", account_display(account))
+
+    def _on_account_save(self) -> None:
+        """校验并保存当前编辑的账户；密码框留空表示不修改已存密码。"""
+        account = self._find_account(self._editing_account_id)
+        if account is None:
+            return
+        user = self._acct_user_var.get().strip()
+        server = self._acct_server_var.get().strip()
+        if not user:
+            messagebox.showwarning("信息不完整", "请填写邮箱地址。", parent=self.root)
+            return
+        if not server:
+            messagebox.showwarning("信息不完整", "请填写收件服务器。", parent=self.root)
+            return
+        try:
+            port = int(self._acct_port_var.get().strip())
+            if not 0 < port < 65536:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("端口无效", "端口必须是 1-65535 的整数。", parent=self.root)
+            return
+        password = self._acct_password_var.get()
+        if password:
+            cipher = _dpapi_encrypt(password) if sys.platform == "win32" else None
+            if cipher is None:
+                messagebox.showwarning("无法保存密码", "密码加密失败，本次未保存密码。", parent=self.root)
+            else:
+                account["password_dpapi"] = cipher
+        account["name"] = self._acct_name_var.get().strip()
+        account["user"] = user
+        account["server"] = server
+        account["ssl"] = bool(self._acct_ssl_var.get())
+        account["port"] = str(port)
+        self._acct_password_var.set("")
+        self._refresh_account_list()
+        self._refresh_edit_list(account["id"])
+        self._refresh_stale(account["id"])
+        if account["id"] == self._selected_account_id:
+            self._render_card(account)
+        self._save_column_config()
+        self.log.info("保存账户 %s（%s）", account_display(account), user)
+
+    # ------------------------------------------------------- stale state rules
+
+    def _refresh_stale(self, account_id: str) -> None:
+        """账户被编辑后刷新连接状态：取值 ≠ 连接当刻快照即 stale，回到原值即 connected。
+
+        Note:
+            只有连接过（快照非空）的账户才谈得上过期；idle/connecting 不动。快照取密码密文，
+            换密码同样算改了连接信息。
+        """
+        state = self._states.get(account_id)
+        if state is None or state["snapshot"] is None or state["connect_state"] not in ("connected", "stale"):
+            return
+        account = self._find_account(account_id)
+        if account is None:
+            return
+        state["connect_state"] = "connected" if self._account_snapshot(account) == state["snapshot"] else "stale"
+        if account_id == self._selected_account_id:
+            self.connect_state = state["connect_state"]
+            self._apply_connect_state()
+            self._update_start_state()
 
     def _show_conn_hint(self, text: str, color: str) -> None:
         """显示连接提示并上色；空文案时整行让出空间，避免无提示时留一条空带。
@@ -1270,19 +1892,34 @@ class BackupApp:
         self._connect_spinner_tick(0)
 
     def _connect_spinner_tick(self, index: int) -> None:
-        """画第 index 帧并按连接状态决定排不排下一帧；文案由 _apply_connect_state 收尾复位。"""
-        if self.connect_state != "connecting":
+        """画第 index 帧并按当前可见账户的连接状态决定排不排下一帧。
+
+        Note:
+            帧链只服务「当前可见账户正在连接」这一种情形：切到别的账户时 _apply_connect_state
+            会取消它，连着的那个账户在后台照常完成，切回去时重新起链。
+        """
+        state = self._visible_state()
+        if state is None or state["connect_state"] != "connecting":
             self._spinner_job = None
             return
         self._set_loading_frame(self.connect_btn, CONNECTING_BTN_LABEL, index)
         self._spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._connect_spinner_tick, index + 1)
 
     def _apply_connect_state(self) -> None:
+        state = self._visible_state()
+        self.connect_state = state["connect_state"] if state is not None else "idle"
+        if state is None:
+            # 一个账户都没有：连接按钮无处可点，等去设置页建账户
+            self._cancel_connect_spinner()
+            self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="disabled")
+            self._show_conn_hint("", HINT_GRAY)
+            return
         if self.connect_state == "connecting":
             if self._spinner_job is None:
                 self._start_button_spinner()
         else:
-            self._spinner_job = None
+            # 帧链取消要走 after_cancel：切账户后旧链若只清 job 槽，会和下一账户的新链并行
+            self._cancel_connect_spinner()
             if self.running:
                 # 运行中配置区整体锁定，connect_btn 已被 _set_config_enabled(False) 禁用
                 self.connect_btn.configure(text=CONNECT_BTN_LABEL)
@@ -1299,33 +1936,27 @@ class BackupApp:
                 else:
                     self._show_conn_hint("", HINT_GRAY)
 
+    def _cancel_connect_spinner(self) -> None:
+        if self._spinner_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._spinner_job)
+        self._spinner_job = None
+
     # --------------------------------------------------------- misc handlers
 
-    def _on_ssl_toggle(self) -> None:
-        if not self._port_touched:
-            self.port_var.set("993" if self.ssl_var.get() else "143")
-
-    def _on_port_key(self, _event) -> str | None:
-        self._port_touched = True
-        return None  # continue normal binding
-
-    def _on_show_toggle(self) -> None:
-        self.password_entry.configure(show="" if self.show_var.get() else "*")
-
-    def _bind_enter(self, *entries: tk.Entry) -> None:
-        """连接相关的输入框里 Enter = 点连接按钮；小键盘的 Enter 是独立事件名 KP_Enter。"""
-        for entry in entries:
-            for key in ("<Return>", "<KP_Enter>"):
-                entry.bind(key, self._on_return)
-
-    def _on_return(self, _event) -> None:
-        self._on_connect()
-
-    def _on_browse(self) -> None:
-        initial = self.outdir_var.get().strip() or str(Path.home())
+    def _on_browse_backup_root(self) -> None:
+        initial = self.backup_root_var.get().strip() or str(Path.home())
         chosen = filedialog.askdirectory(parent=self.root, title="选择备份保存位置", initialdir=initial)
         if chosen:
-            self.outdir_var.set(Path(chosen).as_posix())
+            self.backup_root_var.set(Path(chosen).as_posix())
+
+    def _on_format_change(self) -> None:
+        """格式复选框变更：写进当前账户（每账户独立），再重算开始按钮。"""
+        account = self._find_account(self._selected_account_id)
+        if account is not None:
+            account["mbox"] = bool(self.mbox_var.get())
+            account["eml"] = bool(self.eml_var.get())
+        self._update_start_state()
 
     def _set_all_folders(self, value: bool) -> None:
         for row in self.folder_rows:
@@ -1389,10 +2020,9 @@ class BackupApp:
         return False
 
     def _entry_widget_paths(self) -> frozenset[str]:
-        """5 个输入框的控件路径：焦点归属判定用。"""
-        return frozenset(
-            str(w) for w in (self.user_entry, self.server_entry, self.port_entry,
-                             self.password_entry, self.outdir_entry))
+        """所有输入框（设置页账户表单 + 备份页地址栏）的控件路径：焦点归属判定用。"""
+        widgets = [self.backup_root_entry, *self._account_form_entries]
+        return frozenset(str(w) for w in widgets)
 
     def _on_click_clear_selection_and_focus(self, event) -> None:
         """主窗口唯一的左键入口：清邮件列表选中高亮，并把输入框焦点收归主窗口。
@@ -1445,12 +2075,17 @@ class BackupApp:
         self._log_menu.add_command(label=MENU_COPY_LABEL, command=self._log_copy_selection)
         self._log_menu.add_command(label=MENU_COPY_ALL_LABEL, command=self._log_copy_all)
 
-    def _bind_context_menu(self, *widgets: tk.Widget) -> None:
-        """仿 _bind_enter：给一组输入框挂同一个右键入口。"""
-        for widget in widgets:
-            widget.bind("<Button-3>", self._on_entry_context)
-
     def _read_ui_settings(self) -> dict:
+        """读界面设置，含 v1 → v2 迁移与逐节容错（ADR 0008/0010）。
+
+        Returns:
+            统一形状的设置字典（version 恒为当前版本）；文件缺失、整体损坏时回退默认值。
+
+        Note:
+            容错按节独立：columns 的细节校验沿用 `_load_column_config`，window/close_action 各自
+            降级，accounts 非列表整节丢弃、单账户按 `parse_account` 逐个校验。旧的无版本「仅列宽」
+            格式先被识别成 v1 形状再走迁移，存量用户不会因为升级丢掉列宽与账号。
+        """
         try:
             with COLUMN_CONFIG_PATH.open(encoding="utf-8") as stream:
                 raw = json.load(stream)
@@ -1458,21 +2093,88 @@ class BackupApp:
                     and all(isinstance(raw[name], int) and not isinstance(raw[name], bool)
                             for name in MAIL_COLUMNS)):
                 return {"version": UI_SETTINGS_VERSION, "columns": raw}
-            if not isinstance(raw, dict) or raw.get("version") != UI_SETTINGS_VERSION:
+            if not isinstance(raw, dict):
                 raise ValueError("unsupported UI settings format")
-            columns = raw.get("columns")
-            if columns is not None and not isinstance(columns, dict):
-                raise ValueError("invalid columns section")
-            action = raw.get(CLOSE_ACTION_KEY)
-            if action is not None and parse_close_action(action) != action:
-                self.log.warning("忽略无效的关闭行为偏好 %s: %r", COLUMN_CONFIG_PATH, action)
-            return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
-                    "config": raw.get("config"), CLOSE_ACTION_KEY: parse_close_action(action)}
+            version = raw.get("version")
+            if version == 1:
+                self.log.info("界面设置为 v1 格式，迁移到 v%d", UI_SETTINGS_VERSION)
+                raw = self._migrate_v1_settings(raw)
+                version = UI_SETTINGS_VERSION
+            if version != UI_SETTINGS_VERSION:
+                raise ValueError("unsupported UI settings format")
+            return self._parse_settings_v2(raw)
         except FileNotFoundError:
             return {"version": UI_SETTINGS_VERSION}
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             self.log.warning("忽略无效的界面设置 %s: %s", COLUMN_CONFIG_PATH, exc)
             return {"version": UI_SETTINGS_VERSION}
+
+    def _migrate_v1_settings(self, raw: dict) -> dict:
+        """v1 → v2：旧 config 节（单账号）变成 accounts 单元素列表，outdir 变成 backup_root。
+
+        Note:
+            其余节（columns/window/close_action）原样带走；config 缺失或损坏时不造账户，
+            只保留其余节——与「坏节丢弃」同一口径。
+        """
+        migrated = dict(raw)
+        migrated["version"] = UI_SETTINGS_VERSION
+        config = raw.get("config")
+        accounts: list[dict] = []
+        backup_root = None
+        if isinstance(config, dict):
+            account = new_account()
+            for name in ("user", "server", "port"):
+                value = config.get(name)
+                if isinstance(value, str):
+                    account[name] = value
+            ssl = config.get("ssl")
+            if isinstance(ssl, bool):
+                account["ssl"] = ssl
+            cipher = config.get("password_dpapi")
+            if isinstance(cipher, str) and cipher:
+                account["password_dpapi"] = cipher
+            accounts.append(account)
+            outdir = config.get("outdir")
+            if isinstance(outdir, str) and outdir.strip():
+                backup_root = outdir
+        else:
+            self.log.warning("忽略无效的用户配置节 %s", COLUMN_CONFIG_PATH)
+        migrated["accounts"] = accounts
+        migrated["backup_root"] = backup_root
+        migrated["selected_account"] = accounts[0]["id"] if accounts else None
+        migrated.pop("config", None)
+        return migrated
+
+    def _parse_settings_v2(self, raw: dict) -> dict:
+        """逐节校验 v2 设置：坏节丢弃、坏字段回落，不让一处坏数据拖垮整份设置。"""
+        columns = raw.get("columns")
+        if columns is not None and not isinstance(columns, dict):
+            raise ValueError("invalid columns section")
+        action = raw.get(CLOSE_ACTION_KEY)
+        if action is not None and parse_close_action(action) != action:
+            self.log.warning("忽略无效的关闭行为偏好 %s: %r", COLUMN_CONFIG_PATH, action)
+        accounts: list[dict] = []
+        raw_accounts = raw.get("accounts")
+        if raw_accounts is not None:
+            if not isinstance(raw_accounts, list):
+                self.log.warning("忽略无效的账户列表 %s", COLUMN_CONFIG_PATH)
+            else:
+                for item in raw_accounts:
+                    account = parse_account(item)
+                    if account is None:
+                        self.log.warning("跳过无效的账户记录 %s", COLUMN_CONFIG_PATH)
+                    else:
+                        accounts.append(account)
+        backup_root = raw.get("backup_root")
+        if backup_root is not None and not (isinstance(backup_root, str) and backup_root.strip()):
+            self.log.warning("忽略无效的备份保存位置 %s", COLUMN_CONFIG_PATH)
+            backup_root = None
+        selected = raw.get("selected_account")
+        if selected not in {account["id"] for account in accounts}:
+            selected = accounts[0]["id"] if accounts else None
+        return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
+                CLOSE_ACTION_KEY: parse_close_action(action), "accounts": accounts,
+                "backup_root": backup_root, "selected_account": selected}
 
     def _restore_window_settings(self) -> tuple[int, int, int, int]:
         # 落地后要重设的那份几何（见 __init__ 末尾）：默认就是默认尺寸，恢复到保存值时在下面替换
@@ -1521,40 +2223,6 @@ class BackupApp:
                 self._window_maximized = True
         return width, height, x, y
 
-    def _restore_user_config(self) -> None:
-        """启动时恢复配置区 6 字段。
-
-        坏节/坏字段逐个跳过，回退默认值。
-
-        Note:
-            校验风格与窗口节一致：节不是 dict 就整节丢弃；字段逐个看类型（字符串/布尔），
-            坏的只跳过该字段。密码解不出明文视为没存过（换机器/换账户/文件损坏），
-            记一条 warning，不弹窗、不阻断启动。
-        """
-        config = self._ui_settings.get("config")
-        if config is None:
-            return
-        if not isinstance(config, dict):
-            self.log.warning("忽略无效的用户配置节 %s", COLUMN_CONFIG_PATH)
-            return
-        ssl = config.get("ssl")
-        if isinstance(ssl, bool):
-            self.ssl_var.set(ssl)
-        for name, var in (("user", self.user_var), ("server", self.server_var),
-                          ("port", self.port_var), ("outdir", self.outdir_var)):
-            value = config.get(name)
-            if isinstance(value, str):
-                var.set(value)
-                if name == "port":
-                    self._port_touched = True  # 持久化端口=用户确认过的值，挡住 SSL 联动
-        cipher = config.get("password_dpapi")
-        if isinstance(cipher, str):
-            password = _dpapi_decrypt(cipher)
-            if password is None:
-                self.log.warning("无法解密保存的密码，需要重新输入")
-            else:
-                self.password_var.set(password)
-
     def _window_position_visible(self, width: int, height: int, x: int, y: int) -> bool:
         left = self.root.winfo_vrootx()
         top = self.root.winfo_vrooty()
@@ -1580,24 +2248,22 @@ class BackupApp:
         self._column_config_loaded = True
 
     def _save_column_config(self) -> None:
-        """Atomically persist all UI settings, leaving the live layout untouched on failure."""
+        """Atomically persist all UI settings, leaving the live layout untouched on failure.
+
+        Note:
+            账户节从内存态序列化（`account_record`）：文件夹勾选先从可见账户的树上收一次，
+            别的账户的勾选在各自状态字典里原地存活，随下一次连接或落盘回到记录。
+        """
         widths = {name: int(self.tree.column(name, "width")) for name in MAIL_COLUMNS}
+        self._sync_visible_folder_choices()
         self._ui_settings["version"] = UI_SETTINGS_VERSION
         self._ui_settings["columns"] = widths
         self._ui_settings["window"] = self._window_settings()
         # 关闭行为偏好只由设置页/关闭对话框改内存，落盘统一走这里（ADR 0008 的单一写入路径）
         self._ui_settings[CLOSE_ACTION_KEY] = self._close_action()
-        config = {"user": self.user_var.get(), "server": self.server_var.get(),
-                  "ssl": bool(self.ssl_var.get()), "port": self.port_var.get(),
-                  "outdir": self.outdir_var.get()}
-        password = self.password_var.get()
-        if password and sys.platform == "win32":
-            cipher = _dpapi_encrypt(password)
-            if cipher is not None:
-                config["password_dpapi"] = cipher  # 空密码不落盘；非 win32 本项缺席
-            else:
-                self.log.warning("DPAPI 加密失败，本次未保存密码")
-        self._ui_settings["config"] = config
+        self._ui_settings["accounts"] = [account_record(account) for account in self.accounts]
+        self._ui_settings["backup_root"] = self.backup_root_var.get().strip() or DEFAULT_BACKUP_ROOT
+        self._ui_settings["selected_account"] = self._selected_account_id
         temporary: Path | None = None
         try:
             COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1617,6 +2283,13 @@ class BackupApp:
             except OSError:
                 pass
             self.log.warning("保存界面设置失败 %s: %s", COLUMN_CONFIG_PATH, exc)
+
+    def _sync_visible_folder_choices(self) -> None:
+        """把可见账户树上的勾选写回该账户记录（构造过树才有可写的勾选）。"""
+        account = self._find_account(self._selected_account_id)
+        if account is None or not self.folder_rows:
+            return
+        account["folders"] = [row["foldername"] for row in self.folder_rows if row["var"].get()]
 
     def _window_settings(self) -> dict:
         width, height, x, y = self._normal_geometry
@@ -1855,11 +2528,13 @@ class BackupApp:
     # ------------------------------------------------------------- run control
 
     def _update_start_state(self, *_args) -> None:
-        ok = (self.connect_state == "connected"
+        state = self._visible_state()
+        ok = (state is not None and state["connect_state"] == "connected"
               and any(r["var"].get() for r in self.folder_rows)
               and (self.mbox_var.get() or self.eml_var.get())
               and not self.running)
         self.start_btn.configure(state="normal" if ok else "disabled")
+        self.backup_selected_btn.configure(state="normal" if self.accounts and not self.running else "disabled")
 
     def _set_loading_frame(self, button: tk.Button, label: str, index: int) -> None:
         """把按钮画成加载态的第 index 帧——连接与备份共用这一个入口。
@@ -1963,50 +2638,157 @@ class BackupApp:
         self.notebook.select(0)
 
     def _on_start(self) -> None:
-        v = self._conn_values()
-        if v is None:
+        """备份当前账户：先校验连接信息与备份位置，再进入批量运行的公共入口。"""
+        if self.running:
             return
-        if not v["outdir"]:
-            messagebox.showwarning("信息不完整", "请选择备份保存位置。", parent=self.root)
+        account = self._find_account(self._selected_account_id)
+        if account is None:
             return
-        selected = [(r["foldername"], r["filename"], r["eml_relpath"], r["display"])
-                    for r in self.folder_rows if r["var"].get()]
-        if not selected:
+        if self._account_credentials(account) is None:
             return
+        if not self._backup_root_ready():
+            return
+        if not any(r["var"].get() for r in self.folder_rows):
+            return
+        self._sync_visible_folder_choices()
+        self._begin_run([account["id"]])
+
+    def _on_start_selected(self) -> None:
+        """备份所选账户：只跑勾选的账户，跳过信息不完整的并逐个提示，按列表顺序串行运行。"""
+        if self.running:
+            return
+        if not self.accounts:
+            messagebox.showwarning("信息不完整", "还没有账户，请先在设置页的「账户」里新增。", parent=self.root)
+            return
+        if not self._backup_root_ready():
+            return
+        chosen = [account for account in self.accounts if account["id"] in self._checked_accounts]
+        if not chosen:
+            messagebox.showwarning("未勾选账户", "请先在左侧勾选要备份的账户。", parent=self.root)
+            return
+        ready: list[dict] = []
+        skipped: list[str] = []
+        for account in chosen:
+            if self._account_credentials(account, warn=False) is None:
+                skipped.append(account_display(account))
+            else:
+                ready.append(account)
+        if skipped:
+            messagebox.showwarning("部分账户将跳过",
+                                   "以下账户信息不完整（缺邮箱地址、收件服务器或密码），本次不备份：\n"
+                                   + "\n".join(skipped), parent=self.root)
+        if not ready:
+            messagebox.showwarning("信息不完整", "勾选的账户信息都不完整，请先在设置页补全账户信息与密码。",
+                                   parent=self.root)
+            return
+        self._sync_visible_folder_choices()
+        self._begin_run([account["id"] for account in ready])
+
+    def _backup_root_ready(self) -> bool:
+        if self.backup_root_var.get().strip():
+            return True
+        messagebox.showwarning("信息不完整", "请先在设置页的「备份」里选择备份保存位置。", parent=self.root)
+        return False
+
+    def _begin_run(self, account_ids: list[str]) -> None:
+        """进入运行态并把参与账户的重跑基线复位（公共入口：单账户与批量都走这里）。"""
         self.running = True
         self.stopping = False
         self.stop_flag.clear()
-        self.server_total = self.pending_total = self.backed_count = 0
-        self._clear_message_rows()
-        self.progress.configure(maximum=1, value=0)
-        self._set_counts("正在统计…")
-        self._set_status("正在连接…", error=False)
+        self._run_account_ids = list(account_ids)
+        self._run_t0 = time.monotonic()
+        for index, account_id in enumerate(account_ids):
+            state = self._state(account_id)
+            state["messages"] = []
+            state["row_index"] = 0
+            state["server_total"] = state["pending_total"] = state["backed"] = 0
+            state["progress"] = None
+            state["result"] = None
+            state["status_error"] = False
+            state["status_text"] = CONNECTING_STATUS_TEXT if index == 0 else QUEUED_STATUS_TEXT
+            state["count_text"] = "尚未开始备份"
+        visible = self._visible_state()
+        if visible is not None:
+            self._render_messages(visible)
+            self._restore_run_state(visible)
         self._begin_run_ui()
-        self.log.info("开始备份运行：%d 个邮箱文件夹，输出 %s（mbox=%s eml=%s）",
-                      len(selected), v["outdir"], v["mbox"], v["eml"])
+        outdir = self.backup_root_var.get().strip()
+        snapshots = self._account_snapshots(account_ids)
+        self.log.info("开始备份运行：%d 个账户，输出 %s", len(snapshots), outdir)
         self._sync_tray()  # 图标常驻时窗口可见也挂着：菜单「停止备份」此刻就该可点
-        threading.Thread(target=self._backup_worker, args=(v, selected), daemon=True).start()
+        threading.Thread(target=self._batch_worker, args=(snapshots, outdir), daemon=True).start()
 
-    def _backup_worker(self, v: dict, selected: list[tuple]) -> None:
-        """备份线程入口：先统计待备份总量、再逐文件夹下载，进度经事件队列回主线程。"""
+    def _account_snapshots(self, account_ids: list[str]) -> list[dict]:
+        """开跑前把参与账户复制一份（含解出的密码）：运行中改设置不影响本次运行。"""
+        snapshots: list[dict] = []
+        for account_id in account_ids:
+            account = self._find_account(account_id)
+            if account is None:
+                continue
+            data = dict(account)
+            data["folders"] = list(account.get("folders", []))
+            data["password"] = self._account_password(account)
+            snapshots.append(data)
+        return snapshots
+
+    def _batch_worker(self, snapshots: list[dict], outdir: str) -> None:
+        """批量线程入口：按顺序逐账户备份，任一账户失败不影响其余；停止则跳过后续账户。"""
         log = logging.getLogger("imapbackup")
-        t0 = time.monotonic()
         eq = self.events
+        failures: list[tuple[str, str]] = []
+        for account in snapshots:
+            account_id = account["id"]
+            if self.stop_flag.is_set():
+                eq.put(("account_skipped", account_id))
+                continue
+            eq.put(("account_begin", account_id))
+            try:
+                self._backup_account(account, outdir, eq, log)
+            except SystemExit as e:
+                failures.append((account_display(account), str(e)))
+                eq.put(("account_failed", account_id, str(e)))
+            except Exception as e:
+                log.exception("账户备份失败：%s", account_display(account))
+                failures.append((account_display(account), f"{type(e).__name__}: {e}"))
+                eq.put(("account_failed", account_id, f"{type(e).__name__}: {e}"))
+        eq.put(("batch_done", self.stop_flag.is_set(), failures))
+
+    def _backup_account(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger) -> None:
+        """单个账户的备份：先统计待备份总量、再逐文件夹下载，进度经事件队列回主线程。
+
+        Note:
+            每次运行都自己 LIST 一次文件夹（不依赖界面上那份清单）：从没连接过的账户在批量里
+            也要能直接跑，且以服务器此刻的文件夹为准。账户目录名取邮箱地址（ADR 0002），
+            账户名称只是显示名、不参与路径。
+        """
+        account_id = account["id"]
+        t0 = time.monotonic()
         backed = 0
+        wanted = {name for name in account.get("folders", []) if isinstance(name, str) and name} or {"INBOX"}
 
         def report(d: dict) -> None:
             nonlocal backed
             backed += 1
-            self.log.debug("已备份 %s：%s", d["folder"], d["msg_id"])
-            eq.put(("message", d))
+            log.debug("已备份 %s：%s", d["folder"], d["msg_id"])
+            eq.put(("message", account_id, d))
 
+        v = {"user": account["user"], "server": account["server"], "password": account["password"],
+             "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)),
+             "port": int(str(account.get("port", DEFAULT_ACCOUNT_PORT)).strip()),
+             "mbox": bool(account.get("mbox", False)), "eml": bool(account.get("eml", True))}
+        root_dir = Path(outdir)
+        basedir = root_dir if v["mbox"] else None
+        eml_root = root_dir if v["eml"] else None
+        cfg = self._core_config(v, basedir, eml_root)
+        log.info("开始备份账户 %s（%s）：目标 %s（mbox=%s eml=%s）",
+                 account_display(account), v["user"], outdir, v["mbox"], v["eml"])
+        server = core.connect_and_login(cfg, log)
+        account_dir = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
         try:
-            root_dir = Path(v["outdir"])
-            basedir = root_dir if v["mbox"] else None
-            eml_root = root_dir if v["eml"] else None
-            cfg = self._core_config(v, basedir, eml_root)
-            server = core.connect_and_login(cfg, log)
-            account = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
+            names = core.get_names(server, False, True, quiet=False, log=log)
+            selected = [n for n in names if n[0] in wanted]
+            if not selected:
+                log.warning("账户 %s：选中的文件夹在服务器上都不存在，本次无备份", account_display(account))
 
             # pass 1: enumerate + incremental scan, so 待备份 total is known before any download
             plans: list[tuple] = []
@@ -2016,7 +2798,7 @@ class BackupApp:
                 if self.stop_flag.is_set():
                     break
                 foldername, filename, eml_relpath, display = n
-                eq.put(("phase", f"扫描 {i}/{len(selected)}：{display}"))
+                eq.put(("phase", account_id, f"扫描 {i}/{len(selected)}：{display}"))
                 try:
                     remote = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
                 except core.SkipFolderException as e:
@@ -2025,49 +2807,47 @@ class BackupApp:
                 # 两种格式各自判重：任一已选格式缺这封就算待备份，写盘时只补缺的那一份。
                 local_mbox: dict[str, str] | None = None
                 if basedir is not None:
-                    local_mbox = core.scan_file(f"{account}/{filename}", False, True, basedir, quiet=False, log=log)
+                    local_mbox = core.scan_file(f"{account_dir}/{filename}", False, True, basedir,
+                                                quiet=False, log=log)
                 local_eml: dict[str, str] | None = None
                 if eml_root is not None:
-                    local_eml = core.scan_eml_dir(eml_root / account / eml_relpath, False, True, quiet=False, log=log)
+                    local_eml = core.scan_eml_dir(eml_root / account_dir / eml_relpath, False, True,
+                                                  quiet=False, log=log)
                 new = core.pending_messages(remote, local_mbox, local_eml)
                 server_total += len(remote)
                 pending_total += len(new)
                 plans.append((n, new, local_mbox, local_eml))
-            eq.put(("totals", server_total, pending_total))
+            eq.put(("totals", account_id, server_total, pending_total))
 
             # pass 2: download; folders were re-selectable because scan_folder moved the selection each time
             if pending_total > 0 and not self.stop_flag.is_set():
                 if basedir is not None:
                     core.ensure_basedir(basedir)
-                    core.create_folder_structure([p[0] for p in plans], basedir, account)
+                    core.create_folder_structure([p[0] for p in plans], basedir, account_dir)
                 for n, new, local_mbox, local_eml in plans:
                     if self.stop_flag.is_set():
                         break
                     foldername, filename, eml_relpath, display = n
                     if not new:
                         continue
-                    eq.put(("phase", f"备份 {display}（{len(new)} 封）"))
+                    eq.put(("phase", account_id, f"备份 {display}（{len(new)} 封）"))
                     typ, data = server.select(f'"{foldername}"', readonly=True)
                     if typ != "OK":
                         self.log.warning("%s：SELECT 失败 %s", display, data)
                         continue
-                    label = f"{account}/{filename}" if basedir is not None else f"{account}/{eml_relpath}"
-                    eml_folder_dir = eml_root / account / eml_relpath if eml_root is not None else None
+                    label = f"{account_dir}/{filename}" if basedir is not None else f"{account_dir}/{eml_relpath}"
+                    eml_folder_dir = eml_root / account_dir / eml_relpath if eml_root is not None else None
                     core.download_messages(server, label, new, False, True, False,
                                            basedir, False, quiet=False, log=log,
                                            eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                            foldername=display,
                                            report=report, should_stop=self.stop_flag.is_set)
+        finally:
             with contextlib.suppress(Exception):
                 server.logout()
-            seconds = time.monotonic() - t0
-            eq.put(("run_done", backed, server_total - pending_total, seconds,
-                    self.stop_flag.is_set(), pending_total))
-        except SystemExit as e:
-            eq.put(("run_failed", str(e)))
-        except Exception as e:
-            self.log.exception("备份运行失败")
-            eq.put(("run_failed", f"{type(e).__name__}: {e}"))
+        seconds = time.monotonic() - t0
+        eq.put(("account_done", account_id, backed, server_total - pending_total, seconds,
+                self.stop_flag.is_set(), pending_total))
 
     def _on_stop(self) -> None:
         """停止中：多处同时给反馈。
@@ -2109,33 +2889,23 @@ class BackupApp:
         elif kind == "folders_loaded":
             self._on_folders_loaded(*ev[1])
         elif kind == "connect_failed":
-            self.connect_state = "idle"
-            self._apply_connect_state()
-            self._update_start_state()
-            messagebox.showerror("连接失败", ev[1], parent=self.root)
+            self._on_connect_failed(*ev[1])
+        elif kind == "account_begin":
+            self._on_account_begin(ev[1])
         elif kind == "phase":
-            self._set_status(ev[1], error=False)
+            self._on_phase(*ev[1:])
         elif kind == "totals":
-            self.server_total, self.pending_total = ev[1], ev[2]
-            self.progress.configure(maximum=max(self.pending_total, 1), value=0)
-            self._refresh_counts()
-            if self.pending_total == 0:
-                self._set_status(UPTODATE_STATUS, error=False)
+            self._on_totals(*ev[1:])
         elif kind == "message":
-            self._add_message_row(ev[1])
-        elif kind == "run_done":
-            hidden = self._background_hidden()
-            self._finish_run(*ev[1:])
-            if hidden:
-                self._notify_run_done_background(*ev[1:])
-        elif kind == "run_failed":
-            hidden = self._background_hidden()
-            self._end_run_controls()
-            self._set_status("备份失败，详见运行日志", error=True)
-            if hidden:
-                self._notify_background(TRAY_TITLE_FAILED, TRAY_BODY_FAILED)
-            else:
-                messagebox.showerror("备份失败", ev[1], parent=self.root)
+            self._on_message_event(*ev[1:])
+        elif kind == "account_done":
+            self._on_account_done(*ev[1:])
+        elif kind == "account_failed":
+            self._on_account_failed(*ev[1:])
+        elif kind == "account_skipped":
+            self._on_account_skipped(ev[1])
+        elif kind == "batch_done":
+            self._on_batch_done(*ev[1:])
         elif kind == "tray_show":
             self._show_window()
         elif kind == "tray_stop":
@@ -2144,15 +2914,138 @@ class BackupApp:
         elif kind == "tray_quit":
             self._on_tray_quit()
 
-    def _notify_run_done_background(self, backed: int, skipped: int, seconds: float,
-                                    stopped: bool, pending: int) -> None:
-        """后台驻留期间的运行结束：完成/停止分别给气泡文案（窗口保持隐藏）。"""
-        if stopped:
-            self._notify_background(TRAY_TITLE_STOPPED, TRAY_BODY_STOPPED)
+    def _on_connect_failed(self, account_id: str, message: str) -> None:
+        state = self._states.get(account_id)
+        if state is not None:
+            state["connect_state"] = "idle"
+        if account_id == self._selected_account_id:
+            self._apply_connect_state()
+            self._update_start_state()
+        messagebox.showerror("连接失败", message, parent=self.root)
+
+    def _on_account_begin(self, account_id: str) -> None:
+        """某账户轮到开跑：清掉它上一轮的行，把状态切到「正在连接」。"""
+        state = self._states.get(account_id)
+        if state is None:
             return
-        seconds_text = _fmt_duration(seconds)
-        self._notify_background(TRAY_TITLE_DONE, f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {seconds_text}")
-        self.log.info("后台驻留期间备份结束：%d 封（待备份 %d）", backed, pending)
+        state["messages"] = []
+        state["row_index"] = 0
+        state["server_total"] = state["pending_total"] = state["backed"] = 0
+        state["progress"] = None
+        state["status_text"] = CONNECTING_STATUS_TEXT
+        state["status_error"] = False
+        state["count_text"] = "正在统计…"
+        if account_id == self._selected_account_id:
+            self._render_messages(state)
+            self._restore_run_state(state)
+
+    def _on_phase(self, account_id: str, text: str) -> None:
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["status_text"] = text
+        state["status_error"] = False
+        if account_id == self._selected_account_id:
+            self._set_status(text, error=False)
+
+    def _on_totals(self, account_id: str, server_total: int, pending_total: int) -> None:
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["server_total"] = server_total
+        state["pending_total"] = pending_total
+        if account_id != self._selected_account_id:
+            return
+        self.server_total, self.pending_total = server_total, pending_total
+        maximum = max(pending_total, 1)
+        self.progress.configure(maximum=maximum, value=0)
+        state["progress"] = (0.0, float(maximum))
+        self._refresh_counts()
+        if pending_total == 0:
+            self._set_status(UPTODATE_STATUS, error=False)
+
+    def _on_message_event(self, account_id: str, data: dict) -> None:
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["messages"].append(data)
+        state["backed"] += 1
+        if account_id != self._selected_account_id:
+            return
+        self.backed_count = state["backed"]
+        self._row_index = state["row_index"] = state["row_index"] + 1
+        self._insert_message_row(data, self._row_index)
+        self._refresh_counts()
+
+    def _on_account_done(self, account_id: str, backed: int, skipped: int, seconds: float,
+                         stopped: bool, pending: int) -> None:
+        """单个账户跑完：写结果文案（停止 / 已是最新 / 完成三态）。"""
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["result"] = ("done", backed, skipped, seconds, pending)
+        if stopped:
+            state["status_text"] = f"已停止：本次备份 {backed} 封"
+        elif pending == 0:
+            state["status_text"] = UPTODATE_STATUS
+        else:
+            state["status_text"] = (f"完成：本次备份 {backed} 封，跳过 {skipped} 封（本地已存在），"
+                                    f"用时 {_fmt_duration(seconds)}")
+        state["status_error"] = False
+        account = self._find_account(account_id)
+        self.log.info("账户 %s 备份结束：备份 %d 封，跳过 %d 封，用时 %s%s",
+                      account_display(account) if account else account_id, backed, skipped,
+                      _fmt_duration(seconds), "（用户停止）" if stopped else "")
+        if account_id != self._selected_account_id:
+            return
+        if not stopped and pending > 0:
+            self.progress.configure(value=self.progress["maximum"])
+            state["progress"] = (float(self.progress["maximum"]), float(self.progress["maximum"]))
+        self._set_status(state["status_text"], error=False)
+
+    def _on_account_failed(self, account_id: str, message: str) -> None:
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["result"] = ("failed", message)
+        state["status_text"] = "备份失败，详见运行日志"
+        state["status_error"] = True
+        if account_id == self._selected_account_id:
+            self._set_status(state["status_text"], error=True)
+
+    def _on_account_skipped(self, account_id: str) -> None:
+        """停止后没轮到的账户：状态退回「已停止」，不动它上一轮的计数与结果。"""
+        state = self._states.get(account_id)
+        if state is None:
+            return
+        state["status_text"] = "已停止（未开始）"
+        state["status_error"] = False
+        if account_id == self._selected_account_id:
+            self._set_status(state["status_text"], error=False)
+
+    def _on_batch_done(self, stopped: bool, failures: list[tuple[str, str]]) -> None:
+        """整个批量结束：复位控件，按后台/前台与成败给一次总结。"""
+        elapsed = time.monotonic() - self._run_t0
+        backed = sum(self._state(aid)["backed"] for aid in self._run_account_ids)
+        skipped = sum(max(self._state(aid)["server_total"] - self._state(aid)["pending_total"], 0)
+                      for aid in self._run_account_ids)
+        hidden = self._background_hidden()
+        self._end_run_controls()
+        self.log.info("备份运行结束：账户 %d 个，备份 %d 封，跳过 %d 封，用时 %s%s",
+                      len(self._run_account_ids), backed, skipped, _fmt_duration(elapsed),
+                      "（用户停止）" if stopped else "")
+        if hidden:
+            if stopped:
+                self._notify_background(TRAY_TITLE_STOPPED, TRAY_BODY_STOPPED)
+            elif failures:
+                self._notify_background(TRAY_TITLE_FAILED, TRAY_BODY_FAILED)
+            else:
+                self._notify_background(TRAY_TITLE_DONE,
+                                        f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {_fmt_duration(elapsed)}")
+            return
+        if failures:
+            detail = failures[0][1] if len(failures) == 1 else f"{len(failures)} 个账户备份失败"
+            messagebox.showerror("备份失败", detail, parent=self.root)
 
     def _end_run_controls(self) -> None:
         self.running = False
@@ -2172,26 +3065,23 @@ class BackupApp:
         # 运行结束：常驻托盘图标的 tooltip 与菜单「停止备份」跟着复位（窗口可见时也挂着）
         self._sync_tray()
 
-    def _finish_run(self, backed: int, skipped: int, seconds: float, stopped: bool, pending: int) -> None:
-        self._end_run_controls()
-        if stopped:
-            self._set_status(f"已停止：本次备份 {backed} 封", error=False)
-        elif pending == 0:
-            self._set_status(UPTODATE_STATUS, error=False)
-        else:
-            self.progress.configure(value=self.progress["maximum"])
-            self._set_status(f"完成：本次备份 {backed} 封，跳过 {skipped} 封（本地已存在），用时 {_fmt_duration(seconds)}",
-                             error=False)
-        self.log.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s", backed, skipped, _fmt_duration(seconds),
-                      "（用户停止）" if stopped else "")
-
     def _set_status(self, text: str, error: bool) -> None:
+        """写状态行（截断显示），并同步进可见账户的状态字典——切账户后还要原样回来。"""
         self._status_full = text
+        self._status_error = error
+        state = self._visible_state()
+        if state is not None:
+            state["status_text"] = text
+            state["status_error"] = error
         self.status_label.configure(foreground="red" if error else "black")
         self._fit_status()
 
     def _set_counts(self, text: str) -> None:
+        """写计数行（截断显示），并同步进可见账户的状态字典。"""
         self._count_full = text
+        state = self._visible_state()
+        if state is not None:
+            state["count_text"] = text
         self._fit_counts()
 
     def _fit_counts(self) -> None:
@@ -2305,9 +3195,13 @@ class BackupApp:
         if children := self.tree.get_children():
             self.tree.delete(*children)
         self._row_index = 0
+        state = self._visible_state()
+        if state is not None:
+            state["row_index"] = 0
         self._toggle_hint(self.list_ph, True)
 
-    def _add_message_row(self, d: dict) -> None:
+    def _insert_message_row(self, d: dict, row_index: int) -> None:
+        """把一封邮件画进邮件列表的第 row_index 行（斑马纹按视觉行号奇偶）。"""
         dt: datetime = d["timestamp"]
         ts_fmt = "%m-%d %H:%M" if dt.year == datetime.now().year else "%Y-%m-%d %H:%M"
         sender_raw = core.decode_mime_words(d["from"]) if d["from"] else ""
@@ -2315,16 +3209,13 @@ class BackupApp:
         sender = name or addr or "?"
         subject = core.decode_mime_words(d["subject"]) if d["subject"] else ""
         # 行都是 append 到 "end"，插入顺序即显示顺序，按序号奇偶就是按视觉行号
-        self._row_index += 1
-        if self._row_index == 1:
+        if row_index == 1:
             self._toggle_hint(self.list_ph, False)
-        tags = (ZEBRA_TAG,) if self._row_index % 2 == 0 else ()
+        tags = (ZEBRA_TAG,) if row_index % 2 == 0 else ()
         iid = self.tree.insert("", "end", values=(sender, subject or "(no subject)",
                                                   dt.strftime(ts_fmt), d["folder"],
                                                   core.pretty_byte_count(d["size"])), tags=tags)
         self.tree.see(iid)
-        self.backed_count += 1
-        self._refresh_counts()
 
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")

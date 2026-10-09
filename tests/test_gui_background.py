@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import sys
+import time
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -277,12 +278,17 @@ def test_tray_stop_event_only_stops_a_running_backup(app):
 
 def test_run_finished_in_background_only_sends_a_balloon(app, tray):
     """后台隐藏期间备份结束：窗口保持隐藏，只弹托盘气泡。"""
+    state = app._state("acc")
+    state.update({"backed": 3, "server_total": 10, "pending_total": 3})
+    app._run_account_ids = ["acc"]
+    app._run_t0 = time.monotonic() - 61.1   # 留点余量：_fmt_duration 取整后仍是 1:01
     app.root.withdraw()
     app.running = True
-    app._handle_event(("run_done", 3, 7, 61.5, False, 3))
+    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 3))
+    app._handle_event(("batch_done", False, []))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_DONE,
-            f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.5)}") in tray.calls
+            f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.1)}") in tray.calls
     assert tray.running is False
     assert tray.tooltip == g.TRAY_TOOLTIP_IDLE
 
@@ -290,7 +296,10 @@ def test_run_finished_in_background_only_sends_a_balloon(app, tray):
 def test_stopped_run_in_background_sends_the_stopped_balloon(app, tray):
     app.root.withdraw()
     app.running = True
-    app._handle_event(("run_done", 0, 0, 3.0, True, 5))
+    app._run_account_ids = ["acc"]
+    app._run_t0 = time.monotonic() - 3.0
+    app._handle_event(("account_done", "acc", 0, 0, 3.0, True, 5))
+    app._handle_event(("batch_done", True, []))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_STOPPED, g.TRAY_BODY_STOPPED) in tray.calls
 
@@ -300,7 +309,9 @@ def test_failed_run_in_background_does_not_pop_a_dialog(app, tray, monkeypatch):
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: pytest.fail("后台不该弹错误框"))
     app.root.withdraw()
     app.running = True
-    app._handle_event(("run_failed", "boom"))
+    app._run_account_ids = ["acc"]
+    app._handle_event(("account_failed", "acc", "boom"))
+    app._handle_event(("batch_done", False, [("主账户", "boom")]))
     assert ("notify", g.TRAY_TITLE_FAILED, g.TRAY_BODY_FAILED) in tray.calls
 
 
@@ -309,7 +320,9 @@ def test_visible_run_finished_keeps_the_dialog_path(app, monkeypatch):
     shown = []
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: shown.append(a))
     app.running = True
-    app._handle_event(("run_failed", "boom"))
+    app._run_account_ids = ["acc"]
+    app._handle_event(("account_failed", "acc", "boom"))
+    app._handle_event(("batch_done", False, [("主账户", "boom")]))
     assert shown
 
 
@@ -410,6 +423,10 @@ def test_settings_page_lists_the_sections_and_selects_the_first(app):
     assert [app.settings_nav.get(i) for i in range(app.settings_nav.size())] == \
         [title for _key, title in g.SETTINGS_SECTIONS]
     app._show_page(g.PAGE_SETTINGS)
+    # 进设置页默认落在第一个分类（账户）；切到「窗口与后台」再看它自己的详情
+    assert app.settings_nav.curselection() == (0,)
+    assert app._settings_section == g.SETTINGS_SECTIONS[0][0]
+    app._show_settings_section(g.SETTINGS_WINDOW_SECTION)
     index = [key for key, _title in g.SETTINGS_SECTIONS].index(g.SETTINGS_WINDOW_SECTION)
     assert app.settings_nav.curselection() == (index,)
     assert app._settings_section == g.SETTINGS_WINDOW_SECTION
