@@ -160,8 +160,11 @@ DEFAULT_ACCOUNT_SSL = True
 DEFAULT_ACCOUNT_PORT = "993"
 DEFAULT_BACKUP_ROOT = str(Path.home() / "邮箱备份")
 CARD_EMPTY_TEXT = "—"               # 未选中账户时只读信息卡的占位
-PASSWORD_SAVED_TEXT = "已保存"       # 密码行不回显任何明文或掩码位数
-PASSWORD_MISSING_TEXT = "未设置"
+# 密码框的固定掩码：8 颗星，不回显内容也不透露真实位数；同时充当「未改动」哨兵——
+# 原样保存 = 不修改已存密文，清空 = 删除已存密码，其余内容按新密码加密（见 _on_account_save）。
+PASSWORD_MASK_TEXT = "********"
+MAIL_TYPE_TEXT = "IMAP（仅接收，不发送）"   # 邮箱类型行的值：设置页表单与备份页卡片共用
+HEADING_SIZE_DELTA = 2              # 设置页分类标题相对正文的字号增量(pt)
 # 账户行配色：底色取对话框灰（行是自绘控件，不再有 Listbox 的白底），选中行沿用系统高亮色，
 # 与原 Listbox 的选中蓝完全一致，且跟随系统主题。
 ACCOUNT_ROW_BG = "SystemButtonFace"
@@ -264,9 +267,14 @@ def _italic_font(base: tkfont.Font) -> tkfont.Font:
     return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), slant="italic")
 
 
-def _bold_font(base: tkfont.Font) -> tkfont.Font:
-    """返回同一字体的加粗版（设置页分组标题用，口径与 _italic_font 一致）。"""
-    return tkfont.Font(family=base.cget("family"), size=abs(int(base.cget("size"))), weight="bold")
+def _heading_font(base: tkfont.Font) -> tkfont.Font:
+    """返回设置页分类标题字体：加粗、比基准大 HEADING_SIZE_DELTA 磅。
+
+    Note:
+        size 取绝对值——系统默认字号可能是负数（DPI 无关），Font 构造要正数。
+    """
+    return tkfont.Font(family=base.cget("family"),
+                       size=abs(int(base.cget("size"))) + HEADING_SIZE_DELTA, weight="bold")
 
 
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
@@ -748,35 +756,34 @@ class BackupApp:
         group.columnconfigure(1, weight=1)
 
         tk.Label(group, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
-        tk.Label(group, text="IMAP（仅接收，不发送）", anchor="w").grid(row=0, column=1, columnspan=4, sticky="w", pady=3)
+        tk.Label(group, text=MAIL_TYPE_TEXT, anchor="w").grid(row=0, column=1, columnspan=5, sticky="w", pady=3)
 
         self._card_labels: dict[str, tk.Label] = {}
-        for row, (key, caption) in enumerate((("user", "邮箱地址："), ("server", "收件服务器：")), start=1):
-            tk.Label(group, text=caption).grid(row=row, column=0, sticky="e", padx=(8, 0), pady=3)
-            label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-            label.grid(row=row, column=1, columnspan=4, sticky="we", padx=4, pady=3)
-            self._card_labels[key] = label
+        tk.Label(group, text="邮箱地址：").grid(row=1, column=0, sticky="e", padx=(8, 0), pady=3)
+        user_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        user_label.grid(row=1, column=1, columnspan=5, sticky="we", padx=4, pady=3)
+        self._card_labels["user"] = user_label
 
-        tk.Label(group, text="SSL：").grid(row=3, column=0, sticky="e", padx=(8, 0), pady=3)
+        # 收件服务器与 SSL、端口同排（foxmail 版式）；卡片是只读展示，SSL 报「是/否」而非复选框
+        tk.Label(group, text="收件服务器：").grid(row=2, column=0, sticky="e", padx=(8, 0), pady=3)
+        server_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
+        server_label.grid(row=2, column=1, sticky="we", padx=4, pady=3)
+        self._card_labels["server"] = server_label
+        tk.Label(group, text="SSL：").grid(row=2, column=2, sticky="e", padx=(8, 0), pady=3)
         ssl_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        ssl_label.grid(row=3, column=1, sticky="w", padx=4, pady=3)
+        ssl_label.grid(row=2, column=3, sticky="w", padx=4, pady=3)
         self._card_labels["ssl"] = ssl_label
-        tk.Label(group, text="端口：").grid(row=3, column=2, sticky="e", padx=(8, 0), pady=3)
+        tk.Label(group, text="端口：").grid(row=2, column=4, sticky="e", padx=(8, 0), pady=3)
         port_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        port_label.grid(row=3, column=3, columnspan=2, sticky="w", padx=4, pady=3)
+        port_label.grid(row=2, column=5, sticky="w", padx=(4, 8), pady=3)
         self._card_labels["port"] = port_label
-
-        tk.Label(group, text="密码：").grid(row=4, column=0, sticky="e", padx=(8, 0), pady=3)
-        password_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        password_label.grid(row=4, column=1, columnspan=4, sticky="we", padx=4, pady=3)
-        self._card_labels["password"] = password_label
 
         self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=CONNECT_BTN_CHARS,
                                                      command=self._on_connect))
-        self.connect_btn.grid(row=5, column=0, columnspan=6, pady=(10, 10))
+        self.connect_btn.grid(row=3, column=0, columnspan=6, pady=(10, 10))
         # 按需挂出：无提示时 grid_remove 让出这一行，按钮位置不变，让出的高度由下方邮件列表吸收
         self.conn_hint = tk.Label(group, text="")
-        self.conn_hint.grid(row=6, column=0, columnspan=6, pady=(0, 8))
+        self.conn_hint.grid(row=4, column=0, columnspan=6, pady=(0, 8))
         self.conn_hint.grid_remove()
 
     def _build_output_group(self, parent: tk.Frame) -> None:
@@ -912,9 +919,9 @@ class BackupApp:
             保存是显式动作（含校验与落盘）：表单里可能只填了一半，逐键生效会把半成品写进设置。
         """
         body = tk.Frame(parent)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
         tk.Label(body, text=title, anchor="w",
-                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+                 font=_heading_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
         tk.Label(body, text=ACCOUNTS_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
                  wraplength=TIP_WRAP).pack(fill="x", pady=(4, 0))
 
@@ -942,33 +949,36 @@ class BackupApp:
         self._acct_ssl_var = tk.BooleanVar(value=DEFAULT_ACCOUNT_SSL)
         self._acct_port_var = tk.StringVar(value=DEFAULT_ACCOUNT_PORT)
         self._acct_password_var = tk.StringVar()
+        # 行序与收件服务器那排照 foxmail 的连接设置：类型置顶，SSL 与端口并进服务器行
+        tk.Label(form, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(0, 4), pady=3)
+        tk.Label(form, text=MAIL_TYPE_TEXT, anchor="w").grid(row=0, column=1, columnspan=4, sticky="w", pady=3)
         form_entries = [
-            self._account_form_row(form, 0, "名称：", self._acct_name_var),
-            self._account_form_row(form, 1, "邮箱地址：", self._acct_user_var),
+            self._account_form_row(form, 1, "名称：", self._acct_name_var),
+            self._account_form_row(form, 2, "邮箱地址：", self._acct_user_var),
         ]
-        server_entry = self._account_form_row(form, 2, "收件服务器：", self._acct_server_var)
+        server_entry = self._account_form_row(form, 3, "收件服务器：", self._acct_server_var)
         form_entries.append(server_entry)
-
-        ssl_row = tk.Frame(form)
-        ssl_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
-        tk.Checkbutton(ssl_row, text="SSL", variable=self._acct_ssl_var,
-                       command=self._on_acct_ssl_toggle).pack(side="left")
-        tk.Label(ssl_row, text="端口：").pack(side="left", padx=(16, 4))
-        port_entry = tk.Entry(ssl_row, textvariable=self._acct_port_var, width=7)
-        port_entry.pack(side="left")
+        ssl_check = tk.Checkbutton(form, text="SSL", variable=self._acct_ssl_var,
+                                   command=self._on_acct_ssl_toggle)
+        ssl_check.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=3)
+        tk.Label(form, text="端口：").grid(row=3, column=3, sticky="e", padx=(4, 4), pady=3)
+        port_entry = tk.Entry(form, textvariable=self._acct_port_var, width=7)
+        port_entry.grid(row=3, column=4, sticky="w", pady=3)
         form_entries.append(port_entry)
 
         tk.Label(form, text="密码：").grid(row=4, column=0, sticky="e", padx=(0, 4), pady=3)
         self._acct_password_entry = tk.Entry(form, textvariable=self._acct_password_var, show="*")
-        self._acct_password_entry.grid(row=4, column=1, sticky="we", pady=3)
-        tk.Label(form, text="留空则不修改已保存的密码", anchor="w", foreground=EMPTY_HINT_FG).grid(
-            row=5, column=1, sticky="w", pady=(0, 6))
-        tk.Button(form, text="保存", width=10, command=self._on_account_save).grid(row=6, column=1, sticky="w")
+        self._acct_password_entry.grid(row=4, column=1, columnspan=4, sticky="we", pady=3)
+        tk.Button(form, text="保存", width=10, command=self._on_account_save).grid(
+            row=5, column=1, sticky="w", pady=(6, 0))
 
         for entry in [*form_entries, self._acct_password_entry]:
             for key in ("<Return>", "<KP_Enter>"):
                 entry.bind(key, lambda _e: self._on_account_save())
             entry.bind("<Button-3>", self._on_entry_context)
+        self._acct_password_entry.bind("<KeyPress>", self._on_acct_password_key)
+        self._acct_password_entry.bind("<<Paste>>", self._on_acct_password_clip)
+        self._acct_password_entry.bind("<<Cut>>", self._on_acct_password_clip)
         self._account_form_entries = [*form_entries, self._acct_password_entry]
 
     def _account_form_row(self, form: tk.Frame, row: int, caption: str, var: tk.StringVar) -> tk.Entry:
@@ -981,9 +991,9 @@ class BackupApp:
     def _build_backup_settings(self, parent: tk.Frame, title: str) -> None:
         """「备份」分类：全局唯一的备份保存位置（所有账户共用，见 ADR 0010）。"""
         body = tk.Frame(parent)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
         tk.Label(body, text=title, anchor="w",
-                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+                 font=_heading_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
 
         row = tk.Frame(body)
         row.pack(fill="x", pady=(10, 0))
@@ -1002,9 +1012,9 @@ class BackupApp:
             控件不进 _register 名单：关闭行为不影响正在跑的备份，运行中也不必跟着禁用。
         """
         body = tk.Frame(parent)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
         tk.Label(body, text=title, anchor="w",
-                 font=_bold_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
+                 font=_heading_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
         self._settings_action_var = tk.StringVar(value=DEFAULT_CLOSE_ACTION)
         for value, label in CLOSE_ACTION_LABELS:
             tk.Radiobutton(body, text=label, value=value, variable=self._settings_action_var,
@@ -1740,16 +1750,15 @@ class BackupApp:
         self._update_start_state()
 
     def _render_card(self, account: dict | None) -> None:
-        """只读信息卡：账户缺失时全部显示占位符，密码只报「已保存/未设置」。"""
+        """只读信息卡：账户缺失时全部显示占位符；密码不在卡片上（只在设置页账户表单维护）。"""
         if account is None:
             values = {"user": CARD_EMPTY_TEXT, "server": CARD_EMPTY_TEXT, "ssl": CARD_EMPTY_TEXT,
-                      "port": CARD_EMPTY_TEXT, "password": CARD_EMPTY_TEXT}
+                      "port": CARD_EMPTY_TEXT}
         else:
             values = {"user": account.get("user") or CARD_EMPTY_TEXT,
                       "server": account.get("server") or CARD_EMPTY_TEXT,
                       "ssl": "是" if account.get("ssl", DEFAULT_ACCOUNT_SSL) else "否",
-                      "port": str(account.get("port") or CARD_EMPTY_TEXT),
-                      "password": PASSWORD_SAVED_TEXT if account.get("password_dpapi") else PASSWORD_MISSING_TEXT}
+                      "port": str(account.get("port") or CARD_EMPTY_TEXT)}
         for key, label in self._card_labels.items():
             label.configure(text=values[key])
         self._render_backup_root()
@@ -1809,13 +1818,13 @@ class BackupApp:
         self._load_account_form(account)
 
     def _load_account_form(self, account: dict) -> None:
-        """把账户记录填进表单；密码框始终留空（留空 = 不修改已保存的密码）。"""
+        """把账户记录填进表单；已存密码只显示固定掩码（原样保存 = 不修改，清空 = 删除）。"""
         self._acct_name_var.set(account.get("name", ""))
         self._acct_user_var.set(account.get("user", ""))
         self._acct_server_var.set(account.get("server", ""))
         self._acct_ssl_var.set(bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)))
         self._acct_port_var.set(str(account.get("port", DEFAULT_ACCOUNT_PORT)))
-        self._acct_password_var.set("")
+        self._acct_password_var.set(PASSWORD_MASK_TEXT if account.get("password_dpapi") else "")
 
     def _clear_account_form(self) -> None:
         self._acct_name_var.set("")
@@ -1824,6 +1833,27 @@ class BackupApp:
         self._acct_ssl_var.set(DEFAULT_ACCOUNT_SSL)
         self._acct_port_var.set(DEFAULT_ACCOUNT_PORT)
         self._acct_password_var.set("")
+
+    def _on_acct_password_key(self, event) -> None:
+        """掩码保护（键盘）：会改文本的按键先清掉掩码，再让按键落进空框。
+
+        Note:
+            掩码是「已保存」的哨兵、不是密码内容，在它中间插字符会拼出假密码；导航键
+            （方向、Home/End、Tab、Esc）与 Ctrl+A 等控制组合不改内容，直接放行。
+        """
+        if self._acct_password_var.get() != PASSWORD_MASK_TEXT:
+            return
+        if event.keysym in ("BackSpace", "Delete") or (event.char and event.char.isprintable()):
+            self._acct_password_entry.delete(0, "end")
+
+    def _on_acct_password_clip(self, _event=None) -> None:
+        """掩码保护（剪贴板）：<<Paste>>/<<Cut>> 落在掩码上时先把整框清掉。
+
+        Note:
+            不拦的话，粘贴会插进掩码中间、剪切会留下半截星号，保存时都变成假密码。
+        """
+        if self._acct_password_var.get() == PASSWORD_MASK_TEXT:
+            self._acct_password_entry.delete(0, "end")
 
     def _on_acct_ssl_toggle(self) -> None:
         """SSL 勾选联动默认端口：只在端口仍是 993/143 这两个默认值时替换。"""
@@ -1862,7 +1892,7 @@ class BackupApp:
         self.log.info("删除账户 %s", account_display(account))
 
     def _on_account_save(self) -> None:
-        """校验并保存当前编辑的账户；密码框留空表示不修改已存密码。"""
+        """校验并保存当前编辑的账户；密码框原样（掩码）= 不修改，清空 = 删除已存密码。"""
         account = self._find_account(self._editing_account_id)
         if account is None:
             return
@@ -1882,18 +1912,21 @@ class BackupApp:
             messagebox.showwarning("端口无效", "端口必须是 1-65535 的整数。", parent=self.root)
             return
         password = self._acct_password_var.get()
-        if password:
+        if password == PASSWORD_MASK_TEXT:
+            pass                                  # 掩码原样：未改动，保留已存密文
+        elif password:
             cipher = _dpapi_encrypt(password) if sys.platform == "win32" else None
             if cipher is None:
                 messagebox.showwarning("无法保存密码", "密码加密失败，本次未保存密码。", parent=self.root)
             else:
                 account["password_dpapi"] = cipher
+        else:
+            account.pop("password_dpapi", None)   # 删空 = 删除已存密码
         account["name"] = self._acct_name_var.get().strip()
         account["user"] = user
         account["server"] = server
         account["ssl"] = bool(self._acct_ssl_var.get())
         account["port"] = str(port)
-        self._acct_password_var.set("")
         self._refresh_account_list()
         self._refresh_edit_list(account["id"])
         self._refresh_stale(account["id"])

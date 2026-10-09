@@ -1840,7 +1840,13 @@ def test_backup_detail_has_no_entry_widgets(app):
     assert entries == [], entries
     assert current_account(app) is not None
     assert app.card_root_label.cget("text") == app.backup_root_var.get().strip()
-    assert app._card_labels["password"].cget("text") in (g.PASSWORD_SAVED_TEXT, g.PASSWORD_MISSING_TEXT)
+
+    # 卡片不再有密码行（密码只在设置页表单里维护）；SSL 与端口并进收件服务器同一行（foxmail 版式）
+    assert "password" not in app._card_labels
+    assert any(isinstance(w, tk.Label) and w.cget("text") == g.MAIL_TYPE_TEXT for w in walk(app.conn_group))
+    server_row = int(app._card_labels["server"].grid_info()["row"])
+    assert int(app._card_labels["ssl"].grid_info()["row"]) == server_row
+    assert int(app._card_labels["port"].grid_info()["row"]) == server_row
 
 
 def test_format_checkboxes_are_per_account(app):
@@ -2230,3 +2236,119 @@ def test_entry_context_menu_items_grey_out(app, monkeypatch):
     assert app._entry_menu.entrycget(g.MENU_COPY_LABEL, "state") == "disabled"
     assert app._entry_menu.entrycget(g.MENU_PASTE_LABEL, "state") == "disabled"
     entry["state"] = "normal"
+
+
+def test_account_form_password_mask_reflects_the_saved_password(app):
+    """密码框不回显内容：已存密码的账户显示固定掩码（不代表位数），没有密码的账户是空框。"""
+    saved = dict(current_account(app), password_dpapi="cipher")
+    app._load_account_form(saved)
+    assert app._acct_password_var.get() == g.PASSWORD_MASK_TEXT
+    assert app._acct_password_entry.get() == g.PASSWORD_MASK_TEXT
+
+    plain = {key: value for key, value in saved.items() if key != "password_dpapi"}
+    app._load_account_form(plain)
+    assert app._acct_password_var.get() == ""
+
+    app._load_account_form(current_account(app))   # 表单复位到当前选中账户
+
+
+def test_password_box_saves_keeps_and_clears(app):
+    """密码框三态保存语义：掩码原样 = 不修改，清空 = 删除已存密码，其余 = 写入新密码。"""
+    if not DPAPI_OK:
+        pytest.skip("非 Windows 没有可用的加密密码")
+    account = g.new_account()
+    account.update({"name": "密码语义", "user": "pw@example.com", "server": "imap.pw.com", "port": "993"})
+    app.accounts.append(account)
+    app._refresh_account_list()
+    app._refresh_edit_list(account["id"])
+    assert app._editing_account_id == account["id"]
+
+    app._acct_password_var.set("新密码-1")
+    app._on_account_save()
+    assert g._dpapi_decrypt(account["password_dpapi"]) == "新密码-1"
+    assert app._acct_password_var.get() == g.PASSWORD_MASK_TEXT, "保存后按新状态回填掩码"
+
+    cipher = account["password_dpapi"]
+    app._on_account_save()                                     # 掩码原样：一个字节都不动
+    assert account["password_dpapi"] == cipher
+
+    app._acct_password_var.set("")
+    app._on_account_save()                                     # 清空 = 删除已存密码
+    assert "password_dpapi" not in account
+
+    app.accounts.remove(account)
+    app._states.pop(account["id"], None)
+    app._refresh_account_list()
+    app._refresh_edit_list(current_account(app)["id"])
+
+
+def test_password_mask_guards_typing_and_paste(app):
+    """掩码保护：会改文本的动作先整框清空，导航键放行——免得在掩码中间拼出假密码。"""
+    entry = app._acct_password_entry
+    app._acct_password_var.set(g.PASSWORD_MASK_TEXT)
+
+    app._on_acct_password_key(SimpleNamespace(keysym="Left", char=""))      # 导航键：掩码不动
+    assert entry.get() == g.PASSWORD_MASK_TEXT
+    app._on_acct_password_key(SimpleNamespace(keysym="a", char="a"))        # 打字：先清空再落字符
+    assert entry.get() == ""
+    app._acct_password_var.set(g.PASSWORD_MASK_TEXT)
+    app._on_acct_password_key(SimpleNamespace(keysym="BackSpace", char="\x08"))
+    assert entry.get() == ""
+    app._acct_password_var.set(g.PASSWORD_MASK_TEXT)
+    app._on_acct_password_clip()                                           # 粘贴/剪切：先清空
+    assert entry.get() == ""
+
+    # 不是掩码的内容（用户自己敲的）概不插手
+    app._acct_password_var.set("typed")
+    app._on_acct_password_key(SimpleNamespace(keysym="a", char="a"))
+    app._on_acct_password_clip()
+    assert entry.get() == "typed"
+    app._acct_password_var.set("")
+
+
+def test_settings_section_titles_use_a_bigger_bold_font(app):
+    """设置页分类标题：加粗、比正文大 HEADING_SIZE_DELTA 磅（拉开层级，用户口径）。"""
+    def walk(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from walk(child)
+
+    base_size = abs(int(tkfont.nametofont("TkDefaultFont").cget("size")))
+    for key, title in g.SETTINGS_SECTIONS:
+        label = next(w for w in walk(app._settings_sections[key])
+                     if isinstance(w, tk.Label) and w.cget("text") == title)
+        font = tkfont.Font(font=label.cget("font"))
+        assert int(font.cget("size")) == base_size + g.HEADING_SIZE_DELTA, (title, font.cget("size"))
+        assert str(font.cget("weight")) == "bold", title
+
+
+def test_settings_detail_padding_matches_the_8px_gap(app):
+    """设置页右详情四边内边距 = 面板间距 8px：内容留白与栏间缝共用同一条基线。"""
+    for key, title in g.SETTINGS_SECTIONS:
+        body = app._settings_sections[key].winfo_children()[0]
+        info = body.pack_info()
+        assert (int(info["padx"]), int(info["pady"])) == (8, 8), (title, info)
+
+
+def test_account_form_follows_the_mail_client_layout(app):
+    """账户表单照 foxmail 的连接设置：类型置顶，收件服务器与 SSL、端口同一行，密码提示已撤。"""
+    def walk(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from walk(child)
+
+    section = app._settings_sections[g.SETTINGS_ACCOUNTS_SECTION]
+    captions = ("邮箱类型：", "名称：", "邮箱地址：", "收件服务器：", "SSL", "端口：", "密码：")
+    widgets = {}
+    for widget in walk(section):
+        if isinstance(widget, (tk.Label, tk.Checkbutton)) and str(widget.cget("text")) in captions:
+            widgets[str(widget.cget("text"))] = widget
+    assert set(widgets) == set(captions), sorted(widgets)
+    rows = {name: int(widget.grid_info()["row"]) for name, widget in widgets.items()}
+    assert rows["邮箱类型："] < rows["名称："] < rows["邮箱地址："] < rows["收件服务器："]
+    assert rows["收件服务器："] == rows["SSL"] == rows["端口："] < rows["密码："]
+    assert any(isinstance(w, tk.Label) and w.cget("text") == g.MAIL_TYPE_TEXT for w in walk(section))
+    assert not any(isinstance(w, tk.Label) and "留空" in str(w.cget("text")) for w in walk(section))
+    # 输入框顺序不变：名称 / 邮箱地址 / 收件服务器 / 端口 / 密码（Enter 保存与右键菜单靠它索引）
+    assert int(app._account_form_entries[2].grid_info()["row"]) == rows["收件服务器："]
+    assert int(app._account_form_entries[3].grid_info()["row"]) == rows["收件服务器："]
