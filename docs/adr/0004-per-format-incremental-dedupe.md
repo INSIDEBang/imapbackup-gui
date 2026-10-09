@@ -8,7 +8,7 @@ Status: accepted
 
 并集语义把两种输出当成"同一种备份的两个副本、有一个就够"，但两者是用户各自要保留的输出，各自有独立的完整性。用户要问的是"mbox 里有这封吗"，不是"任意一份里有吗"。
 
-实现：`main()` 与 GUI 的 `_backup_worker` 不再把 `scan_file` 与 `scan_eml_dir` 的结果 `update` 进同一个 dict，而是分别保存；只把**已选**格式的结果放进 `selected`，`any(mid not in local for local in selected)` 决定待备份；`download_messages` 新增 `skip_mbox` / `skip_eml`（默认为 None，保持单格式与 CLI 现状不变），逐封循环里对两个输出各自加 `msg_id not in skip_*` 门控。
+实现：`main()` 与 GUI 的账户备份入口（原 `_backup_worker`，多账户后为 `_backup_account`）不再把 `scan_file` 与 `scan_eml_dir` 的结果 `update` 进同一个 dict，而是分别保存；只把**已选**格式的结果放进 `selected`，`any(mid not in local for local in selected)` 决定待备份；`download_messages` 新增 `skip_mbox` / `skip_eml`（默认为 None，保持单格式与 CLI 现状不变），逐封循环里对两个输出各自加 `msg_id not in skip_*` 门控。
 
 ## Considered Options
 

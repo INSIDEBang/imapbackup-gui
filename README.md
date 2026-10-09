@@ -64,7 +64,7 @@ python imapbackup312.py --help
 python imapbackup_gui.py
 ```
 
-A single-window front-end for people who would rather not use a terminal: fill in the server, account and password, connect to load the account's folder tree (collapsible, with cascade-selectable checkboxes), pick a backup folder and the mbox/eml output, then start the backup and watch each message appear in the table with live server/pending/backed counts. Stop is cooperative (it finishes the current message), reruns are incremental, and the app data goes to `%LOCALAPPDATA%\imapbackup-gui\`: daily logs under `log\` plus per-user UI settings, including global mail-list column widths. Passwords and other credentials are never saved. It runs the same backup code as the CLI above, so the two never drift apart. The interface text is Chinese.
+A single-window front-end for people who would rather not use a terminal: manage your accounts (name, address, server, SSL, port, password) in the Settings page, pick one in the list on the left of the backup page and connect to load that account's folder tree (collapsible, with cascade-selectable checkboxes), choose the mbox/eml output format, then start the backup and watch each message appear in the table with live server/pending/backed counts. "备份所选" runs every checked account in list order (accounts are checked by default; the row checkboxes plus 全选/反选/清空 pick the set); each account keeps its own folders, message list and progress, and one failing account does not stop the others. Stop is cooperative (it finishes the current message), reruns are incremental, and the app data goes to `%LOCALAPPDATA%\imapbackup-gui\`: daily logs under `log\` plus per-user UI settings. Passwords are stored in the settings file encrypted with the Windows DPAPI (current user, current machine only), never in plain text. It runs the same backup code as the CLI above, so the two never drift apart. The interface text is Chinese.
 
 ## What Changed in 1.5.2 (Experimental Python 3.12 modernization)
 
@@ -117,8 +117,16 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 **GUI settings and recovery contract**
 
-* UI settings are global to the Windows user, not keyed by account, folder or backup root. The versioned settings file stores normal window geometry, maximized state, mail-list column widths and the close-button preference; it restores normal geometry before maximization, keeps the last normal geometry while maximized, and falls back to the default position if a saved position is entirely off the current displays.
-* The settings file never contains passwords, server credentials, session tokens or message content. A missing, corrupt, incompatible or unwritable settings file must not block the GUI, connection or backup: recover with defaults or the last successfully saved values, keep the current process state, and report a diagnostic warning through the run log (or the existing console/status fallback when logging is unavailable).
+* UI settings are global to the Windows user, not keyed by account, folder or backup root. The versioned settings file stores normal window geometry, maximized state, mail-list column widths, the close-button preference, the account list, and the (single, shared) backup root; it restores normal geometry before maximization, keeps the last normal geometry while maximized, and falls back to the default position if a saved position is entirely off the current displays.
+* A missing, corrupt, incompatible or unwritable settings file must not block the GUI, connection or backup: recover with defaults or the last successfully saved values, keep the current process state, and report a diagnostic warning through the run log (or the existing console/status fallback when logging is unavailable). Settings written by an older build (version 1, single account) are migrated on read: the old account becomes the first entry of the account list and its backup folder becomes the shared backup root.
+
+**Multiple accounts**
+
+* Accounts are managed in the Settings page ("账户"): add, edit and delete them there, with the password encrypted through DPAPI (current user, current machine) — the file never holds plain-text credentials. The "备份" category holds the one backup root shared by every account; each account's output stays under `<backup-root>/<email address>/`, so backups never mix (ADR 0002).
+* The backup page is a two-pane layout: the account list on the left, the selected account's detail on the right. The detail shows the connection information and the backup root as a read-only card — no text fields — and the only editable controls are the mbox/eml format checkboxes and the folder selection tree, both stored per account.
+* Each account keeps its own folder selection (defaults to INBOX for a new account), message list, counts, progress and status; switching accounts does not interrupt a connection or a run in progress.
+* "备份所选" backs up every checked account in list order, one after another. Each row carries a checkbox and 全选/反选/清空 switch the whole set; a new or restored account starts checked, and the set is UI state that is not written to the settings file. A failing account is logged and reported without stopping the rest; Stop finishes the current message and skips the remaining accounts.
+* The account name is a display-only label: renaming it never moves existing backups or causes messages to be downloaded again.
 
 **Background backup and the tray**
 
