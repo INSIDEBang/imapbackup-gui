@@ -123,6 +123,8 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 **Multiple accounts**
 
 * Accounts are managed in the Settings page ("账户"): add, edit and delete them there, with the password encrypted through DPAPI (current user, current machine) — the file never holds plain-text credentials. The password box shows a fixed mask once a password is stored, never the secret or its length: saving it untouched keeps the stored password, clearing it removes the password, and typing anything else stores the new one. The "备份" category holds the one backup root shared by every account; each account's output stays under `<backup-root>/<email address>/`, so backups never mix (ADR 0002).
+* "Add" opens a modal form dialog with the same fields as the edit form: closing or cancelling it discards the whole new account (no half-filled entry is left behind), and a successful save flashes "已保存" beside its Save button, closes the dialog shortly after, and selects the new account. Deleting asks for confirmation in a dialog centered on the main window (the wording is unchanged; already-backed-up mail is never deleted).
+* Saving in the edit form reports the result beside its Save button — a green "已保存" that clears itself after a few seconds, or red text stating the exact reason (missing address/server, bad port) — instead of popping a warning dialog.
 * The backup page is a two-pane layout: the account list on the left, the selected account's detail on the right. The detail shows the connection information and the backup root as a read-only card — no text fields — and the only editable controls are the mbox/eml format checkboxes and the folder selection tree, both stored per account.
 * The account list scrolls on its own once the accounts no longer fit the pane; the scrollbar only appears then, and the mouse wheel moves it one row per notch.
 * Each account keeps its own folder selection (defaults to INBOX for a new account), message list, counts, progress and status; switching accounts does not interrupt a connection or a run in progress.
@@ -132,6 +134,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 **Connection folded into the backup run**
 
 * There is no separate "connect" button any more. Folder lists load silently in the background (on startup, on switching accounts, and after saving an account), so the folder tree simply fills in on its own; a failure only writes to the run log.
+* While a folder list is loading (including a manual reload from the ⟳ button in the pane's top-right corner), the folder pane shows an in-panel loading spinner instead of the tree and disables that button; the spinner follows the selected account only, and a failure brings back the old tree or hint as before.
 * Starting a backup first opens a connection-check dialog that probes each account in turn (sign in, list folders, sign out) and shows per-account status. Only after every account checks out does the dialog close on its own and the accounts sync **concurrently** — each with its own IMAP connection.
 * A wrong (or missing) password opens a password prompt: type the right one and retry that account, or skip it and carry on with the rest. A "save password" checkbox (checked by default) stores it encrypted; leaving it unchecked uses the password only for this run. Closing the check dialog cancels the whole backup.
 * Run log lines from concurrent accounts carry an account-name prefix so interleaved output stays readable; the mail list shows only the selected account's messages and switches with the selection.
@@ -140,6 +143,8 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 * The backup page's account list and the settings page's left bar can each be dragged at their right edge to resize (120–320 px, default 160); each remembers its own width across sessions.
 * Card values and the account form no longer stretch to fill a maximized window: values cap at 620px and the form block at 640px, long values truncate with a hover tooltip, and the two upper cards line up on a shared bottom edge.
+* The settings account list's 新增/删除 buttons span the full width of the list (half each) and follow it when the list is drag-resized.
+* The 新增/删除 buttons carry code-drawn icons (a green plus and a red cross, matching the green-triangle/red-square of start/stop). **Every button in the app** now uses a themed button with the native messagebox look (no classic 3-D buttons left): same-row dialog buttons share one width and sit **centred** in the dialog, the safe choice carries the default focus (Enter confirms, Esc always takes the safe way out), and disabled icon buttons show grey icon variants.
 
 **Background backup and the tray**
 
