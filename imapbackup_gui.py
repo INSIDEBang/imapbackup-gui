@@ -66,21 +66,14 @@ ERROR_ALREADY_EXISTS = 183
 ICON_FILENAME = "imapbackup-gui.ico"
 _instance_mutex_handle: int | None = None  # 进程级持有，不 CloseHandle：进程活着互斥量就该活着
 UPTODATE_STATUS = "已是最新，无待备份邮件"
-CONNECT_BTN_LABEL = "⇄ 连接并加载文件夹"
-CONNECTING_BTN_LABEL = "正在连接…"
-CONNECTED_BTN_LABEL = "✓ 已成功连接"
-CONNECT_BTN_CHARS = 26          # 连接按钮的固定宽度（字符数）：各状态文案长短不一，定宽才不会抖
 START_BTN_LABEL = "开始备份"
 RUNNING_BTN_LABEL = "正在备份…"
 STOP_BTN_LABEL = "停止"
 STOPPING_BTN_LABEL = "正在停止…"  # 停止中：转圈挪到停止按钮上，开始按钮退回静止外观
-STALE_HINT_TEXT = "连接信息已更改，请重新连接并加载文件夹"
-RUNNING_HINT_TEXT = "备份运行中，文件夹选择与输出格式不可修改，请先停止"
-STOPPING_HINT_TEXT = "备份正在停止，完成后即可修改"  # 已按过停止，再说「请先停止」就是过期信息
 
-# 加载动画：连接与备份共用同一套帧与节奏——用户要求两处的加载图标看起来一样。
+# 加载动画：开始按钮的加载态（停止中改画到停止按钮上）。
 # 帧是盲文点阵（U+2800 段，Windows 字体普遍有字形），画在按钮文字前缀上，不需要图片资产；
-# 按钮处在禁用态时 Tk 会用系统灰降级渲染，两处观感因此天然一致。
+# 按钮处在禁用态时 Tk 会用系统灰降级渲染，观感因此天然一致。
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 SPINNER_INTERVAL_MS = 150
 
@@ -91,23 +84,24 @@ STOP_ICON_COLOR = "#d13438"     # 停止：红色
 ICON_MIN_SIZE = 9               # 图标边长下限(px)
 ICON_LINESPACE_GAP = 5          # 图标边长 = 默认字体行高 − 这个值：行高变大图标同比例变大，不设上限
 STOP_ICON_INSET_RATIO = 0.125   # 红方块相对外接框的内缩比例：方块视觉比同框三角重，缩一圈才平衡
-HINT_RED = "red"       # 需要用户操作：连接信息已过期，得重新连接
-HINT_GRAY = "gray"     # 备份运行中：配置锁定，先停下才能改
 ZEBRA_TAG = "zebra"    # 邮件列表偶数行（第 2、4… 行）的 tag；奇数行走 Treeview 默认白底
 ZEBRA_BG = "#f0f0f0"   # 不跟随系统深色模式，与运行日志 Text 的 #ffffff 同一取舍
 
-# 文件夹树的勾选态与箭头符号（字形可用性以本机截图为准，缺字时退用 □/■/▦ 与 [-]/[+]）
+# 文件夹树的勾选态与层级符号（字形可用性以本机截图为准，缺字时退用 □/■/▦ 与 [-]/[+]）
 CHECK_OFF = "☐"        # U+2610 未勾选
 CHECK_ON = "☑"         # U+2611 已勾选
 CHECK_PARTIAL = "⊟"    # U+229F 部分勾选
 ARROW_OPEN = "▾"       # U+25BE 已展开
 ARROW_CLOSED = "▸"     # U+25B8 已折叠
-ARROW_SLOT_W = 16      # 箭头占位宽度，保证各级名称左边缘对齐
+TREE_BRANCH = "├"      # U+251C 非末个同级节点的连接符
+TREE_LAST = "└"        # U+2514 末个同级节点的连接符
+ARROW_SLOT_W = 16      # 连接符+展开箭头的占位宽度，保证各级名称左边缘对齐
+TREE_INDENT_W = 12     # 每级缩进(px)：子层挂进 kids 框的 padx，树形语言有了层级符号后收窄
 FOLDER_ROW_PAD_Y = 1   # 文件夹行的上下 pady(px)；行距 = 行高 + 2×它，滚轮的按行对齐按行距算
 WHEEL_DELTA = 120      # Windows 一格滚轮的标准 delta；高分辨率鼠标/触摸板给更小的值，须累加
 FOLDER_WHEEL_ROWS = 1  # 一格滚轮滚几行：与下方「邮件列表」的 1 行/格（Tk Treeview 默认）一致
 EMPTY_HINT_FG = "gray"            # 空态提示字色：只说明面板用途，不需要用户操作
-FOLDER_PLACEHOLDER_TEXT = "连接成功后，这里会列出该邮箱的所有文件夹"
+FOLDER_PLACEHOLDER_TEXT = "这里会列出该邮箱的所有文件夹"
 LIST_PLACEHOLDER_TEXT = "开始备份后，这里会列出本次备份的每封邮件"
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui"
 COLUMN_CONFIG_PATH = APP_DATA_DIR / "treeview-columns.json"
@@ -146,14 +140,63 @@ SETTINGS_BACKUP_SECTION = "backup"
 SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = ((SETTINGS_ACCOUNTS_SECTION, "账户"),
                                                   (SETTINGS_BACKUP_SECTION, "备份"),
                                                   (SETTINGS_WINDOW_SECTION, "窗口与后台"))
-SETTINGS_SECTION_LIST_WIDTH = 160   # 左分类栏固定宽度(px)：右栏吃掉剩余宽度
+SETTINGS_SECTION_LIST_WIDTH = 160   # 左分类栏默认宽度(px)：右栏吃掉剩余宽度，可拖拽调宽
 PAGE_BACKUP = "backup"
 PAGE_SETTINGS = "settings"
 PAGE_LABELS = ((PAGE_BACKUP, "备份"), (PAGE_SETTINGS, "设置"))
 
+# 侧边栏拖拽调宽：备份页账户列表、设置页左栏与设置页账户列表各自独立、各自持久化（用户选定）。
+# 拖拽手柄压在「侧边栏右边框与右侧内容之间」的空隙带上（隐形、只留光标提示），手柄宽＝带宽，
+# 侧栏内容不再被手柄盖住；宽度钳在 [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]，
+# 且拖拽中动态钳制（见 _sash_drag）：右侧内容最小完整宽吃不下就不再变宽。
+SIDEBAR_MIN_WIDTH = 120
+SIDEBAR_MAX_WIDTH = 240   # 硬上限（用户选定 240）：再宽右边详情显示不全
+SIDEBAR_DEFAULT_WIDTH = 160
+BACKUP_DETAIL_MIN_WIDTH = 420   # 备份页右侧（两卡+运行区）的最小完整宽：拖拽钳制的反推基数
+BACKUP_SIDEBAR_WIDTH_KEY = "backup_sidebar_width"
+SETTINGS_SIDEBAR_WIDTH_KEY = "settings_sidebar_width"
+ACCOUNT_LIST_WIDTH_KEY = "settings_account_list_width"   # 设置页「账户」列表独立记忆宽度
+
+# 版式封顶：卡片内容块不超过这个宽（窗口再大右侧留白，值列不无限拉伸），
+# 设置页账户表单块同理（用户选定 640px）。超长值文本截断 + 悬停显示全文。
+CARD_CONTENT_MAX_WIDTH = 620
+ACCOUNT_FORM_MAX_WIDTH = 640
+
+# 卡片内容四边内边距（用户选定统一 8px）：账户信息/输出/邮箱文件夹三卡同值。
+CARD_PAD = 8
+BTN_GAP = 4      # 按钮排里相邻按钮的统一间隔(px)：基准取备份页账户列表 全选/反选/清空 的间隔（用户选定）
+
+# 上部两栏（账户信息列 ↔ 邮箱文件夹）固定 3:2（用户选定）：grid 权重做不到严格比例——
+# 列宽 = 请求宽 + 按权重分余量，左列内容请求宽会在小窗下吃掉右列，改 place 定宽（_fit_top_columns）。
+TOP_COLUMN_GAP = 8        # 两栏之间的间隙(px)，与面板间距基线同值
+TOP_LEFT_SHARE = 3 / 5    # 账户信息列占两栏净宽的比例（账户信息:邮箱文件夹 = 3:2）
+SERVER_MIN_BUDGET = 80    # 收件服务器值的像素地板：低于它就把 SSL chip 与端口挪到第二行
+WRAP_HYSTERESIS = 12      # 换行迟滞带(px)：换行/恢复两个阈值错开，临界宽度来回拖不闪跳
+
+# 收件服务器行同排时 chip/端口各段的 grid padx：布局与量宽共用同一组值——
+# 「实测宽度 + 实际间隙」而不是估值（见 _layout_conn_row 的换行判定）。
+CHIP_PADX_SAME_ROW = (8, 4)
+PORT_CAPTION_PADX_SAME_ROW = (8, 0)
+PORT_LABEL_PADX_SAME_ROW = (4, 4)
+
+# SSL 色块 chip：方形色块标签（启用绿、未启用灰），备份卡只读展示与设置表单可点切换同一视觉。
+SSL_CHIP_TEXT = "SSL"
+SSL_CHIP_ON_BG = "#cdeccd"
+SSL_CHIP_ON_FG = "#1e6b2f"
+SSL_CHIP_OFF_BG = "#e2e2e2"
+SSL_CHIP_OFF_FG = "#777777"
+
+# 邮箱文件夹工具栏的刷新入口：icon-only 字形按钮（PhotoImage 画不了圆弧，用字形充当 icon）。
+RELOAD_GLYPH = "⟳"        # U+27F3
+RELOAD_BTN_TIP = "重新加载文件夹清单"
+FOLDER_LOAD_FAIL_HINT = "文件夹清单加载失败：{reason}，点右上角刷新重试"
+FOLDER_LOAD_NO_PASSWORD_HINT = "该账户未保存密码，点右上角刷新补录"
+FOLDER_LOAD_INCOMPLETE_HINT = "连接信息不完整，请到设置页「账户」补全"
+FOLDER_FAIL_REASON_MAX = 40   # 失败原因进提示行前的截断长度（防爆宽）
+
 # 账户（多账户配置）：连接设置在设置页「账户」分类维护；备份页左列表 + 右只读详情。
 # 账户名称是纯显示名，不参与 <备份根>/<账号>/ 目录名生成（账号目录取邮箱地址，见 ADR 0002/0010）。
-ACCOUNT_LIST_WIDTH = 160            # 备份页左侧账户列表宽度(px)：与设置页左分类栏同宽
+ACCOUNT_LIST_WIDTH = SIDEBAR_DEFAULT_WIDTH  # 备份页左侧账户列表默认宽度(px)：可拖拽调宽
 ACCOUNT_LIST_TITLE = "账户"          # 备份页左侧列表的带标题边框（与「账户信息」卡同款）
 ACCOUNT_NAME_FALLBACK = "未命名账户"
 DEFAULT_ACCOUNT_SSL = True
@@ -180,6 +223,23 @@ ACCOUNTS_HINT_TEXT = ("在这里维护每个账户的连接信息；密码经系
 BACKUP_ROOT_HINT_TEXT = ("所有账户共用这一个备份位置；每个账户的备份分别保存在该位置下、"
                          "以邮箱地址命名的目录里。")
 BACKUP_ROOT_SETTINGS_HINT = "（在设置页「备份」中修改）"
+
+# 备份预检弹窗：点「开始备份/备份所选」后先串行检测各账户连接，全过才并发同步（ADR 0011）。
+# 关闭弹窗 = 终止本次备份；密码错误弹密码补录窗（重试 / 跳过该账户）。
+PREFLIGHT_TITLE = "连接检测"
+PREFLIGHT_INTRO = "正在逐个检测账户连接，全部通过后自动开始备份。关闭本窗口将终止本次备份。"
+PREFLIGHT_ROW_WAIT = "等待检测…"
+PREFLIGHT_ROW_CHECKING = "正在连接…"
+PREFLIGHT_ROW_OK = "✓ 连接成功"
+PREFLIGHT_ROW_SKIPPED = "已跳过"
+PREFLIGHT_ROW_CANCELLED = "已取消"
+PREFLIGHT_CANCEL_BTN = "终止备份"
+PASSWORD_PROMPT_TITLE = "输入密码"
+PASSWORD_PROMPT_TEXT = "账户「{name}」的密码不正确（或未保存）。请输入密码后重试，或跳过该账户。"
+PASSWORD_SAVE_CHECK = "保存密码（加密存储在本机）"
+PASSWORD_RETRY_BTN = "重试"
+PASSWORD_SKIP_BTN = "跳过该账户"
+RUN_LOG_ACCOUNT_PREFIX = "[{name}] "   # 并发同步时日志行的账户前缀（日志混排、每行可辨）
 
 # 托盘：图标只在窗口隐藏期间存在；tooltip 随备份是否运行切换
 TRAY_TOOLTIP_IDLE = "IMAP Backup GUI"
@@ -219,6 +279,40 @@ class QueueLogHandler(logging.Handler):
         # pragma: no cover — logging must never raise into the app
         with contextlib.suppress(Exception):
             self.events.put(("log", self.format(record)))
+
+
+class _AccountPrefixFilter(logging.Filter):
+    """给并发同步的单账户日志行加账户名前缀（日志混排、每行可辨，ADR 0011）。
+
+    Note:
+        挂在「每账户一个」的真实 Logger 上（core 的接口只收 Logger）：记录经本 logger 时
+        在 msg 前拼前缀，再传播到 root 的 QueueLogHandler/文件 handler；% 格式化参数不受影响。
+    """
+
+    def __init__(self, prefix: str) -> None:
+        super().__init__()
+        self._prefix = prefix
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._prefix + str(record.msg)
+        return True
+
+
+def _account_logger(account_id: str, name: str) -> logging.Logger:
+    """取（并重置）某账户的专用 Logger：只留当前这一轮的前缀 filter，避免重复叠加。"""
+    logger = logging.getLogger(f"imapbackup.account.{account_id}")
+    logger.filters = [_AccountPrefixFilter(RUN_LOG_ACCOUNT_PREFIX.format(name=name))]
+    return logger
+
+
+def _is_auth_failure(message: str) -> bool:
+    """判定连接失败是否为「认证失败」（该弹密码补录窗而非报网络错误）。
+
+    Note:
+        core.connect_and_login 把 imaplib.IMAP4.error 统一包成 SystemExit
+        "IMAP authentication failed: ..."，按这个前缀识别（与 core 的口径对齐）。
+    """
+    return message.startswith("IMAP authentication failed")
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -277,6 +371,26 @@ def _heading_font(base: tkfont.Font) -> tkfont.Font:
                        size=abs(int(base.cget("size"))) + HEADING_SIZE_DELTA, weight="bold")
 
 
+def _make_square_button(btn: tk.Button) -> None:
+    """把 icon-only 按钮钉成正方形：宽迭代逼近自身实测高（误差 ≤2px）。
+
+    Note:
+        Button 的 width 单位是「0」字符宽、height 单位是文本行高，两者单位不同，
+        width=2 出来是竖长条（用户「刷新按钮应正方形」）。以请求高为基准换算字符数
+        迭代逼近：请求宽偏小就加宽，反之收窄，两三轮内收敛。
+    """
+    font = tkfont.nametofont(str(btn.cget("font")) or "TkDefaultFont")
+    char_w = max(font.measure("0"), 1)
+    for _ in range(3):
+        want, have = btn.winfo_reqheight(), btn.winfo_reqwidth()
+        if abs(want - have) <= 2:
+            return
+        step = round((want - have) / char_w)
+        if step == 0:
+            return
+        btn.configure(width=max(1, int(btn.cget("width")) + step))
+
+
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
     """返回显示名的最后一段。
 
@@ -301,6 +415,13 @@ def parse_close_action(raw: object) -> str:
     if raw in (CLOSE_ACTION_ASK, CLOSE_ACTION_TRAY, CLOSE_ACTION_EXIT):
         return str(raw)
     return DEFAULT_CLOSE_ACTION
+
+
+def parse_sidebar_width(raw: object) -> int:
+    """校验侧边栏宽度：钳在 [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]，越界/坏值回落默认。"""
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return max(SIDEBAR_MIN_WIDTH, min(SIDEBAR_MAX_WIDTH, raw))
+    return SIDEBAR_DEFAULT_WIDTH
 
 
 def decide_close(preference: str, *, hidden: bool) -> str:
@@ -593,14 +714,23 @@ class BackupApp:
         self._account_rows: dict[str, dict] = {}
 
         # ---- state ----
-        self.connect_state = "idle"  # idle | connecting | connected | stale（当前可见账户的口径）
         self.running = False
         self.stopping = False  # 运行中的子阶段：已按停止、工作线程还在收尾（按钮与提示都跟着换口径）
         self.folder_rows: list[dict] = []
         self._folder_nodes: dict[tuple[str, ...], dict] = {}
         self._folder_clickables: list[tuple[tk.Label, str]] = []
-        self._spinner_job: str | None = None  # root.after id while the button shows a spinner
-        self._run_spinner_job: str | None = None  # 同上，备份运行中的开始按钮
+        self._run_spinner_job: str | None = None  # root.after id，备份运行中开始按钮的转圈帧链
+        self._loading_folder_ids: set[str] = set()  # 静默拉文件夹清单的去重：同一账户不重复起线程
+        self._sash_grips: dict[str, tk.Frame] = {}   # 侧边栏拖拽手柄（backup/settings/account 三处）
+        self._sash_layout: dict[str, tuple[tk.Widget, int, int]] = {}   # kind -> (宿主, 空隙带宽, 带左缘偏移)
+        self._run_passwords: dict[str, str] = {}  # 本次运行的临时密码（预检补录但未保存时只在本次生效）
+        self._preflight: dict | None = None  # 连接预检弹窗状态（None = 未在预检）
+        self._backup_sidebar_width = self._ui_settings.get(
+            BACKUP_SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH)   # 备份页账户列表宽（可拖拽）
+        self._settings_sidebar_width = self._ui_settings.get(
+            SETTINGS_SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH)  # 设置页左栏宽（可拖拽）
+        self._account_list_width = self._ui_settings.get(
+            ACCOUNT_LIST_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH)      # 设置页账户列表宽（可拖拽）
         self._config_widgets: list[tuple[tk.Widget, str]] = []
         self.server_total = 0
         self.pending_total = 0
@@ -640,8 +770,8 @@ class BackupApp:
         self._refresh_account_list()
         self._refresh_edit_list(self.accounts[0]["id"] if self.accounts else None)
         self._render_account_detail()
-        self._apply_connect_state()
         self._update_start_state()
+        self._maybe_load_folders(self._selected_account_id)   # 启动静默拉选中账户的文件夹清单
         self._show_page(PAGE_BACKUP)
         # 窗口真正落地后再摆一次几何：菜单栏在落地前会把客户区高度吃掉一截（真机实测默认 736
         # 变成 716），落地后设置才生效、所见即所得。最大化时不许再动——ADR 0008 要求先恢复
@@ -693,6 +823,131 @@ class BackupApp:
         right.pack(side="left", fill="both", expand=True)
         self._build_config_area(right)
         self._build_run_area(right)
+        # 手柄压在「账户栏右边框与右栏内容之间」那条 8px 空隙带上（= 右栏的左内边距），
+        # 必须晚于 right 建出来：带落在 right 的地盘上，早建会被它整个盖住、点不到。
+        self._make_sash(body, "backup", gap=8, offset=8)
+
+    def _make_sash(self, host: tk.Widget, kind: str, gap: int, offset: int = 0) -> tk.Frame:
+        """侧边栏与右侧内容之间空隙带上的拖拽手柄（overlay，不占布局宽、不改既有间距）。
+
+        Args:
+            host: 空隙带所在的宿主——带是它的内边距/格距，手柄作为它的子控件压在带上。
+            kind: "backup"（备份页账户列表）/"settings"（设置页左栏）/"account"（设置页账户列表）。
+            gap: 空隙带宽度(px)，手柄同宽：拖拽区就是「侧边栏右边框与右侧内容之间那一部分」（用户选定）。
+            offset: 带左缘相对 host 左缘的偏移(px)，加当前侧栏宽即手柄 x。
+
+        Note:
+            三处各自独立持久化（用户选定）；背景取 host 同色，手柄隐形、只留光标提示。手柄
+            先前贴在侧边栏内侧的右边线上，压出一条灰条（用户截图），挪进空隙带后带里本就没有内容。
+            必须晚于占住这条带的兄弟内容创建：带常落在右侧内容的内边距上，早建会被兄弟节点
+            整个盖住、点不到（z-order，见 tests 的命中测试）。
+        """
+        grip = tk.Frame(host, width=gap, background=str(host.cget("background")),
+                        cursor="sb_h_double_arrow")
+        grip.bind("<Button-1>", lambda e, k=kind: self._sash_start(e, k))
+        grip.bind("<B1-Motion>", lambda e, k=kind: self._sash_drag(e, k))
+        grip.bind("<ButtonRelease-1>", lambda e, k=kind: self._sash_end(e, k))
+        self._sash_grips[kind] = grip
+        self._sash_layout[kind] = (host, gap, offset)
+        self._place_sash(kind)
+        return grip
+
+    def _place_sash(self, kind: str) -> None:
+        """把手柄摆到空隙带上：x = 带左缘偏移 + 当前侧栏宽（改宽后必须重摆）。"""
+        gap, offset = self._sash_layout[kind][1:]
+        width = int(self._sash_target(kind).cget("width"))
+        self._sash_grips[kind].place(x=offset + width, y=0, width=gap, relheight=1.0)
+
+    def _sash_target(self, kind: str) -> tk.Widget:
+        if kind == "backup":
+            return self.account_pane
+        if kind == "account":
+            return self._account_nav_frame
+        return self._settings_nav_frame
+
+    def _sash_start(self, event, kind: str) -> None:
+        target = self._sash_target(kind)
+        self._sash_dragging = (kind, event.x_root, int(target.cget("width")))
+
+    def _sash_drag(self, event, kind: str) -> None:
+        dragging = getattr(self, "_sash_dragging", None)
+        if not dragging:
+            return
+        drag_kind, start_x, start_w = dragging
+        if drag_kind != kind:
+            return
+        delta = event.x_root - start_x
+        # 动态上限每次 motion 重算 = 拖拽中实时判断右侧内容还能不能显示完整（用户选定）
+        width = max(SIDEBAR_MIN_WIDTH, min(self._sash_max_width(kind), start_w + delta))
+        self._apply_sidebar_width(kind, width)
+
+    def _sash_max_width(self, kind: str) -> int:
+        """拖拽中的宽度上限：硬上限与「右侧内容最小完整宽」反推的动态上限取小。
+
+        Note:
+            动态上限 = 窗口宽 - 同页其它杂项宽 - 右侧最小完整宽。右侧最小完整宽：
+            设置页两处手柄取账户表单块的实测请求宽（钳在 320..ACCOUNT_FORM_MAX_WIDTH，
+            表单块本身也封顶 640），备份页取 _backup_detail_min_width（含「邮箱文件夹」
+            工具栏实测宽——先前只按 BACKUP_DETAIL_MIN_WIDTH 反推，拖宽后右上 ⟳ 会被挤没）。
+            拖到右侧内容刚好完整显示就不再变宽——小窗口下侧栏再宽就把详情挤没了。
+        """
+        if kind == "backup":
+            detail_min = self._backup_detail_min_width()
+            others = 8   # 账户栏左侧那条页边距（pane.pack(padx=(8,0))）：右栏可用宽里没它
+        else:
+            form = getattr(self, "_account_form_block", None)
+            detail_min = (min(max(form.winfo_reqwidth(), 320), ACCOUNT_FORM_MAX_WIDTH)
+                          if form is not None else BACKUP_DETAIL_MIN_WIDTH)
+            others = self._settings_sidebar_width if kind == "account" else self._account_list_width
+        return max(SIDEBAR_MIN_WIDTH, min(SIDEBAR_MAX_WIDTH, self.root.winfo_width() - others - detail_min))
+
+    def _backup_detail_min_width(self) -> int:
+        """备份页右栏最小完整宽：整体最小宽 与 「邮箱文件夹」工具栏装得下反推的宽，取大。
+
+        Note:
+            工具栏（全选/清空/仅收件箱 + 右上 ⟳）是 pack 的定宽按钮排，卡宽不够时后打包的
+            刷新按钮先被挤没（用户截图：⟳ 压成一条竖缝）。文件夹列宽 = (右栏宽 - 左右内边距
+            - 栏间隙) × (1 - TOP_LEFT_SHARE)，卡内可用再扣 2×CARD_PAD 与卡片边框；把工具栏
+            实测请求宽反推回右栏宽即下限，随字体/DPI 走，末尾留 2px 抹平取整。
+        """
+        toolbar = getattr(self, "_folder_toolbar", None)
+        if toolbar is None or not hasattr(self, "folder_group"):
+            return BACKUP_DETAIL_MIN_WIDTH
+        border = int(self.folder_group.cget("borderwidth"))
+        need = (toolbar.winfo_reqwidth() + 2 * CARD_PAD + 2 * border) / (1 - TOP_LEFT_SHARE)
+        return max(BACKUP_DETAIL_MIN_WIDTH, round(need) + 2 * CARD_PAD + TOP_COLUMN_GAP + 2)
+
+    def _clamp_backup_sidebar(self) -> None:
+        """窗口变窄后把账户栏实际宽度收到「右侧内容完整」以内，⟳ 别再被挤没（用户截图）。
+
+        Note:
+            实际宽度 = min(用户选定的 `_backup_sidebar_width`, 拖拽上限)：窄窗只收实际宽度、
+            不动用户选定的宽，窗口再拉宽自动回到原宽；与拖拽同口径（_sash_max_width），
+            所以拖拽与缩放两条路判的都是「内容完整」。
+        """
+        if "backup" not in self._sash_layout or not hasattr(self, "account_pane"):
+            return
+        want = min(self._backup_sidebar_width, self._sash_max_width("backup"))
+        if want != int(self.account_pane.cget("width")):
+            self.account_pane.configure(width=want)
+            self._place_sash("backup")
+
+    def _sash_end(self, _event, kind: str) -> None:
+        if getattr(self, "_sash_dragging", None):
+            self._sash_dragging = None
+            self._save_column_config()   # 拖完落盘（各处独立记忆）
+
+    def _apply_sidebar_width(self, kind: str, width: int) -> None:
+        if kind == "backup":
+            self._backup_sidebar_width = width
+            self.account_pane.configure(width=width)
+        elif kind == "account":
+            self._account_list_width = width
+            self._account_nav_frame.configure(width=width)   # 账户编辑列表独立记忆宽（用户选定）
+        else:
+            self._settings_sidebar_width = width
+            self._settings_nav_frame.configure(width=width)
+        self._place_sash(kind)   # 侧栏一变宽，空隙带跟着挪，手柄重摆
 
     def _build_accounts_pane(self, parent: tk.Frame) -> tk.LabelFrame:
         """左侧账户列表：点选切换右侧详情，勾选决定「备份所选」跑哪些账户。
@@ -701,7 +956,7 @@ class BackupApp:
         一个控件只表达一件事——Listbox 一行放不下「点选切换」与「勾选备份」两个动作。
         """
         pane = self.account_pane = tk.LabelFrame(parent, text=ACCOUNT_LIST_TITLE)
-        pane.configure(width=ACCOUNT_LIST_WIDTH)
+        pane.configure(width=self._backup_sidebar_width)
         pane.pack_propagate(False)  # 固定宽：账户名再长也不挤动右栏（右栏吃剩余宽度）
         area = tk.Frame(pane)
         area.columnconfigure(0, weight=1)
@@ -729,7 +984,8 @@ class BackupApp:
                         ("清空", lambda: self._set_all_account_checks(False)))
         for column, (label, command) in enumerate(tool_actions):
             tools.columnconfigure(column, weight=1, uniform="account-tools")  # 三格等宽
-            tk.Button(tools, text=label, command=command).grid(row=0, column=column, sticky="we", padx=2)
+            tk.Button(tools, text=label, command=command).grid(row=0, column=column, sticky="we",
+                                                               padx=BTN_GAP // 2)   # 两侧各一半=BTN_GAP
         # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
         self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
         tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
@@ -737,105 +993,304 @@ class BackupApp:
         return pane
 
     def _build_config_area(self, parent: tk.Frame) -> None:
-        outer = tk.Frame(parent)
+        outer = self._top_outer = tk.Frame(parent)
         # 下边距与运行区的上边距合起来 = 面板之间的 8px（上半区与下半区之间的那条）
         outer.pack(fill="x", padx=8, pady=(8, 4))
-        outer.columnconfigure(0, weight=1)
-        outer.columnconfigure(1, weight=1)
-        left = tk.Frame(outer)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left = self._left_col = tk.Frame(outer)
         self._build_conn_group(left)
         self._build_output_group(left)
         self._build_folder_group(outer)
+        # 上部两栏固定 3:2（账户信息:邮箱文件夹，用户选定）：place 定宽（见 _fit_top_columns）。
+        left.place(x=0, y=0)
+        self.folder_group.place(x=0, y=0)
+        outer.bind("<Configure>", self._fit_top_columns)
+        # 底边对齐（图1「底部边框没有对齐」）：左列两卡叠出的自然高度是基准线（place 不定高），
+        # 「邮箱文件夹」卡的高度与 outer 的高度都去贴它（用户选定「动邮箱文件夹的高度」），
+        # 两卡下边框因此落在同一条线上；outer 的高度还要带住下方运行区的排布。
+        left.bind("<Configure>", lambda _e: self._sync_top_region_height())
+
+    def _fit_top_columns(self, event=None) -> None:
+        """上部两栏定宽：账户信息:邮箱文件夹 = 3:2（净宽含 8px 栏间隙），所有窗口尺寸固定比例。
+
+        Note:
+            不用 grid 权重：列宽 = 请求宽 + 按权重分余量，左列内容请求宽几百像素，
+            小窗下余量再怎么分右列都只剩零头（图1「邮箱文件夹被挤扁」的根因）。
+        """
+        total = int(event.width) if event is not None else self._top_outer.winfo_width()
+        if total < 20:
+            return
+        self._clamp_backup_sidebar()   # 窗口变窄先收账户栏宽，右栏（含⟳）才完整；再分两栏
+        inner = max(total - TOP_COLUMN_GAP, 0)
+        left_w = round(inner * TOP_LEFT_SHARE)
+        self._left_col.place_configure(x=0, width=left_w)
+        self.folder_group.place_configure(x=left_w + TOP_COLUMN_GAP, width=inner - left_w)
 
     def _build_conn_group(self, parent: tk.Frame) -> None:
-        """账户信息卡：连接设置已在设置页维护，这里只读展示（无任何输入框）。"""
+        """账户信息卡：连接设置已在设置页维护，这里只读展示（无任何输入框）。
+
+        版式封顶：值列 weight=0 不拉伸（窗口再大右侧留白），超长值截断 + 悬停显示全文，
+        整块内容宽度封顶 CARD_CONTENT_MAX_WIDTH（见 _fit_card_values）。
+        """
         group = self.conn_group = tk.LabelFrame(parent, text="账户信息")
         # 与「账户信息」「邮箱文件夹」之间那条 8px 同宽：面板之间的横竖间距都取 8px
         group.pack(fill="x", pady=(0, 8))
-        group.columnconfigure(1, weight=1)
+        # 内容块四边内边距统一 CARD_PAD（用户选定）：行自带 pady=3，两段合成内容距边框 8px。
+        # anchor="w" 而不是 fill="x"：内容块按内容定宽贴左，窗口再大右侧整片留白（用户选定）；
+        # 一旦填满整卡，grid 会把自己居中在更宽的 master 里，看着又像居中了。
+        inner = tk.Frame(group)
+        inner.pack(padx=CARD_PAD, pady=CARD_PAD - 3, anchor="w")
+        # 值列不设 weight：内容紧凑左对齐，不吃满整卡宽度（图1「分隔太远」的根因）
+        inner.columnconfigure(1, weight=0)
+        self._card_inners: list[tk.Frame] = [inner]            # 两卡内容块（值列同线用）
+        self._card_caption_labels: list[tk.Label] = []         # 两卡标签（取最大宽做列下限）
+        self._card_fits: list[dict] = []   # 每个可截断值的 {key,var,label,caption,tails,group}
 
-        tk.Label(group, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
-        tk.Label(group, text=MAIL_TYPE_TEXT, anchor="w").grid(row=0, column=1, columnspan=5, sticky="w", pady=3)
+        type_caption = tk.Label(inner, text="邮箱类型：")
+        type_caption.grid(row=0, column=0, sticky="e", pady=3)
+        self._card_caption_labels.append(type_caption)
+        # 值列统一 padx=4：首行漏了它，「IMAP（仅接收，不发送）」比下一行值左移 4px（用户截图）
+        tk.Label(inner, text=MAIL_TYPE_TEXT, anchor="w").grid(row=0, column=1, columnspan=5,
+                                                             sticky="w", padx=4, pady=3)
 
         self._card_labels: dict[str, tk.Label] = {}
-        tk.Label(group, text="邮箱地址：").grid(row=1, column=0, sticky="e", padx=(8, 0), pady=3)
-        user_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        user_label.grid(row=1, column=1, columnspan=5, sticky="we", padx=4, pady=3)
+        self._card_vars: dict[str, tk.StringVar] = {}
+        self._card_full: dict[str, str] = {}
+
+        user_caption = tk.Label(inner, text="邮箱地址：")
+        user_caption.grid(row=1, column=0, sticky="e", pady=3)
+        self._card_caption_labels.append(user_caption)
+        user_var = tk.StringVar(value=CARD_EMPTY_TEXT)
+        user_label = tk.Label(inner, textvariable=user_var, anchor="w")
+        user_label.grid(row=1, column=1, columnspan=5, sticky="w", padx=4, pady=3)
         self._card_labels["user"] = user_label
+        self._card_vars["user"] = user_var
+        self._card_fits.append({"key": "user", "var": user_var, "label": user_label,
+                                "caption": user_caption, "tails": [], "group": group})
+        self._bind_tip(user_label, user_var, lambda: self._card_full.get("user", ""))
 
-        # 收件服务器与 SSL、端口同排（foxmail 版式）；卡片是只读展示，SSL 报「是/否」而非复选框
-        tk.Label(group, text="收件服务器：").grid(row=2, column=0, sticky="e", padx=(8, 0), pady=3)
-        server_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        server_label.grid(row=2, column=1, sticky="we", padx=4, pady=3)
+        # 收件服务器与 SSL chip、端口同排（foxmail 版式）；卡片是只读展示，SSL 是色块 chip 不是文字值
+        server_caption = tk.Label(inner, text="收件服务器：")
+        server_caption.grid(row=2, column=0, sticky="e", pady=3)
+        self._card_caption_labels.append(server_caption)
+        server_var = tk.StringVar(value=CARD_EMPTY_TEXT)
+        server_label = tk.Label(inner, textvariable=server_var, anchor="w")
+        server_label.grid(row=2, column=1, sticky="w", padx=4, pady=3)
         self._card_labels["server"] = server_label
-        tk.Label(group, text="SSL：").grid(row=2, column=2, sticky="e", padx=(8, 0), pady=3)
-        ssl_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        ssl_label.grid(row=2, column=3, sticky="w", padx=4, pady=3)
-        self._card_labels["ssl"] = ssl_label
-        tk.Label(group, text="端口：").grid(row=2, column=4, sticky="e", padx=(8, 0), pady=3)
-        port_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        port_label.grid(row=2, column=5, sticky="w", padx=(4, 8), pady=3)
+        self._card_vars["server"] = server_var
+        ssl_chip = tk.Label(inner, text=SSL_CHIP_TEXT, padx=6, pady=1)
+        ssl_chip.grid(row=2, column=2, sticky="w", padx=CHIP_PADX_SAME_ROW, pady=3)
+        self._card_labels["ssl"] = ssl_chip
+        self._style_ssl_chip(ssl_chip, False)
+        port_caption = tk.Label(inner, text="端口：")
+        port_caption.grid(row=2, column=3, sticky="e", padx=PORT_CAPTION_PADX_SAME_ROW, pady=3)
+        self._card_caption_labels.append(port_caption)
+        port_label = tk.Label(inner, text=CARD_EMPTY_TEXT, anchor="w")
+        port_label.grid(row=2, column=4, sticky="w", padx=PORT_LABEL_PADX_SAME_ROW, pady=3)
         self._card_labels["port"] = port_label
+        # 换行时的第二行容器：chip/端口挪进来紧凑排一排，不吃第一行的列宽——
+        # 先前直接塞进 row3 的 col1/2/3，列宽按第一行定，端口被推到最右还截断（用户截图）。
+        # 它跨列摆放（columnspan），不参与列宽计算，左边缘贴值列（服务器值左对齐）。
+        self._conn_wrap_row = tk.Frame(inner)
+        self._conn_row = {"chip": ssl_chip, "port_caption": port_caption, "port_label": port_label}
+        self._conn_wrapped = False
+        # 服务器值的可用宽要扣掉同排的 SSL chip/端口两截（tails），只截服务器名本身；
+        # _layout_conn_row 换行时把 tails 清空——第二行不占服务器行的宽
+        self._conn_server_spec = {"key": "server", "var": server_var, "label": server_label,
+                                  "caption": server_caption,
+                                  "tails": [ssl_chip, port_caption, port_label],
+                                  "group": group}
+        self._card_fits.append(self._conn_server_spec)
+        self._bind_tip(server_label, server_var, lambda: self._card_full.get("server", ""))
+        group.bind("<Configure>", lambda _e: self._fit_card_values())
 
-        self.connect_btn = self._register(tk.Button(group, text=CONNECT_BTN_LABEL, width=CONNECT_BTN_CHARS,
-                                                     command=self._on_connect))
-        self.connect_btn.grid(row=3, column=0, columnspan=6, pady=(10, 10))
-        # 按需挂出：无提示时 grid_remove 让出这一行，按钮位置不变，让出的高度由下方邮件列表吸收
-        self.conn_hint = tk.Label(group, text="")
-        self.conn_hint.grid(row=4, column=0, columnspan=6, pady=(0, 8))
-        self.conn_hint.grid_remove()
+    def _style_ssl_chip(self, chip: tk.Label, enabled: bool) -> None:
+        """SSL chip 的两态配色：启用绿、未启用灰（备份卡只读展示与设置表单可点切换共用）。"""
+        bg, fg = ((SSL_CHIP_ON_BG, SSL_CHIP_ON_FG) if enabled else (SSL_CHIP_OFF_BG, SSL_CHIP_OFF_FG))
+        chip.configure(background=bg, foreground=fg, activebackground=bg, activeforeground=fg)
+
+    def _layout_conn_row(self) -> None:
+        """SSL chip 与端口的排位：放得下与收件服务器同排（foxmail 版式），放不下挪到第二行。
+
+        Note:
+            判定是实时的（每次卡片 <Configure> 重算）：各段取 winfo_reqwidth 实测宽 + 同排
+            grid padx 实际间隙，拼上服务器值的像素地板 SERVER_MIN_BUDGET 与可用宽比。
+            恢复同行比换行多要 WRAP_HYSTERESIS 的富余（迟滞带），临界宽度来回拖不闪跳。
+            换行与否决定 _fit_card_values 给服务器值的预算里扣不扣 tails，先排位再截断；
+            第二行进 _conn_wrap_row 紧凑排一排，不吃第一行的列宽。
+        """
+        group_w = self.conn_group.winfo_width()
+        if group_w < 20:      # 未映射时宽度是 1，等真实 <Configure> 再排位
+            return
+        chip = self._conn_row["chip"]
+        port_caption = self._conn_row["port_caption"]
+        port_label = self._conn_row["port_label"]
+        caption_w = self._conn_server_spec["caption"].winfo_reqwidth()
+        pad_w = sum(sum(p) for p in (CHIP_PADX_SAME_ROW, PORT_CAPTION_PADX_SAME_ROW,
+                                    PORT_LABEL_PADX_SAME_ROW))
+        tails_w = sum(w.winfo_reqwidth() for w in (chip, port_caption, port_label)) + pad_w
+        budget = min(CARD_CONTENT_MAX_WIDTH, group_w - 2 * CARD_PAD)
+        needed = caption_w + tails_w + SERVER_MIN_BUDGET
+        threshold = budget - (WRAP_HYSTERESIS if self._conn_wrapped else 0)
+        wrapped = needed > threshold
+        if wrapped == self._conn_wrapped:
+            return
+        self._conn_wrapped = wrapped
+        for widget in (chip, port_caption, port_label):
+            widget.grid_forget()
+            widget.pack_forget()
+        if wrapped:
+            self._conn_wrap_row.grid(row=3, column=1, columnspan=4, sticky="w", pady=3)
+            # 三段的 master 仍是 inner（控件换不了爹），pack 用 in_ 挂进换行容器紧凑排一排
+            chip.pack(side="left", padx=(0, 4), in_=self._conn_wrap_row)
+            port_caption.pack(side="left", padx=(8, 0), in_=self._conn_wrap_row)
+            port_label.pack(side="left", padx=(4, 0), in_=self._conn_wrap_row)
+            self._conn_server_spec["tails"] = []
+        else:
+            self._conn_wrap_row.grid_forget()
+            chip.grid(row=2, column=2, sticky="w", padx=CHIP_PADX_SAME_ROW, pady=3)
+            port_caption.grid(row=2, column=3, sticky="e", padx=PORT_CAPTION_PADX_SAME_ROW, pady=3)
+            port_label.grid(row=2, column=4, sticky="w", padx=PORT_LABEL_PADX_SAME_ROW, pady=3)
+            self._conn_server_spec["tails"] = [chip, port_caption, port_label]
 
     def _build_output_group(self, parent: tk.Frame) -> None:
-        group = tk.LabelFrame(parent, text="输出")
-        group.pack(fill="x")
-        group.columnconfigure(1, weight=1)
+        group = self._output_group = tk.LabelFrame(parent, text="输出")
+        # expand：左列高度贴两栏底边对齐基准（见 _sync_top_region_height）后若还有富余，
+        # 由「输出」卡吸收——两卡底边框永远落在同一条线上，卡内内容顶部对齐、下方留白。
+        group.pack(fill="both", expand=True)
+        # 内容块四边内边距统一 CARD_PAD（用户选定）：与「账户信息」卡同款（含 anchor="w" 贴左）
+        inner = tk.Frame(group)
+        inner.pack(padx=CARD_PAD, pady=CARD_PAD - 3, anchor="w")
+        inner.columnconfigure(1, weight=0)   # 值列不拉伸：同「账户信息」封顶口径
+        self._card_inners.append(inner)
 
-        tk.Label(group, text="备份保存位置：").grid(row=0, column=0, sticky="e", padx=(8, 0), pady=3)
-        self.card_root_label = tk.Label(group, text=CARD_EMPTY_TEXT, anchor="w")
-        self.card_root_label.grid(row=0, column=1, sticky="we", padx=4, pady=3)
-        tk.Label(group, text=BACKUP_ROOT_SETTINGS_HINT, anchor="w",
-                 foreground=EMPTY_HINT_FG).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        root_caption = tk.Label(inner, text="备份保存位置：")
+        root_caption.grid(row=0, column=0, sticky="e", pady=3)
+        self._card_caption_labels.append(root_caption)
+        root_var = tk.StringVar(value=CARD_EMPTY_TEXT)
+        self.card_root_label = tk.Label(inner, textvariable=root_var, anchor="w")
+        self.card_root_label.grid(row=0, column=1, sticky="w", padx=4, pady=3)
+        hint_label = tk.Label(inner, text=BACKUP_ROOT_SETTINGS_HINT, anchor="w",
+                              foreground=EMPTY_HINT_FG)
+        hint_label.grid(row=0, column=2, sticky="w")
+        self._card_labels["root"] = self.card_root_label
+        self._card_vars["root"] = root_var
+        self._card_fits.append({"key": "root", "var": root_var, "label": self.card_root_label,
+                                "caption": root_caption, "tails": [hint_label], "group": group})
+        self._bind_tip(self.card_root_label, root_var, lambda: self._card_full.get("root", ""))
         self.backup_root_var.trace_add("write", lambda *_a: self._render_backup_root())
+        group.bind("<Configure>", lambda _e: self._fit_card_values())
 
-        fmt_row = tk.Frame(group)
-        fmt_row.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
+        fmt_row = tk.Frame(inner)
+        fmt_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 3))
         self.mbox_var = tk.BooleanVar(value=False)
         self.eml_var = tk.BooleanVar(value=True)
         self._register(tk.Checkbutton(fmt_row, text="mbox 输出", variable=self.mbox_var,
                                       command=self._on_format_change)).pack(side="left")
         self._register(tk.Checkbutton(fmt_row, text="eml 输出", variable=self.eml_var,
                                       command=self._on_format_change)).pack(side="left", padx=(12, 0))
+        self._align_card_caption_columns()
+
+    def _align_card_caption_columns(self) -> None:
+        """两卡标签列同宽：「账户信息」与「输出」的值列起点落在同一条竖线（用户选定）。
+
+        Note:
+            标签列（grid 列 0）取所有标签的最大请求宽做下限 minsize，各卡标签仍右对齐、
+            值列贴它起排；标签文案静态，建完两张卡量一次即可，无需挂事件。
+        """
+        caption_w = max((c.winfo_reqwidth() for c in self._card_caption_labels), default=0)
+        for inner in self._card_inners:
+            inner.columnconfigure(0, minsize=caption_w)
+
+    def _fit_card_values(self) -> None:
+        """按卡片宽度把超长值截断（悬停看全文）：值列 + 标题 + 尾巴 ≤ CARD_CONTENT_MAX_WIDTH。
+
+        Note:
+            先放全文量真实请求宽再决定截不截；省略号消失是双向的——变宽后从全文重算（同 _fit_status）。
+            各卡片的值列互不影响，整体宽度由截断保证 ≤ 封顶值，窗口再大右侧只是留白。
+            收件服务器行先排位（_layout_conn_row）再截断：SSL chip/端口换行与否决定扣不扣 tails。
+        """
+        self._layout_conn_row()
+        for spec in self._card_fits:
+            group_w = spec["group"].winfo_width()
+            if group_w < 20:      # 未映射时宽度是 1，等真实 <Configure> 再算
+                continue
+            caption_w = spec["caption"].winfo_reqwidth()
+            tails_w = sum(t.winfo_reqwidth() for t in spec["tails"])
+            budget = min(CARD_CONTENT_MAX_WIDTH, group_w - 2 * CARD_PAD) - caption_w - tails_w
+            if budget < 40:
+                continue
+            full = self._card_full.get(spec["key"]) or str(spec["var"].get())
+            spec["var"].set(full)   # 先放全文拿真实请求宽
+            if spec["label"].winfo_reqwidth() > budget:
+                self._shrink_to_fit(spec["label"], spec["var"], full, budget)
+
+    def _sync_top_region_height(self) -> None:
+        """上半区高度贴合左列（账户信息+输出）自然高度，两卡底边落在同一条线上。
+
+        Note:
+            左列是 place 定宽不定高，它的请求高度就是两卡叠出的自然高度，是基准线；
+            「邮箱文件夹」卡与 outer 的高度都听这里——place 子控件不向上传播请求高，
+            外层 outer 的高度得显式给，下方运行区才排在上半区之下。
+            兜底取两列请求高的较大者：卡高若低于内容的最小排布，grid 会把行顶出卡片、
+            内容盖住 LabelFrame 的底边框（「下边线没了」），宁可整体加高也不能压掉边框。
+        """
+        left_h = max(self._left_col.winfo_reqheight(), self.folder_group.winfo_reqheight())
+        if left_h <= 1:
+            return
+        # 高度走 place 级、不能用 configure：folder_group 的子控件在 grid 里，grid 传播会在子控件
+        # 重新请求尺寸时把 height 选项覆盖回内容高（实测 119 掉回 52），卡片矮一截、底边就对不上；
+        # place 的高度选项不受请求变化影响。左列同样定高，富余高度由「输出」卡吸收（expand），
+        # 两卡底边框因此永远落在同一条线上。
+        if self.folder_group.winfo_height() != left_h:
+            self.folder_group.place_configure(height=left_h)
+        if self._left_col.winfo_height() != left_h:
+            self._left_col.place_configure(height=left_h)
+        if self._top_outer.winfo_height() != left_h:
+            self._top_outer.configure(height=left_h)
 
     def _build_folder_group(self, parent: tk.Frame) -> None:
         group = tk.LabelFrame(parent, text="邮箱文件夹")
         # 面板右边不留白：右边界与下方区域（邮件列表/运行日志/停止按钮）共用同一条线，
         # 即"内容右边距 == 内容左边距（8px）"。单独再留 8px 会让面板比下方窄一块。
-        group.grid(row=0, column=1, sticky="nsew")
+        # 位置与宽高不归 grid：宽听 _fit_top_columns（上部两栏 3:2），高听 _sync_top_region_height。
         self.folder_group = group
         group.columnconfigure(0, weight=1)
         group.rowconfigure(1, weight=1)
 
+        # 内容四边内边距统一 CARD_PAD（用户选定）：toolbar 顶左、树区左下同值，滚条仍贴面板右内沿。
         toolbar = tk.Frame(group)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=6, pady=(2, 0))
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=CARD_PAD, pady=(CARD_PAD, 0))
+        self._folder_toolbar = toolbar   # 拖拽钳制按它的实测请求宽反推右栏最小宽（见 _backup_detail_min_width）
         self._register(tk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
         self._register(tk.Button(toolbar, text="清空", width=7,
-                                 command=lambda: self._set_all_folders(False))).pack(side="left", padx=(6, 0))
-        self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(6, 0))
+                                 command=lambda: self._set_all_folders(False))).pack(side="left", padx=(BTN_GAP, 0))
+        self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
+        # 刷新入口（icon-only）：静默加载失败后唯一的手动重试入口，右对齐与文件夹工具同排。
+        # 正方形（用户选定）：width=2 只是初值，_make_square_button 按实测高迭代钉成正方形。
+        reload_btn = self._register(tk.Button(toolbar, text=RELOAD_GLYPH, width=2,
+                                              command=self._on_refresh_folders))
+        _make_square_button(reload_btn)
+        self.reload_btn = reload_btn
+        reload_btn.pack(side="right", padx=(BTN_GAP, 0))   # 与左排至少 BTN_GAP（右贴工具栏内沿）
+        self._bind_widget_tip(reload_btn, RELOAD_BTN_TIP)
 
         # 用嵌套 Frame 手搭树形，不用 ttk.Treeview：Treeview 的原生 <Button-1> 把整行都当展开/折叠
         # 目标，单行放不下"点箭头=展开、点名字=勾选"两个动作。这里箭头和名称都是真控件，命中区明确。
-        self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=200)
-        self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=4)
+        # 高度只给 1px 的最小请求：grid 行不会缩到请求高以下，请求大了（曾是 200px）会把整个
+        # grid 布局顶出卡片、盖掉 LabelFrame 底边框（用户截图「下边线没了」的根因）；
+        # 实际高度由 row=1 的 weight=1 吃满卡高（高听 _sync_top_region_height）。
+        self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=1)
+        self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(CARD_PAD, 0), pady=(4, CARD_PAD))
         # 滚条紧贴面板内沿（右边不留白），与下方"邮件列表/运行日志"页签里的滚条贴边方式一致
         folder_scroll = ttk.Scrollbar(group, orient="vertical", command=self.folder_canvas.yview)
-        folder_scroll.grid(row=1, column=1, sticky="ns", pady=4)
+        folder_scroll.grid(row=1, column=1, sticky="ns", pady=(4, CARD_PAD))
         self.folder_scroll = folder_scroll
         self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
         self.folder_inner = tk.Frame(self.folder_canvas)
         self._folder_win = self.folder_canvas.create_window((0, 0), window=self.folder_inner, anchor="nw")
         self.folder_inner.bind("<Configure>", self._on_folder_inner_configure)
-        self.folder_canvas.bind("<Configure>", lambda e: self.folder_canvas.itemconfigure(self._folder_win, width=e.width))
+        # 树区宽度一变就重算名称截断（窗口缩放 / 分栏比例变化都从这里进，双向恢复全文）
+        self.folder_canvas.bind("<Configure>", self._on_folder_canvas_configure)
         self.folder_ph = self._empty_hint(group, FOLDER_PLACEHOLDER_TEXT, 1, 0)
 
         # 滚轮只有一个入口：绑在 root 上（root 的路径是主窗口内所有控件的 toplevel bindtag）。
@@ -881,11 +1336,11 @@ class BackupApp:
         # 上/下都留 8：备份页的下边距由运行区自己带（pady=(2, 8)），设置页没有下方内容，
         # 少了这 8px 就会变成「三边等宽、底边贴边」
         outer.pack(fill="both", expand=True, padx=8, pady=8)
-        outer.columnconfigure(1, weight=1)
+        outer.columnconfigure(1, weight=1)   # 列 0=左栏、列 1=右详情（吃剩余宽）
         outer.rowconfigure(0, weight=1)
 
-        nav = self._panel_style_frame(outer)
-        nav.configure(width=SETTINGS_SECTION_LIST_WIDTH)
+        nav = self._settings_nav_frame = self._panel_style_frame(outer)
+        nav.configure(width=self._settings_sidebar_width)
         nav.pack_propagate(False)  # 固定宽：分类名/条目再长也不挤动右栏（右栏吃剩余宽度）
         nav.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.settings_nav = tk.Listbox(nav, exportselection=False, activestyle="none",
@@ -911,6 +1366,9 @@ class BackupApp:
             elif key == SETTINGS_WINDOW_SECTION:
                 self._build_window_settings(page, title)
         self._settings_section = SETTINGS_SECTIONS[0][0]
+        # 手柄压在「左栏右边框与右侧详情之间」那条 8px 空隙带上（= nav 的 grid 右格距），
+        # 挂 outer、隐形只留光标；晚于 detail 建出（z-order 保险，与备份页同款建序口径）。
+        self._make_sash(outer, "settings", gap=8)
 
     def _build_accounts_settings(self, parent: tk.Frame, title: str) -> None:
         """「账户」分类：左账户列表 + 新增/删除，右连接设置编辑表单 + 保存。
@@ -927,21 +1385,42 @@ class BackupApp:
 
         wrap = tk.Frame(body)
         wrap.pack(fill="both", expand=True, pady=(10, 0))
-        nav = self._panel_style_frame(wrap)
-        nav.configure(width=SETTINGS_SECTION_LIST_WIDTH)
+        nav = self._account_nav_frame = self._panel_style_frame(wrap)
+        nav.configure(width=self._account_list_width)   # 独立记忆宽（用户选定），不跟设置左栏联动
         nav.pack_propagate(False)
         nav.pack(side="left", fill="y")
         tools = tk.Frame(nav)
         tools.pack(side="bottom", fill="x", padx=4, pady=4)
         tk.Button(tools, text="新增", width=7, command=self._on_account_add).pack(side="left")
-        tk.Button(tools, text="删除", width=7, command=self._on_account_delete).pack(side="left", padx=(6, 0))
-        self.account_edit_list = tk.Listbox(nav, exportselection=False, activestyle="none",
+        tk.Button(tools, text="删除", width=7, command=self._on_account_delete).pack(side="left", padx=(BTN_GAP, 0))
+        # 列表 + 智能滚条：内容装不下才把滚条挂出来（与备份页账户列表同口径）
+        area = tk.Frame(nav)
+        area.pack(fill="both", expand=True)
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        self.account_edit_list = tk.Listbox(area, exportselection=False, activestyle="none",
                                             background="#ffffff", highlightthickness=0, borderwidth=0)
-        self.account_edit_list.pack(fill="both", expand=True)
+        self.account_edit_list.grid(row=0, column=0, sticky="nsew")
+        scroll = self.account_edit_scroll = ttk.Scrollbar(area, orient="vertical",
+                                                          command=self.account_edit_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.account_edit_list.configure(yscrollcommand=scroll.set)
+        self._account_edit_scroll_shown = False
+        scroll.grid_remove()   # 去留由 _sync_account_edit_scroll 按内容定
         self.account_edit_list.bind("<<ListboxSelect>>", self._on_account_edit_select)
+        self.account_edit_list.bind("<Configure>", lambda _e: self._sync_account_edit_scroll())
 
-        form = tk.Frame(wrap)
-        form.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        form_host = tk.Frame(wrap)
+        form_host.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        # 手柄压在「账户列表右边框与表单之间」那条 10px 空隙带上（= form_host 的左内边距），
+        # 挂 wrap、隐形只留光标；必须晚于 form_host 建出——带落在它的地盘上，早建会被盖住点不到。
+        self._make_sash(wrap, "account", gap=10)
+        # 表单块封顶 ACCOUNT_FORM_MAX_WIDTH（图3「最大化时输入框被拉太长」）：place 定宽、
+        # 内容自然高，块内输入框照常拉伸，块外留白；宽度随宿主收缩，窄窗不溢出。
+        form = tk.Frame(form_host)
+        form.place(x=0, y=0)
+        self._account_form_block = form
+        form_host.bind("<Configure>", self._fit_account_form_block)
         form.columnconfigure(1, weight=1)
         self._acct_name_var = tk.StringVar()
         self._acct_user_var = tk.StringVar()
@@ -958,9 +1437,12 @@ class BackupApp:
         ]
         server_entry = self._account_form_row(form, 3, "收件服务器：", self._acct_server_var)
         form_entries.append(server_entry)
-        ssl_check = tk.Checkbutton(form, text="SSL", variable=self._acct_ssl_var,
-                                   command=self._on_acct_ssl_toggle)
-        ssl_check.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=3)
+        # SSL 用可点击切换的色块 chip（与备份卡同一视觉）：点一下翻状态，默认端口照旧联动
+        ssl_chip = self._acct_ssl_chip = tk.Label(form, text=SSL_CHIP_TEXT, padx=6, pady=1,
+                                                  cursor="hand2")
+        ssl_chip.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=3)
+        ssl_chip.bind("<Button-1>", self._on_acct_ssl_chip_click)
+        self._style_ssl_chip(ssl_chip, self._acct_ssl_var.get())
         tk.Label(form, text="端口：").grid(row=3, column=3, sticky="e", padx=(4, 4), pady=3)
         port_entry = tk.Entry(form, textvariable=self._acct_port_var, width=7)
         port_entry.grid(row=3, column=4, sticky="w", pady=3)
@@ -988,6 +1470,10 @@ class BackupApp:
         entry.grid(row=row, column=1, sticky="we", pady=3)
         return entry
 
+    def _fit_account_form_block(self, event) -> None:
+        """把账户表单块宽度钉在 min(宿主宽, ACCOUNT_FORM_MAX_WIDTH)：块内拉伸、块外留白。"""
+        self._account_form_block.place_configure(width=min(int(event.width), ACCOUNT_FORM_MAX_WIDTH))
+
     def _build_backup_settings(self, parent: tk.Frame, title: str) -> None:
         """「备份」分类：全局唯一的备份保存位置（所有账户共用，见 ADR 0010）。"""
         body = tk.Frame(parent)
@@ -995,8 +1481,14 @@ class BackupApp:
         tk.Label(body, text=title, anchor="w",
                  font=_heading_font(tkfont.nametofont("TkDefaultFont"))).pack(fill="x")
 
-        row = tk.Frame(body)
-        row.pack(fill="x", pady=(10, 0))
+        row_host = tk.Frame(body)
+        row_host.pack(fill="x", pady=(10, 0))
+        # path 行封顶 ACCOUNT_FORM_MAX_WIDTH（与账户表单同口径）：place 定宽、块内拉伸、块外留白，
+        # 免得最大化窗口时输入行拉成一条长线
+        row = tk.Frame(row_host)
+        row.place(x=0, y=0)
+        self._backup_root_row = row
+        row_host.bind("<Configure>", self._fit_backup_root_row)
         tk.Label(row, text="备份保存位置：").pack(side="left")
         self.backup_root_entry = tk.Entry(row, textvariable=self.backup_root_var)
         self.backup_root_entry.pack(side="left", fill="x", expand=True, padx=4)
@@ -1004,6 +1496,17 @@ class BackupApp:
         self.backup_root_entry.bind("<Button-3>", self._on_entry_context)
         tk.Label(body, text=BACKUP_ROOT_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
                  wraplength=TIP_WRAP).pack(fill="x", pady=(8, 0))
+
+    def _fit_backup_root_row(self, event) -> None:
+        """把备份保存位置行钉在 min(宿主宽, ACCOUNT_FORM_MAX_WIDTH)：块内拉伸、块外留白。
+
+        Note:
+            行是 place 子控件、不向宿主传播请求高，宿主的高度显式贴行高，下方说明文字才不压上来。
+        """
+        self._backup_root_row.place_configure(width=min(int(event.width), ACCOUNT_FORM_MAX_WIDTH))
+        row_h = self._backup_root_row.winfo_reqheight()
+        if row_h > 1 and event.height != row_h:
+            event.widget.configure(height=row_h)
 
     def _build_window_settings(self, parent: tk.Frame, title: str) -> None:
         """「窗口与后台」分类的详情：关闭行为三态 + 说明文字。
@@ -1203,7 +1706,7 @@ class BackupApp:
         self.stop_btn = tk.Button(bar, text=STOP_BTN_LABEL, state="disabled", command=self._on_stop)
         self.stop_btn.pack(side="right")
         self.start_btn = tk.Button(bar, text=START_BTN_LABEL, command=self._on_start)
-        self.start_btn.pack(side="right", padx=(0, 6))
+        self.start_btn.pack(side="right", padx=(0, BTN_GAP))
         self._attach_button_icons()
         # 进度条是这一行唯一可伸缩的控件：文字变长它先缩水，触及地板宽度后文字才截断
         self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)
@@ -1251,11 +1754,10 @@ class BackupApp:
         return self._state(self._selected_account_id)
 
     def _state(self, account_id: str) -> dict:
-        """取（必要时建立）某账户的独立状态：连接、文件夹树、邮件行、计数与进度。"""
+        """取（必要时建立）某账户的独立状态：文件夹树、邮件行、计数与进度。"""
         state = self._states.get(account_id)
         if state is None:
-            state = {"connect_state": "idle",       # idle | connecting | connected | stale
-                     "snapshot": None,              # (server, user, password_dpapi) 连接当刻的值
+            state = {"snapshot": None,              # (server, user, password_dpapi) 静默拉清单当刻的值
                      "folder_rows": [], "open_keys": None,  # open_keys=None → 首次全部展开
                      "messages": [], "row_index": 0,
                      "server_total": 0, "pending_total": 0, "backed": 0,
@@ -1271,11 +1773,16 @@ class BackupApp:
         return None
 
     def _account_password(self, account: dict) -> str:
-        """解出账户密码明文；没存过或解不开（换机器/换账户）都按空串处理。"""
+        """解出账户密码明文；没存过或解不开（换机器/换账户）都按空串处理。
+
+        Note:
+            兜底取本次补录的临时密码（_run_passwords，勾了「保存」才落密文）——补录窗
+            选不保存也能先把文件夹清单拉出来，只在本次会话生效。
+        """
         cipher = account.get("password_dpapi")
         if isinstance(cipher, str) and cipher:
             return _dpapi_decrypt(cipher) or ""
-        return ""
+        return self._run_passwords.get(str(account.get("id", "")), "")
 
     def _account_snapshot(self, account: dict) -> tuple[str, str, str]:
         """连接参数快照（密码取密文）：与快照不同即「文件夹快照过期」。"""
@@ -1313,31 +1820,98 @@ class BackupApp:
                 "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)), "port": port,
                 "mbox": bool(account.get("mbox", False)), "eml": bool(account.get("eml", True))}
 
-    def _on_connect(self) -> None:
-        if str(self.connect_btn.cget("state")) != "normal":
-            # 连接中/已连接/备份运行时按钮被禁用；门控不挡住的话会起第二条连接线程。
+    def _maybe_load_folders(self, account_id: str | None) -> None:
+        """按需静默拉某账户的文件夹清单（启动 / 切账户 / 保存账户后触发）。
+
+        Note:
+            不是用户可见的连接动作：无按钮、无状态图标。账户没有清单、或连接参数变过
+            （快照口径）才拉；同一账户进行中不重复起线程。失败在文件夹区提示可刷新重试，
+            密码类失败再弹密码补录窗（补完自动重拉，见 ADR 0011 的连接口径）。
+        """
+        if account_id is None:
             return
-        account = self._find_account(self._selected_account_id)
+        account = self._find_account(account_id)
         if account is None:
             return
-        v = self._account_credentials(account)
-        if v is None:
+        state = self._state(account_id)
+        if account_id in self._loading_folder_ids:
             return
-        state = self._state(account["id"])
-        state["connect_state"] = "connecting"
-        self.connect_state = "connecting"
-        self._apply_connect_state()
-        self._update_start_state()
-        threading.Thread(target=self._connect_worker,
-                         args=(account["id"], v, self._account_snapshot(account)), daemon=True).start()
+        if state["snapshot"] is not None and state["snapshot"] == self._account_snapshot(account):
+            return
+        v = self._account_credentials(account, warn=False)
+        if v is None:
+            if not self._account_password(account):
+                self._show_folder_hint(account_id, FOLDER_LOAD_NO_PASSWORD_HINT)
+                self._maybe_prompt_folder_password(account_id)
+            else:
+                self._show_folder_hint(account_id, FOLDER_LOAD_INCOMPLETE_HINT)
+            return
+        self._loading_folder_ids.add(account_id)
+        threading.Thread(target=self._folder_worker,
+                         args=(account_id, v, self._account_snapshot(account)), daemon=True).start()
+
+    def _on_refresh_folders(self) -> None:
+        """手动刷新（邮箱文件夹工具栏的 ⟳）：丢掉快照强制重拉，密码类失败照旧弹补录。
+
+        Note:
+            「同快照只弹一次」的记忆一并清掉——手动刷新就是要再问一次密码。
+        """
+        account_id = self._selected_account_id
+        if account_id is None or self.running:
+            return
+        state = self._state(account_id)
+        state["snapshot"] = None
+        state["password_prompted"] = None
+        self._maybe_load_folders(account_id)
+
+    def _show_folder_hint(self, account_id: str, text: str) -> None:
+        """文件夹区的提示行：只对可见账户显示；树上已有内容时不打扰（提示叠在树上没意义）。"""
+        if account_id != self._selected_account_id or self.folder_rows:
+            return
+        self.folder_ph.configure(text=text)
+        self._toggle_hint(self.folder_ph, True)
+
+    def _maybe_prompt_folder_password(self, account_id: str) -> None:
+        """密码类失败的补录入口：同账户同快照只弹一次（手动刷新清记忆后必再弹）。
+
+        Note:
+            经 after_idle 弹窗：启动期也走这里，等主循环起来再弹模态窗，不在 __init__ 里嵌事件循环。
+        """
+        account = self._find_account(account_id)
+        if account is None:
+            return
+        state = self._state(account_id)
+        snapshot = self._account_snapshot(account)
+        if state.get("password_prompted") == snapshot:
+            return
+        state["password_prompted"] = snapshot
+        self.root.after_idle(lambda: self._ask_folder_password(account_id))
+
+    def _ask_folder_password(self, account_id: str) -> None:
+        """弹密码补录窗：拿到密码就存（勾了保存）并强制重拉清单；跳过则维持失败提示。"""
+        answer = self._ask_password(account_id)
+        if answer is None:
+            return
+        password, save = answer
+        self._run_passwords[account_id] = password
+        account = self._find_account(account_id)
+        if save and account is not None:
+            cipher = _dpapi_encrypt(password) if sys.platform == "win32" else None
+            if cipher:
+                account["password_dpapi"] = cipher
+                self._save_column_config()
+        state = self._state(account_id)
+        state["snapshot"] = None
+        state["password_prompted"] = None
+        self._maybe_load_folders(account_id)
 
     def _core_config(self, v: dict, basedir: Path | None = None, eml_dir: Path | None = None) -> core.Config:
         return core.Config(overwrite=False, usessl=v["ssl"], thunderbird=False, nospinner=True,
                            basedir=basedir, icloud=False, quiet=False, user=v["user"], server=v["server"],
                            password=v["password"], timeout=60, port=v["port"], eml_dir=eml_dir)
 
-    def _connect_worker(self, account_id: str, v: dict, snapshot: tuple[str, str, str]) -> None:
-        """连接线程入口：登录并拉取文件夹清单，结果经事件队列回主线程。"""
+    def _folder_worker(self, account_id: str, v: dict, snapshot: tuple[str, str, str]) -> None:
+        """静默拉文件夹清单的线程入口：登录并 LIST，结果经事件队列回主线程。"""
         log = logging.getLogger("imapbackup")
         cfg = self._core_config(v)
         try:
@@ -1349,29 +1923,37 @@ class BackupApp:
                     server.logout()
             self.events.put(("folders_loaded", (account_id, names, snapshot)))
         except SystemExit as e:
-            self.events.put(("connect_failed", (account_id, str(e))))
+            self.events.put(("folder_load_failed", (account_id, str(e))))
         except Exception as e:
-            log.exception("连接失败")
-            self.events.put(("connect_failed", (account_id, f"{type(e).__name__}: {e}")))
+            log.exception("拉取文件夹清单失败")
+            self.events.put(("folder_load_failed", (account_id, f"{type(e).__name__}: {e}")))
 
     def _on_folders_loaded(self, account_id: str, names: list[tuple], snapshot: tuple[str, str, str]) -> None:
-        """连接成功：为该账户建文件夹行、记下连接参数快照，可见时才动界面。"""
+        """静默拉到清单：为该账户建文件夹行、记下快照，可见时才动界面。"""
+        self._loading_folder_ids.discard(account_id)
         account = self._find_account(account_id)
         if account is None:
             return
         state = self._state(account_id)
         if account_id == self._selected_account_id:
-            self._sync_visible_folder_choices()  # 重连前先把界面上的勾选收回账户，重建不丢改动
+            self._sync_visible_folder_choices()  # 重建前先把界面上的勾选收回账户，重建不丢改动
         self._fill_folder_rows(state, account, names)
         state["snapshot"] = snapshot
-        state["connect_state"] = "connected"
-        self._refresh_stale(account_id)  # 连接期间账户若被改过，立刻转 stale（快照口径）
         self.log.info("账户 %s：已加载 %d 个邮箱文件夹", account_display(account), len(names))
         if account_id == self._selected_account_id:
             self._render_folder_tree(state)
-            self.connect_state = state["connect_state"]
-            self._apply_connect_state()
             self._update_start_state()
+
+    def _on_folder_load_failed(self, account_id: str, message: str) -> None:
+        """静默拉清单失败：写日志 + 文件夹区提示可刷新重试；密码类失败再弹补录窗。"""
+        self._loading_folder_ids.discard(account_id)
+        account = self._find_account(account_id)
+        name = account_display(account) if account else account_id
+        self.log.warning("账户 %s：文件夹清单加载失败（%s）", name, message)
+        reason = message if len(message) <= FOLDER_FAIL_REASON_MAX else message[:FOLDER_FAIL_REASON_MAX] + ELLIPSIS
+        self._show_folder_hint(account_id, FOLDER_LOAD_FAIL_HINT.format(reason=reason))
+        if _is_auth_failure(message):
+            self._maybe_prompt_folder_password(account_id)
 
     def _fill_folder_rows(self, state: dict, account: dict, names: list[tuple]) -> None:
         """按账户记录的勾选构建文件夹行：现存勾选保留，缺省或全部失效时默认仅 INBOX。"""
@@ -1407,8 +1989,14 @@ class BackupApp:
         keys = sorted({row["path"][:i] for row in rows for i in range(1, len(row["path"]) + 1)},
                       key=lambda k: (len(k), k))
         with_kids = {k for k in keys if any(o != k and o[:len(k)] == k for o in keys)}
+        # 同级末个节点的连接符取 └、其余取 ├（见 _make_folder_node）；keys 已按 (深度, 名) 排好，
+        # 每组兄弟的最后一条就是末个
+        by_parent: dict[tuple, list[tuple]] = {}
+        for k in keys:
+            by_parent.setdefault(k[:-1], []).append(k)
+        last_keys = {siblings[-1] for siblings in by_parent.values()}
         for key in keys:  # 父节点必然先于子节点建成
-            self._make_folder_node(key, real.get(key), with_kids, state["open_keys"])
+            self._make_folder_node(key, real.get(key), with_kids, state["open_keys"], key in last_keys)
 
         self.folder_rows.sort(key=lambda r: r["path"])
         state["folder_rows"] = self.folder_rows
@@ -1423,11 +2011,14 @@ class BackupApp:
         # 不会再触发那个事件，所以这里显式归零——不然上次的行距会留在没内容的树上。
         if not self.folder_rows:
             self._sync_folder_row_increment()
-        # 重建会铺满树区，空态提示得跟着收掉；一个文件夹都没解析出来时重新挂回
+        # 重建会铺满树区，空态提示得跟着收掉；一个文件夹都没解析出来时重新挂回（提示文还原成默认，
+        # 上一轮失败提示的文案不留到下棵树上）
+        self.folder_ph.configure(text=FOLDER_PLACEHOLDER_TEXT)
         self._toggle_hint(self.folder_ph, not self.folder_rows)
 
     def _make_folder_node(self, key: tuple[str, ...], rows: list[dict] | None,
-                          with_kids: set[tuple], open_keys: set[tuple] | None) -> None:
+                          with_kids: set[tuple], open_keys: set[tuple] | None,
+                          is_last: bool) -> None:
         open_now = True if open_keys is None else key in open_keys
         # rows 可能多于一条：两个不同文件夹名消毒后落到同一路径时共享一行，
         # 但仍按 foldername 各自进备份清单（输出路径本就相同）。
@@ -1443,27 +2034,51 @@ class BackupApp:
 
         row = tk.Frame(frame)
         row.pack(anchor="w")
-        slot = tk.Frame(row)  # 固定宽度的箭头槽，让各级名称左边缘对齐
-        slot.pack(side="left")
-        slot.pack_propagate(False)
-        slot.configure(width=ARROW_SLOT_W)
-        if key in with_kids:
-            arrow = tk.Label(slot, text=ARROW_OPEN if open_now else ARROW_CLOSED, cursor="hand2")
-            arrow.pack(side="left")
-            arrow.bind("<Button-1>", lambda _e, _k=key: self._toggle_folder_open(_k))
-            node["arrow"] = arrow
-            self._folder_clickables.append((arrow, str(arrow.cget("foreground"))))
-
+        node["prefix_label"] = None
+        if len(key) == 1:
+            # 一级行：不画 ├/└ 层级符号（用户选定），复选框直接贴树区左缘的 CARD_PAD 标准内边距，
+            # 不再留前置槽；有子文件夹时展开箭头跟在名称后（用户选定）。
+            name_label = tk.Label(row, cursor="hand2" if rows else "arrow")
+            name_label.pack(side="left")
+            if key in with_kids:
+                arrow = tk.Label(row, text=ARROW_OPEN if open_now else ARROW_CLOSED, cursor="hand2")
+                arrow.pack(side="left", padx=(4, 0))
+                arrow.bind("<Button-1>", lambda _e, _k=key: self._toggle_folder_open(_k))
+                node["arrow"] = arrow
+                self._folder_clickables.append((arrow, str(arrow.cget("foreground"))))
+        else:
+            # 二级及以下：连接符 + 展开箭头共一个固定宽槽，各级名称左边缘才对齐；连接符是树形
+            # 层级语言，同级末个用 └、其余用 ├（不画祖先竖线，用户选定）。
+            # 槽定宽但必须 fill="y"：pack_propagate(False) 连高度传播也关掉，不给高度槽会塌成 1px，
+            # Windows 把子标签裁成一条横切片——├/└/▾ 全都显示成「-」（用户截图问题的根因）。
+            slot = tk.Frame(row)
+            slot.pack(side="left", fill="y")
+            slot.pack_propagate(False)
+            slot.configure(width=ARROW_SLOT_W)
+            prefix = tk.Label(slot, text=TREE_LAST if is_last else TREE_BRANCH)
+            prefix.pack(side="left")
+            node["prefix_label"] = prefix
+            if key in with_kids:
+                arrow = tk.Label(slot, text=ARROW_OPEN if open_now else ARROW_CLOSED, cursor="hand2")
+                arrow.pack(side="left")
+                arrow.bind("<Button-1>", lambda _e, _k=key: self._toggle_folder_open(_k))
+                node["arrow"] = arrow
+                self._folder_clickables.append((arrow, str(arrow.cget("foreground"))))
+            name_label = tk.Label(row, cursor="hand2" if rows else "arrow")
+            name_label.pack(side="left")
+        node["label_widget"] = name_label
+        # 名称截断的 store：全文/当前文本/气泡内容（勾选行的全文带勾选符，见 _render_folder_checks）
+        node["text_full"] = node["label"]
+        node["text_shown"] = node["label"]
+        node["tip_full"] = rows[0]["display"] if rows else "/".join(key)
+        name_label.configure(text=node["label"])
+        self._bind_name_tip(name_label, node)
         if rows:
-            btn = tk.Label(row, text=key[-1], cursor="hand2")
-            btn.pack(side="left")
-            btn.bind("<Button-1>", lambda _e, _k=key: self._on_folder_check(_k))
-            self._folder_clickables.append((btn, str(btn.cget("foreground"))))
+            name_label.bind("<Button-1>", lambda _e, _k=key: self._on_folder_check(_k))
+            self._folder_clickables.append((name_label, str(name_label.cget("foreground"))))
             for r in rows:
                 self.folder_rows.append(r)
-                r["check_btn"] = btn
-        else:
-            tk.Label(row, text=key[-1]).pack(side="left")
+                r["check_btn"] = name_label
 
         node["kids"] = tk.Frame(frame)
         self._pack_kids(node)
@@ -1471,7 +2086,7 @@ class BackupApp:
     def _pack_kids(self, node: dict) -> None:
         """展开挂出子文件夹框、折叠收起；控件不销毁，勾选与展开状态都留在内存里。"""
         if node["open"]:
-            node["kids"].pack(anchor="w", fill="x", padx=(ARROW_SLOT_W, 0))
+            node["kids"].pack(anchor="w", fill="x", padx=(TREE_INDENT_W, 0))
         else:
             node["kids"].pack_forget()
 
@@ -1540,14 +2155,40 @@ class BackupApp:
                 glyph = CHECK_PARTIAL
             else:
                 glyph = CHECK_OFF
-            text = f"{glyph} {node['label']}"
-            for r in node["rows"]:
-                r["check_btn"].configure(text=text)
+            # 全文带勾选符（气泡与「没截断」判定都按这一份比），显示文本按树区宽截断
+            node["text_full"] = f"{glyph} {node['label']}"
+            self._fit_folder_names_for(node)
+
+    def _fit_folder_names_for(self, node: dict) -> None:
+        """单个节点的名称截断（_fit_folder_names 的逐节点口径，重建与勾选翻转共用）。"""
+        label = node.get("label_widget")
+        if label is None or "text_full" not in node:
+            return
+        key = node["key"]
+        canvas_w = self.folder_canvas.winfo_width()
+        if canvas_w < 40:
+            label.configure(text=node["text_full"])
+            node["text_shown"] = node["text_full"]
+            return
+        glyph_w = self._text_font().measure(CHECK_ON + " ")
+        if len(key) == 1:
+            # 一级行没有前置槽：只扣勾选符与右留白；展开箭头跟在名称后时再扣它那一截
+            arrow = node.get("arrow")
+            trailing_w = (arrow.winfo_reqwidth() + 4) if arrow is not None else 0
+            budget = canvas_w - glyph_w - 12 - trailing_w
+        else:
+            budget = canvas_w - TREE_INDENT_W * (len(key) - 1) - ARROW_SLOT_W - glyph_w - 12
+        self._fit_name_label(label, node, max(int(budget), 40))
 
     def _on_folder_inner_configure(self, _event=None) -> None:
         """树区内容重排后（首次铺满、加载完文件夹、窗口缩放）同步滚动范围与行距。"""
         self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all"))
         self._sync_folder_row_increment()
+
+    def _on_folder_canvas_configure(self, event) -> None:
+        """树区宽度变化：内嵌树跟着变宽，并重算各层名称截断（变宽自动恢复全文）。"""
+        self.folder_canvas.itemconfigure(self._folder_win, width=event.width)
+        self._fit_folder_names()
 
     def _measure_folder_row_pitch(self) -> int:
         """量文件夹树的行距(px)。
@@ -1606,9 +2247,10 @@ class BackupApp:
         self.account_canvas.after_idle(self._sync_account_scroll)
 
     def _on_account_canvas_configure(self, event) -> None:
-        """画布尺寸变化：内嵌列表跟着变宽（行吃满宽度），并重算滚条去留。"""
+        """画布尺寸变化：内嵌列表跟着变宽（行吃满宽度），并重算滚条去留与名称截断。"""
         self.account_canvas.itemconfigure(self._account_win, width=event.width)
         self._sync_account_scroll()
+        self._fit_account_names()
 
     def _sync_account_scroll(self) -> None:
         """同步账户列表的滚动状态：画布单位 = 一行，内容装不下才把滚条挂出来。
@@ -1658,6 +2300,11 @@ class BackupApp:
                          background=ACCOUNT_ROW_BG, foreground=ACCOUNT_ROW_FG)
         label.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self._account_rows[account_id] = {"frame": frame, "check": check, "label": label, "var": var}
+        # 名称截断的 store（口径同文件夹名）：超侧边栏宽就省略号，悬停看全文
+        store = self._account_rows[account_id]
+        store["text_full"] = store["tip_full"] = account_display(account)
+        store["text_shown"] = store["text_full"]
+        self._bind_name_tip(label, store)
         for widget in (frame, label):
             widget.bind("<Button-1>", lambda _e, _id=account_id: self._on_account_row_click(_id))
 
@@ -1725,6 +2372,7 @@ class BackupApp:
             for child in self.folder_inner.winfo_children():
                 child.destroy()
             self._sync_folder_row_increment()
+            self.folder_ph.configure(text=FOLDER_PLACEHOLDER_TEXT)
             self._toggle_hint(self.folder_ph, True)
             self._render_messages(None)
             self.server_total = self.pending_total = self.backed_count = 0
@@ -1734,11 +2382,8 @@ class BackupApp:
             self._set_config_enabled(False)
             self.mbox_var.set(False)
             self.eml_var.set(True)
-            self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="disabled")
-            self._show_conn_hint("", HINT_GRAY)
             self._update_start_state()
             return
-        self._refresh_stale(account["id"])
         self._render_folder_tree(state)
         self._render_messages(state)
         self._restore_run_state(state)
@@ -1746,25 +2391,32 @@ class BackupApp:
         self.mbox_var.set(bool(account.get("mbox", False)))
         self.eml_var.set(bool(account.get("eml", True)))
         self._set_config_enabled(not self.running)
-        self._apply_connect_state()
         self._update_start_state()
 
     def _render_card(self, account: dict | None) -> None:
         """只读信息卡：账户缺失时全部显示占位符；密码不在卡片上（只在设置页账户表单维护）。"""
         if account is None:
-            values = {"user": CARD_EMPTY_TEXT, "server": CARD_EMPTY_TEXT, "ssl": CARD_EMPTY_TEXT,
+            values = {"user": CARD_EMPTY_TEXT, "server": CARD_EMPTY_TEXT, "ssl": False,
                       "port": CARD_EMPTY_TEXT}
         else:
             values = {"user": account.get("user") or CARD_EMPTY_TEXT,
                       "server": account.get("server") or CARD_EMPTY_TEXT,
-                      "ssl": "是" if account.get("ssl", DEFAULT_ACCOUNT_SSL) else "否",
+                      "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)),
                       "port": str(account.get("port") or CARD_EMPTY_TEXT)}
-        for key, label in self._card_labels.items():
-            label.configure(text=values[key])
+        self._set_card_value("user", values["user"])
+        self._set_card_value("server", values["server"])
+        self._style_ssl_chip(self._card_labels["ssl"], values["ssl"])
+        self._card_labels["port"].configure(text=values["port"])
         self._render_backup_root()
 
+    def _set_card_value(self, key: str, text: str) -> None:
+        """写入卡片某值的全文，再按当前卡宽截断（悬停看全文，见 _fit_card_values）。"""
+        self._card_full[key] = text
+        self._card_vars[key].set(text)
+
     def _render_backup_root(self) -> None:
-        self.card_root_label.configure(text=self.backup_root_var.get().strip() or DEFAULT_BACKUP_ROOT)
+        self._set_card_value("root", self.backup_root_var.get().strip() or DEFAULT_BACKUP_ROOT)
+        self._fit_card_values()
 
     def _render_messages(self, state: dict | None) -> None:
         """把账户的邮件行重画进邮件列表（切换账户时的一次性重绘）。"""
@@ -1791,11 +2443,30 @@ class BackupApp:
         self._set_counts(state["count_text"])
         self._set_status(state["status_text"], state["status_error"])
 
+    def _sync_account_edit_scroll(self) -> None:
+        """设置页账户列表的智能滚条：内容装不下才把滚条挂出来，装下就收走。
+
+        Note:
+            与备份页账户列表（_sync_account_scroll）同口径：行数 × 行高比可视高。
+            挂出滚条又会让列表变窄、再触发一次 <Configure>，第二次进来状态已稳定，不来回抖。
+        """
+        rows = int(self.account_edit_list.index("end"))
+        first = self.account_edit_list.bbox(0)
+        show = bool(first) and rows * first[3] > self.account_edit_list.winfo_height() + 1
+        if show == self._account_edit_scroll_shown:
+            return
+        self._account_edit_scroll_shown = show
+        if show:
+            self.account_edit_scroll.grid()
+        else:
+            self.account_edit_scroll.grid_remove()
+
     def _refresh_edit_list(self, select_id: str | None) -> None:
         """重画设置页账户列表；选中项回填表单，没有账户时表单清空。"""
         self.account_edit_list.delete(0, "end")
         for account in self.accounts:
             self.account_edit_list.insert("end", account_display(account))
+        self._sync_account_edit_scroll()   # 增删后行数变了，滚条去留跟着走
         ids = [account["id"] for account in self.accounts]
         if select_id is None or select_id not in ids:
             select_id = ids[0] if ids else None
@@ -1823,6 +2494,7 @@ class BackupApp:
         self._acct_user_var.set(account.get("user", ""))
         self._acct_server_var.set(account.get("server", ""))
         self._acct_ssl_var.set(bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)))
+        self._style_ssl_chip(self._acct_ssl_chip, self._acct_ssl_var.get())
         self._acct_port_var.set(str(account.get("port", DEFAULT_ACCOUNT_PORT)))
         self._acct_password_var.set(PASSWORD_MASK_TEXT if account.get("password_dpapi") else "")
 
@@ -1831,6 +2503,7 @@ class BackupApp:
         self._acct_user_var.set("")
         self._acct_server_var.set("")
         self._acct_ssl_var.set(DEFAULT_ACCOUNT_SSL)
+        self._style_ssl_chip(self._acct_ssl_chip, self._acct_ssl_var.get())
         self._acct_port_var.set(DEFAULT_ACCOUNT_PORT)
         self._acct_password_var.set("")
 
@@ -1856,9 +2529,15 @@ class BackupApp:
             self._acct_password_entry.delete(0, "end")
 
     def _on_acct_ssl_toggle(self) -> None:
-        """SSL 勾选联动默认端口：只在端口仍是 993/143 这两个默认值时替换。"""
+        """SSL 开关联动默认端口：只在端口仍是 993/143 这两个默认值时替换。"""
         if self._acct_port_var.get().strip() in ("993", "143"):
             self._acct_port_var.set("993" if self._acct_ssl_var.get() else "143")
+        self._style_ssl_chip(self._acct_ssl_chip, self._acct_ssl_var.get())
+
+    def _on_acct_ssl_chip_click(self, _event=None) -> None:
+        """点 SSL chip = 翻转开关：语义与原 Checkbutton 的 command 完全一致，只是控件换成色块。"""
+        self._acct_ssl_var.set(not self._acct_ssl_var.get())
+        self._on_acct_ssl_toggle()
 
     def _on_account_add(self) -> None:
         """新增一个空账户并立刻落盘：先有账户，再去表单里填连接信息。"""
@@ -1929,108 +2608,11 @@ class BackupApp:
         account["port"] = str(port)
         self._refresh_account_list()
         self._refresh_edit_list(account["id"])
-        self._refresh_stale(account["id"])
         if account["id"] == self._selected_account_id:
             self._render_card(account)
         self._save_column_config()
+        self._maybe_load_folders(account["id"])   # 保存后静默补拉该账户的文件夹清单
         self.log.info("保存账户 %s（%s）", account_display(account), user)
-
-    # ------------------------------------------------------- stale state rules
-
-    def _refresh_stale(self, account_id: str) -> None:
-        """账户被编辑后刷新连接状态：取值 ≠ 连接当刻快照即 stale，回到原值即 connected。
-
-        Note:
-            只有连接过（快照非空）的账户才谈得上过期；idle/connecting 不动。快照取密码密文，
-            换密码同样算改了连接信息。
-        """
-        state = self._states.get(account_id)
-        if state is None or state["snapshot"] is None or state["connect_state"] not in ("connected", "stale"):
-            return
-        account = self._find_account(account_id)
-        if account is None:
-            return
-        state["connect_state"] = "connected" if self._account_snapshot(account) == state["snapshot"] else "stale"
-        if account_id == self._selected_account_id:
-            self.connect_state = state["connect_state"]
-            self._apply_connect_state()
-            self._update_start_state()
-
-    def _show_conn_hint(self, text: str, color: str) -> None:
-        """显示连接提示并上色；空文案时整行让出空间，避免无提示时留一条空带。
-
-        Args:
-            text: 提示文案。
-            color: 提示前景色。
-
-        Note:
-            判断是否已挂出用 winfo_manager 而不用 winfo_ismapped：后者反映显示端映射态，
-            比布局管理器滞后，刚 grid_remove 后仍报 True，会让该显示的提示被跳过。
-        """
-        if text:
-            self.conn_hint.configure(text=text, foreground=color)
-            if self.conn_hint.winfo_manager() == "":
-                self.conn_hint.grid()
-        else:
-            # 不可见时把文本清掉：标签只是不挂出，内容仍在，将来误挂出会闪出旧提示
-            self.conn_hint.configure(text="")
-            self.conn_hint.grid_remove()
-
-    def _start_button_spinner(self) -> None:
-        """连接中的按钮加载态：帧与节奏跟开始按钮共用（两处加载图标必须看起来一样）。"""
-        self.connect_btn.configure(state="disabled")
-        self._connect_spinner_tick(0)
-
-    def _connect_spinner_tick(self, index: int) -> None:
-        """画第 index 帧并按当前可见账户的连接状态决定排不排下一帧。
-
-        Note:
-            帧链只服务「当前可见账户正在连接」这一种情形：切到别的账户时 _apply_connect_state
-            会取消它，连着的那个账户在后台照常完成，切回去时重新起链。
-        """
-        state = self._visible_state()
-        if state is None or state["connect_state"] != "connecting":
-            self._spinner_job = None
-            return
-        self._set_loading_frame(self.connect_btn, CONNECTING_BTN_LABEL, index)
-        self._spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._connect_spinner_tick, index + 1)
-
-    def _apply_connect_state(self) -> None:
-        state = self._visible_state()
-        self.connect_state = state["connect_state"] if state is not None else "idle"
-        if state is None:
-            # 一个账户都没有：连接按钮无处可点，等去设置页建账户
-            self._cancel_connect_spinner()
-            self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="disabled")
-            self._show_conn_hint("", HINT_GRAY)
-            return
-        if self.connect_state == "connecting":
-            if self._spinner_job is None:
-                self._start_button_spinner()
-        else:
-            # 帧链取消要走 after_cancel：切账户后旧链若只清 job 槽，会和下一账户的新链并行
-            self._cancel_connect_spinner()
-            if self.running:
-                # 运行中配置区整体锁定，connect_btn 已被 _set_config_enabled(False) 禁用
-                self.connect_btn.configure(text=CONNECT_BTN_LABEL)
-                hint = STOPPING_HINT_TEXT if self.stopping else RUNNING_HINT_TEXT
-                self._show_conn_hint(hint, HINT_GRAY)
-            elif self.connect_state == "connected":
-                self.connect_btn.configure(text=CONNECTED_BTN_LABEL, state="disabled")
-                self._show_conn_hint("", HINT_GRAY)
-            else:  # idle / stale — 同一控件，stale 额外加一行提示
-                # 必须恢复 normal：运行中 _set_config_enabled(False) 禁用的按钮在结束后要能重新点击
-                self.connect_btn.configure(text=CONNECT_BTN_LABEL, state="normal")
-                if self.connect_state == "stale":
-                    self._show_conn_hint(STALE_HINT_TEXT, HINT_RED)
-                else:
-                    self._show_conn_hint("", HINT_GRAY)
-
-    def _cancel_connect_spinner(self) -> None:
-        if self._spinner_job is not None:
-            with contextlib.suppress(tk.TclError):
-                self.root.after_cancel(self._spinner_job)
-        self._spinner_job = None
 
     # --------------------------------------------------------- misc handlers
 
@@ -2273,7 +2855,10 @@ class BackupApp:
             selected = accounts[0]["id"] if accounts else None
         return {"version": UI_SETTINGS_VERSION, "columns": columns, "window": raw.get("window"),
                 CLOSE_ACTION_KEY: parse_close_action(action), "accounts": accounts,
-                "backup_root": backup_root, "selected_account": selected}
+                "backup_root": backup_root, "selected_account": selected,
+                BACKUP_SIDEBAR_WIDTH_KEY: parse_sidebar_width(raw.get(BACKUP_SIDEBAR_WIDTH_KEY)),
+                SETTINGS_SIDEBAR_WIDTH_KEY: parse_sidebar_width(raw.get(SETTINGS_SIDEBAR_WIDTH_KEY)),
+                ACCOUNT_LIST_WIDTH_KEY: parse_sidebar_width(raw.get(ACCOUNT_LIST_WIDTH_KEY))}
 
     def _restore_window_settings(self) -> tuple[int, int, int, int]:
         # 落地后要重设的那份几何（见 __init__ 末尾）：默认就是默认尺寸，恢复到保存值时在下面替换
@@ -2363,6 +2948,9 @@ class BackupApp:
         self._ui_settings["accounts"] = [account_record(account) for account in self.accounts]
         self._ui_settings["backup_root"] = self.backup_root_var.get().strip() or DEFAULT_BACKUP_ROOT
         self._ui_settings["selected_account"] = self._selected_account_id
+        self._ui_settings[BACKUP_SIDEBAR_WIDTH_KEY] = self._backup_sidebar_width
+        self._ui_settings[SETTINGS_SIDEBAR_WIDTH_KEY] = self._settings_sidebar_width
+        self._ui_settings[ACCOUNT_LIST_WIDTH_KEY] = self._account_list_width
         temporary: Path | None = None
         try:
             COLUMN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2628,7 +3216,7 @@ class BackupApp:
 
     def _update_start_state(self, *_args) -> None:
         state = self._visible_state()
-        ok = (state is not None and state["connect_state"] == "connected"
+        ok = (state is not None
               and any(r["var"].get() for r in self.folder_rows)
               and (self.mbox_var.get() or self.eml_var.get())
               and not self.running)
@@ -2636,7 +3224,7 @@ class BackupApp:
         self.backup_selected_btn.configure(state="normal" if self.accounts and not self.running else "disabled")
 
     def _set_loading_frame(self, button: tk.Button, label: str, index: int) -> None:
-        """把按钮画成加载态的第 index 帧——连接与备份共用这一个入口。
+        """把按钮画成加载态的第 index 帧（开始/停止按钮的转圈共用这一个入口）。
 
         Args:
             button: 要画帧的按钮。
@@ -2644,7 +3232,7 @@ class BackupApp:
             index: 帧序号，按 SPINNER_FRAMES 长度取模循环。
 
         Note:
-            盲文点阵当前缀，节奏同为 SPINNER_INTERVAL_MS，所以两处的加载图标看起来一模一样。
+            盲文点阵当前缀，节奏同为 SPINNER_INTERVAL_MS。
         """
         button.configure(text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {label}")
 
@@ -2663,16 +3251,16 @@ class BackupApp:
         Note:
             帧链只有一条（job 槽 self._run_spinner_job）：运行中画开始按钮，停止中改画停止按钮
             （开始按钮已在 _on_stop 里退回静止外观），所以「谁在忙」永远只有一颗按钮在转。
-            退出时把整段运行态界面复位（两颗按钮 + 配置区提示）：有的路径会把 running 直接置假
-            而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」、
-            提示会滞留在「备份正在停止…」。帧推进单独成方法，测试可直接驱动。
+            退出时把整段运行态界面复位（两颗按钮）：有的路径会把 running 直接置假
+            而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」。
+            帧推进单独成方法，测试可直接驱动。
         """
         if not self.running:
             self._run_spinner_job = None
             self.stopping = False
             self._restore_start_button()
             self._restore_stop_button()
-            self._apply_connect_state()
+            self._update_start_state()
             return
         button, label = ((self.stop_btn, STOPPING_BTN_LABEL) if self.stopping
                          else (self.start_btn, RUNNING_BTN_LABEL))
@@ -2722,23 +3310,18 @@ class BackupApp:
     def _begin_run_ui(self) -> None:
         """开始备份的界面侧（调用前 self.running 已置真）。
 
-        锁配置区、亮出"先停止才能改"提示、切到列表。
-
-        Note:
-            必须调 _apply_connect_state：运行中那条提示只在连接状态机里输出，
-            只锁控件不刷状态机的话，用户会以为可以照改配置。
+        锁配置区、切到列表。
         """
         self._ensure_status_rows()
         self._set_config_enabled(False)
-        self._apply_connect_state()
         self._start_run_spinner()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.notebook.select(0)
 
     def _on_start(self) -> None:
-        """备份当前账户：先校验连接信息与备份位置，再进入批量运行的公共入口。"""
-        if self.running:
+        """备份当前账户：校验后走连接预检（预检全过才并发同步，ADR 0011）。"""
+        if self.running or self._preflight_active():
             return
         account = self._find_account(self._selected_account_id)
         if account is None:
@@ -2750,11 +3333,11 @@ class BackupApp:
         if not any(r["var"].get() for r in self.folder_rows):
             return
         self._sync_visible_folder_choices()
-        self._begin_run([account["id"]])
+        self._begin_preflight([account["id"]])
 
     def _on_start_selected(self) -> None:
-        """备份所选账户：只跑勾选的账户，跳过信息不完整的并逐个提示，按列表顺序串行运行。"""
-        if self.running:
+        """备份所选账户：跳过信息不完整的并逐个提示，其余走连接预检。"""
+        if self.running or self._preflight_active():
             return
         if not self.accounts:
             messagebox.showwarning("信息不完整", "还没有账户，请先在设置页的「账户」里新增。", parent=self.root)
@@ -2781,7 +3364,217 @@ class BackupApp:
                                    parent=self.root)
             return
         self._sync_visible_folder_choices()
-        self._begin_run([account["id"] for account in ready])
+        self._begin_preflight([account["id"] for account in ready])
+
+    # ---------------------------------------------------------------- 弹窗
+
+    def _center_on_root(self, win: tk.Toplevel) -> None:
+        """把自绘弹窗摆到主窗口正中（用户选定：所有弹窗都显示在应用窗口正中间）。
+
+        Note:
+            `wm geometry` 的 +x+y 落在**外框**，`winfo_rootx` 量的是**客户区**，中间差着一圈装饰
+            （真机实测 8px 边框 + 31px 标题栏）——直接套「root 中心 - 弹窗一半」的公式会整体偏右下
+            一截。这里先 withdraw 着摆一次 +0+0 量出装饰偏移，再按客户区中心反推外框坐标，
+            实测落点误差 0px；弹窗全程未显示过，不会闪。调用时机在弹窗内容建完之后、grab/wait 之前。
+            系统 messagebox/filedialog 是原生对话框、随 owner（parent=self.root）居中，不用这里管；
+            悬停气泡跟随鼠标，也不走这里。
+        """
+        win.withdraw()
+        win.update_idletasks()
+        win.geometry("+0+0")
+        win.update_idletasks()
+        deco_x, deco_y = win.winfo_rootx(), win.winfo_rooty()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        win.geometry(f"+{max(x - deco_x, 0)}+{max(y - deco_y, 0)}")
+        win.deiconify()
+
+    # ------------------------------------------------------------ 连接预检
+
+    def _preflight_active(self) -> bool:
+        return self._preflight is not None
+
+    def _begin_preflight(self, account_ids: list[str]) -> None:
+        """打开连接预检弹窗，串行检测各账户连接；全部通过后自动关闭并并发同步。
+
+        Note:
+            关闭弹窗（含「终止备份」按钮）= 终止本次备份，已检测/未检测账户全部取消。
+            密码错误（认证失败）时弹密码补录窗：重试用新密码重新检测该账户，跳过则略过该账户。
+        """
+        snapshots = self._account_snapshots(account_ids)
+        if not snapshots:
+            return
+        self._run_passwords = {}
+        rows: dict[str, tk.Label] = {}
+        win = tk.Toplevel(self.root)
+        win.title(PREFLIGHT_TITLE)
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = tk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Label(body, text=PREFLIGHT_INTRO, justify="left", anchor="w",
+                 wraplength=420).pack(fill="x")
+        list_frame = tk.Frame(body)
+        list_frame.pack(fill="both", expand=True, pady=(10, 0))
+        for snapshot in snapshots:
+            line = tk.Frame(list_frame)
+            line.pack(fill="x", pady=2)
+            tk.Label(line, text=account_display(snapshot), anchor="w", width=20).pack(side="left")
+            status = tk.Label(line, text=PREFLIGHT_ROW_WAIT, anchor="w", foreground=EMPTY_HINT_FG)
+            status.pack(side="left", fill="x", expand=True)
+            rows[snapshot["id"]] = status
+        tk.Button(body, text=PREFLIGHT_CANCEL_BTN,
+                  command=self._cancel_preflight).pack(pady=(12, 0))
+        self._center_on_root(win)   # 弹窗居中到主窗口（内容建完后量真实尺寸）
+        win.protocol("WM_DELETE_WINDOW", self._cancel_preflight)
+        self._preflight = {"win": win, "rows": rows, "snapshots": snapshots,
+                           "index": -1, "results": {}, "cancelled": False}
+        self._preflight_next()
+
+    def _preflight_next(self) -> None:
+        """推进预检：检测下一个账户；跑完全部则收口（并发同步或全部失败提示）。"""
+        pf = self._preflight
+        if pf is None or pf["cancelled"]:
+            return
+        pf["index"] += 1
+        if pf["index"] >= len(pf["snapshots"]):
+            self._finish_preflight()
+            return
+        snapshot = pf["snapshots"][pf["index"]]
+        account_id = snapshot["id"]
+        self._set_preflight_row(account_id, PREFLIGHT_ROW_CHECKING)
+        v = {"server": snapshot.get("server", ""), "user": snapshot.get("user", ""),
+             "password": snapshot.get("password", ""),
+             "ssl": bool(snapshot.get("ssl", DEFAULT_ACCOUNT_SSL)),
+             "port": int(str(snapshot.get("port", DEFAULT_ACCOUNT_PORT)).strip())}
+        threading.Thread(target=self._preflight_worker, args=(account_id, v), daemon=True).start()
+
+    def _preflight_worker(self, account_id: str, v: dict) -> None:
+        """预检线程：登录 + LIST + 登出，结果经事件队列回主线程。"""
+        log = logging.getLogger("imapbackup")
+        cfg = self._core_config(v)
+        try:
+            server = core.connect_and_login(cfg, log)
+            try:
+                core.get_names(server, False, True, quiet=False, log=log)
+            finally:
+                with contextlib.suppress(Exception):
+                    server.logout()
+            self.events.put(("preflight_result", (account_id, True, "")))
+        except SystemExit as e:
+            self.events.put(("preflight_result", (account_id, False, str(e))))
+        except Exception as e:
+            self.events.put(("preflight_result", (account_id, False, f"{type(e).__name__}: {e}")))
+
+    def _on_preflight_result(self, account_id: str, ok: bool, message: str) -> None:
+        """预检单账户结果：成功→下一个；认证失败→密码补录窗；其余失败→标失败继续。"""
+        pf = self._preflight
+        if pf is None or pf["cancelled"]:
+            return
+        if ok:
+            pf["results"][account_id] = True
+            self._set_preflight_row(account_id, PREFLIGHT_ROW_OK)
+            self._preflight_next()
+            return
+        if _is_auth_failure(message):
+            answer = self._ask_password(account_id)
+            if answer is None:            # 关窗/跳过：略过该账户，继续检测
+                self._set_preflight_row(account_id, PREFLIGHT_ROW_SKIPPED)
+                self._preflight_next()
+                return
+            password, save = answer
+            self._run_passwords[account_id] = password
+            snapshot = pf["snapshots"][pf["index"]]
+            snapshot["password"] = password
+            if save:
+                account = self._find_account(account_id)
+                cipher = _dpapi_encrypt(password) if sys.platform == "win32" else None
+                if account is not None and cipher:
+                    account["password_dpapi"] = cipher
+                    self._save_column_config()
+            pf["index"] -= 1          # 回退一格：_preflight_next 会重新检测同一账户
+            self._preflight_next()
+            return
+        pf["results"][account_id] = False
+        self._set_preflight_row(account_id, f"✗ {message}")
+        self._preflight_next()
+
+    def _set_preflight_row(self, account_id: str, text: str) -> None:
+        pf = self._preflight
+        if pf is not None and account_id in pf["rows"]:
+            pf["rows"][account_id].configure(text=text)
+
+    def _cancel_preflight(self) -> None:
+        """关闭预检弹窗 = 终止本次备份（已检测/未检测账户全部取消）。"""
+        pf = self._preflight
+        if pf is None:
+            return
+        pf["cancelled"] = True
+        self._close_preflight_win(pf)
+
+    def _finish_preflight(self) -> None:
+        """全部检测完毕：收口弹窗，通过检测的账户并发同步（全失败则只提示）。"""
+        pf = self._preflight
+        if pf is None:
+            return
+        ready = [s["id"] for s in pf["snapshots"] if pf["results"].get(s["id"])]
+        self._close_preflight_win(pf)
+        self._preflight = None
+        if not ready:
+            messagebox.showwarning("没有可备份的账户", "所有账户都未通过连接检测，本次未备份。",
+                                   parent=self.root)
+            return
+        self._begin_run(ready)
+
+    def _close_preflight_win(self, pf: dict) -> None:
+        win = pf.get("win")
+        self._preflight = None
+        if win is not None:
+            with contextlib.suppress(tk.TclError):
+                win.destroy()
+
+    def _ask_password(self, account_id: str) -> tuple[str, bool] | None:
+        """密码补录窗（模态）：返回 (密码, 是否保存)；跳过/关闭返回 None。"""
+        account = self._find_account(account_id)
+        name = account_display(account) if account else account_id
+        result: dict[str, tuple[str, bool] | None] = {"value": None}
+        win = tk.Toplevel(self.root)
+        win.title(PASSWORD_PROMPT_TITLE)
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = tk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Label(body, text=PASSWORD_PROMPT_TEXT.format(name=name), justify="left",
+                 anchor="w", wraplength=360).pack(fill="x")
+        row = tk.Frame(body)
+        row.pack(fill="x", pady=(10, 0))
+        tk.Label(row, text="密码：").pack(side="left")
+        password_var = tk.StringVar()
+        entry = tk.Entry(row, textvariable=password_var, show="*", width=28)
+        entry.pack(side="left", fill="x", expand=True)
+        save_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(body, text=PASSWORD_SAVE_CHECK, variable=save_var,
+                       anchor="w").pack(fill="x", pady=(6, 0))
+        buttons = tk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+
+        def retry() -> None:
+            if password_var.get():
+                result["value"] = (password_var.get(), bool(save_var.get()))
+                win.destroy()
+
+        def skip() -> None:
+            result["value"] = None
+            win.destroy()
+
+        tk.Button(buttons, text=PASSWORD_RETRY_BTN, command=retry).pack(side="left")
+        tk.Button(buttons, text=PASSWORD_SKIP_BTN, command=skip).pack(side="left", padx=(BTN_GAP, 0))
+        self._center_on_root(win)   # 弹窗居中到主窗口（内容建完后量真实尺寸）
+        win.protocol("WM_DELETE_WINDOW", skip)
+        entry.focus_set()
+        win.grab_set()
+        win.wait_window()
+        return result["value"]
 
     def _backup_root_ready(self) -> bool:
         if self.backup_root_var.get().strip():
@@ -2790,13 +3583,13 @@ class BackupApp:
         return False
 
     def _begin_run(self, account_ids: list[str]) -> None:
-        """进入运行态并把参与账户的重跑基线复位（公共入口：单账户与批量都走这里）。"""
+        """进入运行态并把参与账户的重跑基线复位（预检通过后调用）。"""
         self.running = True
         self.stopping = False
         self.stop_flag.clear()
         self._run_account_ids = list(account_ids)
         self._run_t0 = time.monotonic()
-        for index, account_id in enumerate(account_ids):
+        for account_id in account_ids:
             state = self._state(account_id)
             state["messages"] = []
             state["row_index"] = 0
@@ -2804,7 +3597,7 @@ class BackupApp:
             state["progress"] = None
             state["result"] = None
             state["status_error"] = False
-            state["status_text"] = CONNECTING_STATUS_TEXT if index == 0 else QUEUED_STATUS_TEXT
+            state["status_text"] = CONNECTING_STATUS_TEXT
             state["count_text"] = "尚未开始备份"
         visible = self._visible_state()
         if visible is not None:
@@ -2818,7 +3611,11 @@ class BackupApp:
         threading.Thread(target=self._batch_worker, args=(snapshots, outdir), daemon=True).start()
 
     def _account_snapshots(self, account_ids: list[str]) -> list[dict]:
-        """开跑前把参与账户复制一份（含解出的密码）：运行中改设置不影响本次运行。"""
+        """开跑前把参与账户复制一份（含解出的密码）：运行中改设置不影响本次运行。
+
+        Note:
+            密码优先取本次运行的临时值（预检补录但未保存时只在本次生效，见 _run_passwords）。
+        """
         snapshots: list[dict] = []
         for account_id in account_ids:
             account = self._find_account(account_id)
@@ -2826,31 +3623,53 @@ class BackupApp:
                 continue
             data = dict(account)
             data["folders"] = list(account.get("folders", []))
-            data["password"] = self._account_password(account)
+            data["password"] = self._run_passwords.get(account_id) or self._account_password(account)
             snapshots.append(data)
         return snapshots
 
     def _batch_worker(self, snapshots: list[dict], outdir: str) -> None:
-        """批量线程入口：按顺序逐账户备份，任一账户失败不影响其余；停止则跳过后续账户。"""
+        """并发同步入口：通过预检的账户各起一条下载线程，任一账户失败不影响其余（ADR 0011）。
+
+        Note:
+            每账户独立 IMAP 连接、独立日志前缀（_AccountLogAdapter），所以日志混排但每行可辨；
+            「每封消息只 fetch 一次」的判重不变量不受并发影响（各自账户独立判重）。
+            等全部线程收尾后汇总 batch_done；停止口径（stop_flag）全局生效。
+        """
         log = logging.getLogger("imapbackup")
         eq = self.events
         failures: list[tuple[str, str]] = []
+        lock = threading.Lock()
+        threads: list[threading.Thread] = []
         for account in snapshots:
             account_id = account["id"]
             if self.stop_flag.is_set():
                 eq.put(("account_skipped", account_id))
                 continue
             eq.put(("account_begin", account_id))
-            try:
-                self._backup_account(account, outdir, eq, log)
-            except SystemExit as e:
-                failures.append((account_display(account), str(e)))
-                eq.put(("account_failed", account_id, str(e)))
-            except Exception as e:
-                log.exception("账户备份失败：%s", account_display(account))
-                failures.append((account_display(account), f"{type(e).__name__}: {e}"))
-                eq.put(("account_failed", account_id, f"{type(e).__name__}: {e}"))
+            thread = threading.Thread(target=self._backup_account_thread,
+                                      args=(account, outdir, eq, log, failures, lock), daemon=True)
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
         eq.put(("batch_done", self.stop_flag.is_set(), failures))
+
+    def _backup_account_thread(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger,
+                               failures: list[tuple[str, str]], lock: threading.Lock) -> None:
+        """单账户下载线程：跑 _backup_account，异常收口到 failures（并发下加锁写共享列表）。"""
+        name = account_display(account)
+        account_log = _account_logger(account["id"], name)
+        try:
+            self._backup_account(account, outdir, eq, account_log)
+        except SystemExit as e:
+            with lock:
+                failures.append((name, str(e)))
+            eq.put(("account_failed", account["id"], str(e)))
+        except Exception as e:
+            account_log.exception("账户备份失败：%s", name)
+            with lock:
+                failures.append((name, f"{type(e).__name__}: {e}"))
+            eq.put(("account_failed", account["id"], f"{type(e).__name__}: {e}"))
 
     def _backup_account(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger) -> None:
         """单个账户的备份：先统计待备份总量、再逐文件夹下载，进度经事件队列回主线程。
@@ -2968,7 +3787,6 @@ class BackupApp:
         self._stop_run_spinner()  # 取消挂起的那一帧，立即按新目标重画第 0 帧：点下去当刻就见反馈
         self._run_spinner_tick(0)
         self._set_status("", error=False)
-        self._apply_connect_state()
 
     # ------------------------------------------------------------ event pump
 
@@ -2987,8 +3805,10 @@ class BackupApp:
             self._append_log(ev[1])
         elif kind == "folders_loaded":
             self._on_folders_loaded(*ev[1])
-        elif kind == "connect_failed":
-            self._on_connect_failed(*ev[1])
+        elif kind == "folder_load_failed":
+            self._on_folder_load_failed(*ev[1])
+        elif kind == "preflight_result":
+            self._on_preflight_result(*ev[1])
         elif kind == "account_begin":
             self._on_account_begin(ev[1])
         elif kind == "phase":
@@ -3012,15 +3832,6 @@ class BackupApp:
                 self._on_stop()
         elif kind == "tray_quit":
             self._on_tray_quit()
-
-    def _on_connect_failed(self, account_id: str, message: str) -> None:
-        state = self._states.get(account_id)
-        if state is not None:
-            state["connect_state"] = "idle"
-        if account_id == self._selected_account_id:
-            self._apply_connect_state()
-            self._update_start_state()
-        messagebox.showerror("连接失败", message, parent=self.root)
 
     def _on_account_begin(self, account_id: str) -> None:
         """某账户轮到开跑：清掉它上一轮的行，把状态切到「正在连接」。"""
@@ -3154,11 +3965,9 @@ class BackupApp:
         # 两颗按钮一起复位：停止中收尾时停止按钮上也挂着转圈文案
         self._restore_start_button()
         self._restore_stop_button()
-        # 先解锁配置区再走连接状态机：状态机可能重新禁用连接按钮（过期连接），顺序反了会被解锁覆盖回去
         self._set_config_enabled(True)
-        self._apply_connect_state()
         self.stop_btn.configure(state="disabled")
-        # 开始按钮按当前连接与勾选情况重新判定（不是一律 disabled）：失败路径原先停在禁用态，
+        # 开始按钮按当前勾选情况重新判定（不是一律 disabled）：失败路径原先停在禁用态，
         # 用户想重跑还得先去动一下复选框才解禁
         self._update_start_state()
         # 运行结束：常驻托盘图标的 tooltip 与菜单「停止备份」跟着复位（窗口可见时也挂着）
@@ -3284,6 +4093,49 @@ class BackupApp:
             self._tip.destroy()
             self._tip = None
 
+    # --------------------------------------------- 名称截断（文件夹名 / 账户名）
+
+    def _bind_name_tip(self, widget: tk.Widget, store: dict) -> None:
+        """名称标签的悬停气泡：只在文本被截断时弹（store 记全文、当前文本与气泡内容）。"""
+        widget.bind("<Enter>", lambda e: self._on_name_tip_enter(e, store))
+        widget.bind("<Leave>", lambda _e: self._on_tip_leave())
+
+    def _on_name_tip_enter(self, event, store: dict) -> None:
+        if store["text_shown"] == store["text_full"]:
+            return   # 没截断不弹
+        self._schedule_tip(event, store["tip_full"])
+
+    def _bind_widget_tip(self, widget: tk.Widget, text: str) -> None:
+        """无截断语义的控件气泡：悬停即弹（图标按钮没有「全文」可对比）。"""
+        widget.bind("<Enter>", lambda e: self._schedule_tip(e, text))
+        widget.bind("<Leave>", lambda _e: self._on_tip_leave())
+
+    def _schedule_tip(self, event, text: str) -> None:
+        x, y = event.x_root, event.y_root
+        self._tip_after = self.root.after(TIP_DELAY_MS, lambda: self._show_tip(x, y, text))
+
+    def _fit_name_label(self, label: tk.Label, store: dict, budget: int) -> None:
+        """把名称标签截到 ≤ budget 像素（悬停看全文）：变宽后从全文重算，双向恢复。"""
+        full = store["text_full"]
+        font = self._text_font()
+        text = full if font.measure(full) <= budget else _ellipsize(full, budget - 8, font)
+        if text != store["text_shown"]:
+            store["text_shown"] = text
+            label.configure(text=text)
+
+    def _fit_folder_names(self) -> None:
+        """文件夹名按树区宽截断：各层缩进与固定槽宽都扣掉，深的行可用宽更小（画布变宽自动恢复）。"""
+        for node in self._folder_nodes.values():
+            self._fit_folder_names_for(node)
+
+    def _fit_account_names(self) -> None:
+        """账户名按列表宽截断：复选框与行内边距是固定占用，侧边栏拖宽后自动恢复全文。"""
+        budget = self.account_canvas.winfo_width() - 32
+        if budget < 20:
+            return
+        for row in self._account_rows.values():
+            self._fit_name_label(row["label"], row, budget)
+
     def _refresh_counts(self) -> None:
         self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ "
                          f"已备份 {self.backed_count} / {self.pending_total}")
@@ -3377,13 +4229,10 @@ class BackupApp:
 
         tk.Button(buttons, text=CLOSE_DLG_EXIT, command=lambda: choose(CLOSE_ACTION_EXIT)).pack(side="right")
         tk.Button(buttons, text=CLOSE_DLG_HIDE,
-                  command=lambda: choose(CLOSE_ACTION_TRAY)).pack(side="right", padx=(0, 6))
+                  command=lambda: choose(CLOSE_ACTION_TRAY)).pack(side="right", padx=(0, BTN_GAP))
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        dialog.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_reqheight()) // 2
-        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self._center_on_root(dialog)   # 弹窗居中到主窗口（与其余自绘弹窗同一助手）
         dialog.grab_set()
         self.root.wait_window(dialog)
         return answer[0] if answer else None

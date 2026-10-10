@@ -14,6 +14,7 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 import json
 import logging
 from datetime import datetime
+from itertools import pairwise
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +165,14 @@ def stub_popup(monkeypatch, menu):
     return popups
 
 
+def sync_thread(target=None, args=(), **_kwargs):
+    """假线程：start() 当场跑完，用例不用跟真线程赛跑（只替换 threading.Thread）。"""
+    def run() -> None:
+        if target is not None:
+            target(*args)
+    return SimpleNamespace(start=run)
+
+
 def row_by(instance, foldername):
     return next(r for r in instance.folder_rows if r["foldername"] == foldername)
 
@@ -268,17 +277,12 @@ def test_version_is_shared_and_status_bar_starts_on_one_row(app):
     assert app.count_var.get() == "尚未开始备份", app.count_var.get()
 
 
-def test_folder_load_marks_the_account_connected(app):
+def test_folder_load_fills_the_tree(app):
     """folders_loaded 事件走完真实流程：账户先被读到，再投队列；勾选按账户记录默认 INBOX。"""
     account = current_account(app)
     account.update({"server": V["server"], "user": V["user"], "port": "993", "ssl": True})
     load_folders(app, NAMES)
 
-    assert app.connect_state == "connected"
-    assert app.connect_btn.cget("text") == "✓ 已成功连接"
-    assert str(app.connect_btn.cget("state")) == "disabled"
-    # 已连接：提示行未挂出（winfo_manager 判布局管理器，winfo_ismapped 滞后不可靠）
-    assert app.conn_hint.cget("text") == "" and app.conn_hint.winfo_manager() == ""
     assert app.root.winfo_width() == 960 and app.root.winfo_height() == 736, (
         f"{app.root.winfo_width()}x{app.root.winfo_height()}")
     assert app.folder_ph.winfo_manager() == "", app.folder_ph.winfo_manager()
@@ -289,14 +293,67 @@ def test_folder_load_marks_the_account_connected(app):
     assert str(app.start_btn.cget("state")) == "normal", app.start_btn.cget("state")
 
 
+def branch_of(instance, key):
+    """节点行的前缀槽文本：层级连接符（└/├）+ 槽内展开箭头（仅父行）；一级行没有槽，返回 []。"""
+    node = instance._folder_nodes[key]
+    if node["prefix_label"] is None:
+        return []
+    slot = node["prefix_label"].master
+    return [str(w.cget("text")) for w in slot.winfo_children()]
+
+
+def trailing_arrow_of(instance, key):
+    """一级行跟在名称后面的展开箭头文本；无箭头或箭头在槽里（二级及以下）返回 None。"""
+    node = instance._folder_nodes[key]
+    arrow = node["arrow"]
+    if arrow is None or node["prefix_label"] is not None:
+        return None
+    return str(arrow.cget("text"))
+
+
+def conn_row_of(instance, widget):
+    """chip/端口所在 grid 行：同排时自己 grid 在服务器行；换行时 pack 在 _conn_wrap_row（下一行）。"""
+    if widget.winfo_manager() == "pack":
+        return int(instance._conn_wrap_row.grid_info()["row"])
+    return int(widget.grid_info()["row"])
+
+
+def hit_test(instance, widget):
+    """widget 中心点的命中控件（z-order 回归）。
+
+    先把测试窗抬到最上层再 winfo_containing：被别的应用窗口遮住时它会误报 None，
+    而 z-order 要验的只是控件间的叠放（手柄有没有被同级的 Listbox 盖住）。
+    """
+    root = instance.root
+    root.lift()
+    try:
+        root.attributes("-topmost", True)
+        root.update()
+        x = widget.winfo_rootx() + max(widget.winfo_width(), 1) // 2
+        y = widget.winfo_rooty() + max(widget.winfo_height(), 1) // 2
+        return root.winfo_containing(x, y)
+    finally:
+        root.attributes("-topmost", False)
+        root.update()
+
+
 def test_folder_tree_structure(app):
-    """末段显示、真实/合成父节点、箭头、勾选符号、子节点缩进。"""
+    """末段显示、真实/合成父节点、箭头、勾选符号、层级连接符、子节点缩进。"""
     assert sorted(app._folder_nodes) == [SYNTH, LEAF, ("INBOX",), PARENT, ("其他文件夹", "QQ邮件订阅"), DUP], (
         sorted(app._folder_nodes))
     assert app._folder_nodes[PARENT]["rows"]
     assert app._folder_nodes[SYNTH]["arrow"] is not None and not app._folder_nodes[SYNTH]["rows"]
     assert app._folder_nodes[("INBOX",)]["arrow"] is None
     assert is_open(app, SYNTH)
+    # 一级行不画层级符号（用户选定）：没有前缀槽；有子文件夹时展开箭头跟在名称后
+    assert branch_of(app, PARENT) == [] and trailing_arrow_of(app, PARENT) == g.ARROW_OPEN
+    assert branch_of(app, SYNTH) == [] and trailing_arrow_of(app, SYNTH) == g.ARROW_OPEN
+    assert branch_of(app, ("INBOX",)) == [], branch_of(app, ("INBOX",))
+    assert trailing_arrow_of(app, ("INBOX",)) is None                     # 一级叶子行连箭头都没有
+    # 二级及以下维持树形语言：同级末个用 └、其余用 ├，父行的展开箭头跟在连接符后
+    assert branch_of(app, LEAF) == [g.TREE_LAST], branch_of(app, LEAF)                    # 父下唯一子
+    assert branch_of(app, ("其他文件夹", "QQ邮件订阅")) == [g.TREE_BRANCH], "同级头一个"  # CHILD 的路径键
+    assert branch_of(app, DUP) == [g.TREE_LAST], branch_of(app, DUP)                       # 同级末个（叶子无箭头）
     assert row_by(app, "INBOX")["check_btn"].cget("text") == "☑ INBOX"
     assert row_by(app, "Archive/2024")["check_btn"].cget("text") == "☐ 2024"
     assert row_by(app, CHILD)["check_btn"].cget("text") == "☐ QQ邮件订阅"
@@ -315,33 +372,82 @@ def test_folder_tree_structure(app):
     assert 10 <= leaf_x <= 40, leaf_x
 
 
-def test_editing_credentials_makes_the_connection_stale(app):
-    """账户在设置页被改动后（快照 ≠ 现值）连接即过期；改回原值即恢复。"""
-    account = current_account(app)
-    account["server"] = "imap.qq.com"
-    app._refresh_stale(account["id"])
-    pump(app)
-    assert app.connect_state == "stale"
-    assert app.connect_btn.cget("text") == "⇄ 连接并加载文件夹"
-    assert str(app.connect_btn.cget("state")) == "normal"
-    assert str(app.start_btn.cget("state")) == "disabled"
-    # 过期提示是红字（需要用户重新连接），提示行重新挂出
-    assert app.conn_hint.cget("text") == "连接信息已更改，请重新连接并加载文件夹"
-    assert str(app.conn_hint.cget("foreground")) == g.HINT_RED
-    assert app.conn_hint.winfo_manager() == "grid"
+def test_folder_prefix_labels_are_not_clipped(app):
+    """连接符/箭头不得被前缀槽裁成「-」横切片：pack_propagate(False) 槽高度塌陷回归。"""
     app.root.update()
-    group_h_with_hint = app.conn_hint.master.winfo_height()
+    linespace = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+    for node in app._folder_nodes.values():
+        if node["prefix_label"] is None:   # 一级行没有前缀槽，箭头（若有）直接挂在行上
+            if node["arrow"] is not None:
+                assert node["arrow"].winfo_height() >= linespace, (node["key"], node["arrow"].winfo_height())
+            continue
+        slot = node["prefix_label"].master
+        assert slot.winfo_height() >= linespace, (node["key"], slot.winfo_height(), linespace)
+        labels = [node["prefix_label"]] + ([node["arrow"]] if node["arrow"] is not None else [])
+        for label in labels:
+            assert label.winfo_height() <= slot.winfo_height(), (node["key"], label.winfo_height())
 
-    account["server"] = V["server"]
-    app._refresh_stale(account["id"])
-    pump(app)
+
+def test_folder_top_rows_have_no_tree_symbol(app):
+    """一级行不画 ├/└、复选框贴 CARD_PAD 标准内边距；展开箭头跟在名称后（用户选定）。"""
     app.root.update()
-    assert app.connect_state == "connected"
-    assert app.conn_hint.cget("text") == "" and app.conn_hint.winfo_manager() == ""
-    # 空提示让出整行：连接组变矮，让出的高度由下方邮件列表面板吸收
-    assert app.conn_hint.master.winfo_height() < group_h_with_hint, (
-        app.conn_hint.master.winfo_height(), group_h_with_hint)
-    assert str(app.start_btn.cget("state")) == "normal"
+    # 标准内边距的参照是工具栏左缘（同为 CARD_PAD）：画布自己就带了 8px 内边距，
+    # 一级行的前置槽一去掉，复选框就与工具栏落在同一条竖线上
+    ref_x = app.reload_btn.master.winfo_rootx()
+    canvas_x = app.folder_canvas.winfo_rootx()
+    assert abs(ref_x - canvas_x) <= 1, (ref_x, canvas_x)
+    for key, node in app._folder_nodes.items():
+        if len(key) > 1:
+            assert node["prefix_label"] is not None, key   # 二级及以下照旧带层级符号
+            continue
+        row = node["frame"].winfo_children()[0]
+        name_x = node["label_widget"].winfo_rootx()
+        assert abs(name_x - ref_x) <= 1, (key, name_x - ref_x)
+        arrow = node["arrow"]
+        if arrow is not None:
+            assert arrow.master is row, key                       # 不在前缀槽里
+            assert arrow.winfo_rootx() > name_x, key               # 跟在名称后
+
+
+def test_folder_card_bottom_border_not_overflow(app):
+    """「邮箱文件夹」内容不得顶出卡片盖住底边框：卡高 ≥ 请求高、画布底不出卡。"""
+    app.root.update()
+    group, canvas = app.folder_group, app.folder_canvas
+    assert group.winfo_height() >= group.winfo_reqheight() - 1, (group.winfo_height(), group.winfo_reqheight())
+    bottom = canvas.winfo_y() + canvas.winfo_height() + g.CARD_PAD
+    assert bottom <= group.winfo_height(), (bottom, group.winfo_height())
+
+
+def test_reload_button_is_square(app):
+    """⟳ 是正方形 icon 按钮：宽高相等（误差 ≤2px），别再是竖长条。"""
+    btn = app.reload_btn
+    assert btn.cget("text") == g.RELOAD_GLYPH
+    assert abs(btn.winfo_reqwidth() - btn.winfo_reqheight()) <= 2, (btn.winfo_reqwidth(), btn.winfo_reqheight())
+
+
+def test_editing_credentials_triggers_a_silent_reload(app, monkeypatch):
+    """改账户连接参数后（快照 ≠ 现值）再静默补拉清单；参数没变则不重拉（去重口径）。"""
+    account = current_account(app)
+    state = app._state(account["id"])
+    calls: list[str] = []
+    monkeypatch.setattr(app, "_folder_worker", lambda *a: calls.append(a[0]))
+    app._loading_folder_ids.clear()
+
+    # 快照与现值一致 → 不重拉
+    state["snapshot"] = app._account_snapshot(account)
+    app._maybe_load_folders(account["id"])
+    assert calls == [], calls
+
+    # 改了连接参数 → 触发一次静默拉取
+    account["server"] = "imap.qq.com"
+    app._maybe_load_folders(account["id"])
+    assert calls == [account["id"]], calls
+
+    # 进行中不重复起线程
+    app._maybe_load_folders(account["id"])
+    assert calls == [account["id"]], calls
+    app._loading_folder_ids.clear()
+    account["server"] = V["server"]
 
 
 def test_folder_toolbar_select_all_and_inbox_only(app):
@@ -417,7 +523,8 @@ def test_click_checks_expands_and_synthetic_node_is_inert(app):
     app._toggle_folder_open(SYNTH)
     assert is_open(app, SYNTH) and app._folder_nodes[SYNTH]["kids"].winfo_manager() == "pack"
 
-    synthetic_row = app._folder_nodes[SYNTH]["frame"].winfo_children()[0].winfo_children()[1]
+    # 一级行没有前缀槽，行内控件顺序是 [名称, 尾随箭头]，别再按下标取——点到箭头就把节点折叠了
+    synthetic_row = app._folder_nodes[SYNTH]["label_widget"]
     click(app, synthetic_row)
     assert not row_by(app, "Archive/2024")["var"].get()
     app._set_all_folders(False)
@@ -512,8 +619,6 @@ def test_config_is_locked_during_a_run(app):
     """树里的箭头与名称是 tk.Label：它有 -state 选项，但置灰和阻断绑定都不生效，
     所以不进 _config_widgets，改由 _set_config_enabled 置灰 + 两个 handler 的 running
     判定拦截。Entry/Button（含文件夹工具栏）走 state=disabled。
-
-    走 _on_start 的真实界面侧路径：运行中的提示必须自己亮出来。
     """
     app.running = True
     app._begin_run_ui()
@@ -522,11 +627,6 @@ def test_config_is_locked_during_a_run(app):
     assert bool(app._folder_clickables)
     assert all(str(w.cget("foreground")) == "gray" and str(w.cget("cursor")) == "arrow"
                for w, _ in app._folder_clickables), len(app._folder_clickables)
-    assert app.conn_hint.cget("text") == "备份运行中，文件夹选择与输出格式不可修改，请先停止"
-    assert str(app.conn_hint.cget("foreground")) == g.HINT_GRAY
-    assert app.conn_hint.winfo_manager() == "grid"
-    assert app.connect_btn.cget("text") == "⇄ 连接并加载文件夹"
-    assert str(app.connect_btn.cget("state")) == "disabled"
     assert str(app.start_btn.cget("state")) == "disabled"
     assert str(app.stop_btn.cget("state")) == "normal"
 
@@ -540,7 +640,6 @@ def test_config_is_locked_during_a_run(app):
 
     app.running = False
     app._set_config_enabled(True)
-    app._apply_connect_state()
     assert all(str(w.cget("foreground")) == fg and str(w.cget("cursor")) == "hand2"
                for w, fg in app._folder_clickables)
 
@@ -551,29 +650,12 @@ def test_config_is_locked_during_a_run(app):
     click(app, inbox_btn)
     assert [r["var"].get() for r in app.folder_rows] == states_before
     assert all(str(w.cget("state")) == "normal" for w, _ in app._config_widgets
-               if isinstance(w, (tk.Button, tk.Checkbutton)) and w is not app.connect_btn)
-    assert app.conn_hint.cget("text") == "" and app.conn_hint.winfo_manager() == ""
-    # 连接仍有效时，结束运行后连接按钮保持"已成功连接"禁用态（原设计：避免重复登录）
-    assert str(app.connect_btn.cget("state")) == "disabled"
-
-    # 连接已过期时，结束运行要把按钮重新放开并给出过期提示
-    account = current_account(app)
-    account["server"] = "imap.qq.com"
-    app._refresh_stale(account["id"])
-    pump(app)
-    app._end_run_controls()
-    assert str(app.connect_btn.cget("state")) == "normal"
-    # 刚解锁时提示行是灰字，过期提示必须覆盖回红字（不能残留上一次的灰）
-    assert app.conn_hint.cget("text") == "连接信息已更改，请重新连接并加载文件夹"
-    assert str(app.conn_hint.cget("foreground")) == g.HINT_RED
-    assert app.conn_hint.winfo_manager() == "grid"
-    account["server"] = V["server"]
-    app._refresh_stale(account["id"])
-    pump(app)
+               if isinstance(w, (tk.Button, tk.Checkbutton)))
+    app._update_start_state()
 
 
-def test_enter_triggers_connect_with_the_same_button_gating(app, monkeypatch):
-    """设置页账户表单的输入框绑定 Enter = 保存；连接按钮的门控挡住重复连接。"""
+def test_account_form_enter_binds_to_save(app, monkeypatch):
+    """设置页账户表单的输入框绑定 Enter = 保存；保存后触发该账户的静默清单补拉。"""
     box = FakeBox()
     monkeypatch.setattr(g, "messagebox", box)
 
@@ -581,51 +663,21 @@ def test_enter_triggers_connect_with_the_same_button_gating(app, monkeypatch):
     assert all(str(w.bind("<Return>")) != "" and str(w.bind("<KP_Enter>")) != ""
                for w in app._account_form_entries)
 
-    app._connect_worker = lambda *_args: None   # 不起真实网络线程
+    # 缺密码时 _account_credentials 只弹校验提示、不放行（预检/开始都走它把关）
     account = current_account(app)
-    if not account.get("password_dpapi"):
-        pytest.skip("非 Windows 没有可用的加密密码")
-    app._states[account["id"]]["connect_state"] = "idle"   # 回到可连接状态，按钮才会放开
-    app._apply_connect_state()
-    app._on_connect()
-    assert app.connect_state == "connecting"
-    assert "正在连接" in str(app.connect_btn.cget("text")), (
-        app.connect_state, app.connect_btn.cget("text"))
-
-    # 连接中：按钮被禁用——门控必须挡住，否则起第二条连接线程
-    app._on_connect()
-    assert app.connect_state == "connecting"
-    assert str(app.connect_btn.cget("state")) == "disabled"
-    assert app.conn_hint.winfo_manager() == "", (
-        app.connect_state, app.connect_btn.cget("state"), app.conn_hint.cget("text"))
-
-    # 备份运行中：配置区被 _set_config_enabled 置灰，再点同样静默
-    app._states[account["id"]]["connect_state"] = "connected"
-    app.running = True
-    app._begin_run_ui()
-    app._on_connect()
-    assert app.connect_state == "connected"
-    assert str(app.connect_btn.cget("state")) == "disabled", (app.connect_state,)
-    app.running = False
-    app._end_run_controls()
-
-    # 账户缺密码时只弹校验提示、不发起连接；清空密码让连接过期是既有行为
     cipher = account.pop("password_dpapi", None)
-    app._refresh_stale(account["id"])   # 真实路径：设置页保存后刷新过期态
     box.warnings.clear()
-    app._on_connect()
-    assert app.connect_state == "stale"
+    assert app._account_credentials(account) is None
     assert ("信息不完整", "该账户还没有密码，请在设置页的「账户」里填写并保存。") in box.warnings, box.warnings
     if cipher:
-        account["password_dpapi"] = cipher   # 原密文放回：快照口径一致，连接恢复有效
-    app._refresh_stale(account["id"])
-    pump(app)
-    assert app.connect_state == "connected", app.connect_state
+        account["password_dpapi"] = cipher   # 原密文放回
 
-    # 一个文件夹都没解析出来时提示必须重新挂回，否则那块区域是一片纯白
-    clear_folders(app)
-    assert app.folder_ph.winfo_manager() == "grid" and not app.folder_rows and not app._folder_nodes, (
-        app.folder_ph.winfo_manager())
+    # 保存后静默补拉该账户清单
+    loaded: list[str] = []
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda aid: loaded.append(aid))
+    monkeypatch.setattr(app, "_account_credentials", lambda account, warn=True: {"server": "s"})
+    app._on_account_save()
+    assert loaded == [account["id"]], loaded
 
 
 def test_status_bar_rows_version_and_button_width(app):
@@ -758,8 +810,6 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     for index in (0, 3, len(g.SPINNER_FRAMES) - 1):
         app._set_loading_frame(app.start_btn, g.RUNNING_BTN_LABEL, index)
         assert app.start_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.RUNNING_BTN_LABEL}"
-        app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, index)
-        assert app.connect_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.CONNECTING_BTN_LABEL}"
 
     app.running = True
     app._begin_run_ui()
@@ -772,7 +822,6 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     app._end_run_controls()
     assert_start_button_idle(app)
     assert app._run_spinner_job is None
-    app._apply_connect_state()  # 上面借连接按钮验了共享帧，把它的文案交回状态机
 
     # 自愈：有的路径直接把 running 置假、不走 _end_run_controls，帧推进函数得自己复位，
     # 否则「正在备份…」会残留在按钮上
@@ -1026,10 +1075,9 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
     第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
     """
-    app._states[app._selected_account_id]["connect_state"] = "connected"
     app.running = True
     app._begin_run_ui()
-    app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始/连接按钮那套用例同法）
+    app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始按钮那套用例同法）
     app._set_counts("已备份 3 / 10")
     app._set_status("备份 INBOX（7 封）", error=False)
     counts_before, progress_before = app.count_var.get(), float(app.progress["value"])
@@ -1045,7 +1093,6 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     assert app.status_var.get() == "" and app._status_full == ""           # 第二行清空
     assert app._msg_bar.winfo_manager() == "pack"             # 行不收回
     assert app.version_label.winfo_manager() == "pack"        # 版本号留在原处
-    assert app.conn_hint.cget("text") == g.STOPPING_HINT_TEXT
     # 停止这个动作本身不动第一行计数与进度条（工作线程在途的那封照常落盘、计数据实更新，
     # 那是有意义的真实进展，这里不冻结它）
     assert app.count_var.get() == counts_before, app.count_var.get()
@@ -1057,7 +1104,7 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
         assert app.stop_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.STOPPING_BTN_LABEL}"
         assert_start_button_idle(app)
 
-    # 运行真正结束：按钮、状态行、提示全部回位，不残留「正在停止…」
+    # 运行真正结束：按钮、状态行全部回位，不残留「正在停止…」
     aid = app._selected_account_id
     app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
     app.events.put(("batch_done", True, []))
@@ -1066,7 +1113,6 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
     assert_stop_button_idle(app)
     assert_start_button_idle(app)
-    assert app.conn_hint.cget("text") == "", app.conn_hint.cget("text")
 
     # 不在运行时按停止（那时按钮本就禁用）不产生任何变化
     app._on_stop()
@@ -1107,13 +1153,6 @@ def test_loading_buttons_keep_their_height(app):
     app.root.update()
     idle = (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
     assert idle[0] == idle[1], idle                    # 同一行两颗按钮本就该等高
-    connect_idle = app.connect_btn.winfo_reqheight()
-
-    # 连接按钮：加载态只换文案（它本来就没有图标），高度不变
-    app._set_loading_frame(app.connect_btn, g.CONNECTING_BTN_LABEL, 0)
-    app.root.update()
-    assert app.connect_btn.winfo_reqheight() == connect_idle
-    app._apply_connect_state()                         # 文案交回连接状态机
 
     # 运行中：开始按钮的图标槽换成透明占位，高度与静止态一致，同行的停止按钮不被顶高
     app.running = True
@@ -1211,6 +1250,9 @@ def test_row_selection_clears_on_click_outside(app):
 
 def test_mail_column_resize_only_redistributes_adjacent_columns(app, monkeypatch):
     """四条可拖分隔线只改相邻列，拖动时冻结 subject stretch，释放后恢复。"""
+    # 显式前置：给出确定列宽 + subject 可伸展（不依赖前面用例留下的 reflow 状态）
+    for name, width in zip(app.tree["columns"], (160, 320, 110, 140, 90), strict=True):
+        app.tree.column(name, width=width, stretch=(name == "subject"))
     monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
     for separator in range(1, 5):
         before = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
@@ -1248,6 +1290,9 @@ def test_mail_size_column_stays_inside_tree_boundary(app, monkeypatch):
 
 def test_mail_size_column_can_grow_when_dragging_left_boundary_left(app, monkeypatch):
     """大小列左缘向左拖时，大小变宽且邮箱文件夹等量变窄。"""
+    # 显式前置：确定列宽，避免前序 reflow 把 folder 压到 minwidth、拖不动
+    for name, width in zip(app.tree["columns"], (160, 320, 110, 140, 90), strict=True):
+        app.tree.column(name, width=width, stretch=(name == "subject"))
     monkeypatch.setattr(app.tree, "identify_region", lambda _x, _y: "separator")
     monkeypatch.setattr(app.tree, "identify_column", lambda _x: "#4")
     widths = {name: int(app.tree.column(name, "width")) for name in app.tree["columns"]}
@@ -1841,12 +1886,16 @@ def test_backup_detail_has_no_entry_widgets(app):
     assert current_account(app) is not None
     assert app.card_root_label.cget("text") == app.backup_root_var.get().strip()
 
-    # 卡片不再有密码行（密码只在设置页表单里维护）；SSL 与端口并进收件服务器同一行（foxmail 版式）
+    # 卡片不再有密码行（密码只在设置页表单里维护）；SSL 是色块 chip，与端口同排在收件服务器行，
+    # 放不下时 _layout_conn_row 把它们挪到第二行（见 test_conn_row_wraps_when_tight）
     assert "password" not in app._card_labels
     assert any(isinstance(w, tk.Label) and w.cget("text") == g.MAIL_TYPE_TEXT for w in walk(app.conn_group))
+    chip = app._card_labels["ssl"]
+    assert chip.cget("text") == g.SSL_CHIP_TEXT
     server_row = int(app._card_labels["server"].grid_info()["row"])
-    assert int(app._card_labels["ssl"].grid_info()["row"]) == server_row
-    assert int(app._card_labels["port"].grid_info()["row"]) == server_row
+    chip_row = conn_row_of(app, chip)
+    assert chip_row in (server_row, server_row + 1), (server_row, chip_row)
+    assert conn_row_of(app, app._card_labels["port"]) == chip_row
 
 
 def test_format_checkboxes_are_per_account(app):
@@ -2044,7 +2093,7 @@ def test_account_list_scrolls_only_when_accounts_do_not_fit(app):
 
 
 def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
-    """「备份所选」只跑勾选的账户；一个都没勾时只提示、不进运行态。"""
+    """「备份所选」只跑勾选的账户；一个都没勾时只提示、不进预检。"""
     first = current_account(app)
     second = g.new_account()
     second.update({"name": "不选它", "user": "skip@example.com", "server": "imap.example.com"})
@@ -2053,7 +2102,7 @@ def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
     app._switch_account(first["id"])
 
     started: list[list[str]] = []
-    monkeypatch.setattr(app, "_begin_run", started.append)
+    monkeypatch.setattr(app, "_begin_preflight", started.append)
     monkeypatch.setattr(app, "_account_credentials", lambda account, warn=True: {"server": "s"})
     monkeypatch.setattr(app, "_backup_root_ready", lambda: True)
     box = FakeBox()
@@ -2061,7 +2110,7 @@ def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
 
     app._set_all_account_checks(False)
     app._on_start_selected()
-    assert started == []                                    # 一个都没勾：不进运行态
+    assert started == []                                    # 一个都没勾：不进预检
     assert box.warnings and box.warnings[-1][0] == "未勾选账户"
 
     box.warnings.clear()
@@ -2079,8 +2128,8 @@ def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
     assert app._checked_accounts == {first["id"]}
 
 
-def test_batch_worker_runs_accounts_in_order_and_isolates_failures(app, monkeypatch):
-    """批量串行：按列表顺序逐个跑，单个账户失败不影响其余；停止后不再开新账户。"""
+def test_batch_worker_runs_accounts_concurrently_and_isolates_failures(app, monkeypatch):
+    """并发同步：每账户一线程，单个账户失败不影响其余；停止后不再发起备份。"""
     first = g.new_account()
     first.update({"name": "甲", "user": "a@example.com", "server": "imap.example.com", "password": "p"})
     second = g.new_account()
@@ -2102,7 +2151,7 @@ def test_batch_worker_runs_accounts_in_order_and_isolates_failures(app, monkeypa
                  for a in (first, second, third)]
     app.stop_flag.clear()
     app._batch_worker(snapshots, "D:\\out")
-    assert calls == [first["id"], second["id"], third["id"]]
+    assert sorted(calls) == sorted([first["id"], second["id"], third["id"]])   # 并发，顺序不保证
 
     events = []
     while True:
@@ -2111,11 +2160,14 @@ def test_batch_worker_runs_accounts_in_order_and_isolates_failures(app, monkeypa
         except g.queue.Empty:
             break
     kinds = [e[0] for e in events if e[0] != "log"]
-    assert kinds == ["account_begin", "account_done", "account_begin", "account_failed",
-                     "account_begin", "account_done", "batch_done"]
+    # 三个账户并发，各收到 account_begin；两个 done、一个 failed；最后 batch_done
+    assert kinds.count("account_begin") == 3
+    assert kinds.count("account_done") == 2
+    assert kinds.count("account_failed") == 1
+    assert kinds[-1] == "batch_done"
     assert events[-1][2] == [("乙", "RuntimeError: boom")]
 
-    # 停止后：剩下的账户只收到 account_skipped，不再发起备份
+    # 停止后：不再发起备份，只收到 account_skipped
     calls.clear()
     app.stop_flag.set()
     app._batch_worker(snapshots, "D:\\out")
@@ -2352,3 +2404,433 @@ def test_account_form_follows_the_mail_client_layout(app):
     # 输入框顺序不变：名称 / 邮箱地址 / 收件服务器 / 端口 / 密码（Enter 保存与右键菜单靠它索引）
     assert int(app._account_form_entries[2].grid_info()["row"]) == rows["收件服务器："]
     assert int(app._account_form_entries[3].grid_info()["row"]) == rows["收件服务器："]
+
+
+def test_top_columns_split_three_to_two(app):
+    """上部两栏固定 3:2（账户信息:邮箱文件夹，用户选定）：小窗不塌、大窗照比例。"""
+    for width in (800, 960, 1600):
+        app.root.geometry(f"{width}x736")
+        app.root.update()
+        left = app._left_col.winfo_width()
+        folder = app.folder_group.winfo_width()
+        inner = left + folder    # 净宽：两栏之间那条 TOP_COLUMN_GAP 不算在比例里
+        assert abs(left - round(inner * g.TOP_LEFT_SHARE)) <= 2, (width, left, folder)
+        assert left > folder, (width, left, folder)   # 账户信息栏拿 3 份，文件夹栏 2 份
+    app.root.geometry("960x736")
+    app.root.update()
+
+
+def test_card_content_is_left_aligned_and_values_line_up(app):
+    """两卡内容贴左显示、右侧留白（用户选定）；首行值与邮箱地址值同列起排（4px 回归）。"""
+    app.root.update()
+    for group, inner in ((app.conn_group, app._card_inners[0]), (app._output_group, app._card_inners[1])):
+        left_gap = inner.winfo_rootx() - group.winfo_rootx()
+        right_gap = (group.winfo_rootx() + group.winfo_width()) - (inner.winfo_rootx() + inner.winfo_width())
+        assert left_gap <= g.CARD_PAD + 4, (str(group), left_gap)     # 贴左，不居中
+        assert right_gap > left_gap, (str(group), left_gap, right_gap)  # 右侧留白
+    type_label = next(w for w in app._card_inners[0].winfo_children()
+                      if isinstance(w, tk.Label) and str(w.cget("text")) == g.MAIL_TYPE_TEXT)
+    assert type_label.winfo_rootx() == app._card_labels["user"].winfo_rootx(), "首行值漏 padx=4 的回归"
+
+
+def test_card_value_columns_align_across_cards(app):
+    """「账户信息」与「输出」的值列起点同一条竖线（用户选定「统一到同一条线」）。"""
+    app.root.update()
+    assert app._card_labels["user"].winfo_rootx() == app.card_root_label.winfo_rootx()
+
+
+def test_folder_card_bottom_matches_output_card(app):
+    """「邮箱文件夹」底边与「输出」底边同线：place 级定高回归（grid 传播会吃掉 configure 的高度）。"""
+    for width, height in ((800, 620), (960, 736), (1600, 900)):
+        app.root.geometry(f"{width}x{height}")
+        app.root.update()
+        folder_bottom = app.folder_group.winfo_rooty() + app.folder_group.winfo_height()
+        output_bottom = app._output_group.winfo_rooty() + app._output_group.winfo_height()
+        assert abs(folder_bottom - output_bottom) <= 2, (width, folder_bottom, output_bottom)
+    app.root.geometry("960x736")
+    app.root.update()
+
+
+def test_ssl_chip_renders_and_toggles(app):
+    """SSL 色块 chip：备份卡随账户切配色；设置表单的 chip 点一下翻开关并联动默认端口。"""
+    account = current_account(app)
+    chip = app._card_labels["ssl"]
+    assert chip.cget("text") == g.SSL_CHIP_TEXT
+
+    account["ssl"] = True
+    app._render_card(account)
+    assert chip.cget("background") == g.SSL_CHIP_ON_BG
+    account["ssl"] = False
+    app._render_card(account)
+    assert chip.cget("background") == g.SSL_CHIP_OFF_BG
+    account["ssl"] = True
+    app._render_card(account)
+
+    # 设置表单：chip 可点击切换（command 语义与原 Checkbutton 一致）
+    app._load_account_form(account)
+    form_chip = app._acct_ssl_chip
+    assert app._acct_ssl_var.get() is True
+    assert form_chip.cget("background") == g.SSL_CHIP_ON_BG
+    app._acct_port_var.set("993")
+    app._on_acct_ssl_chip_click()
+    assert app._acct_ssl_var.get() is False
+    assert form_chip.cget("background") == g.SSL_CHIP_OFF_BG
+    assert app._acct_port_var.get() == "143"
+    app._on_acct_ssl_chip_click()
+    assert app._acct_ssl_var.get() is True
+    assert app._acct_port_var.get() == "993"
+    app._load_account_form(account)   # 还原表单
+
+
+def test_conn_row_wraps_when_tight(app, monkeypatch):
+    """服务器行放不下就换行：SSL/端口进独立第二行紧凑排一排，放宽回到同一行（双向 + 迟滞）。
+
+    两栏 3:2 后账户信息列变宽，最小窗 800px 也放得下——用 CARD_CONTENT_MAX_WIDTH 顶小
+    来强制进换行态，验的是排位与迟滞机制本身。
+    """
+    chip, port = app._card_labels["ssl"], app._card_labels["port"]
+    caption = app._conn_server_spec["caption"]
+    wrap = app._conn_wrap_row
+    orig_max = g.CARD_CONTENT_MAX_WIDTH
+    pad_w = sum(sum(p) for p in (g.CHIP_PADX_SAME_ROW, g.PORT_CAPTION_PADX_SAME_ROW,
+                                g.PORT_LABEL_PADX_SAME_ROW))
+    needed = (caption.winfo_reqwidth()
+              + sum(w.winfo_reqwidth() for w in (chip, app._conn_row["port_caption"], port))
+              + pad_w + g.SERVER_MIN_BUDGET)
+
+    monkeypatch.setattr(g, "CARD_CONTENT_MAX_WIDTH", 200)   # 远小于 needed：必须换行
+    app._fit_card_values()
+    app.root.update_idletasks()
+    assert app._conn_wrapped, "放不下就该换行"
+    server_row = int(app._card_labels["server"].grid_info()["row"])
+    assert chip.winfo_manager() == "pack" and port.winfo_manager() == "pack", "换行后进独立第二行容器"
+    assert wrap.grid_info() and int(wrap.grid_info()["row"]) == server_row + 1
+    assert chip.winfo_x() < app._conn_row["port_caption"].winfo_x() < port.winfo_x(), "第二行紧凑排一排"
+    assert wrap.winfo_reqwidth() < 200, wrap.winfo_reqwidth()   # 不吃第一行的列宽，整排短
+
+    # 迟滞带：富余不足 WRAP_HYSTERESIS 就不急着换回来（临界宽度来回拖不闪跳）
+    monkeypatch.setattr(g, "CARD_CONTENT_MAX_WIDTH", needed + g.WRAP_HYSTERESIS - 1)
+    app._fit_card_values()
+    assert app._conn_wrapped, "富余不足迟滞带，维持换行"
+    monkeypatch.setattr(g, "CARD_CONTENT_MAX_WIDTH", needed + g.WRAP_HYSTERESIS)
+    app._fit_card_values()
+    assert not app._conn_wrapped, "富余够了才回到同一行"
+    server_row = int(app._card_labels["server"].grid_info()["row"])
+    assert int(chip.grid_info()["row"]) == server_row and int(port.grid_info()["row"]) == server_row
+
+    monkeypatch.setattr(g, "CARD_CONTENT_MAX_WIDTH", orig_max)   # 还原，给后面的用例留干净状态
+    app._fit_card_values()
+    assert not app._conn_wrapped
+
+
+def test_settings_sash_is_on_top_and_draggable(app, monkeypatch):
+    """设置页左栏手柄压在空隙带上不被盖住（z-order 回归）、隐形同底色，拖动改宽并落盘。"""
+    grip = app._sash_grips["settings"]
+    app._show_page(g.PAGE_SETTINGS)
+    app.root.update()
+    assert hit_test(app, grip) is grip, "手柄被别的控件盖住就点不到"
+    assert str(grip.cget("background")) == str(grip.master.cget("background")), "手柄与空隙同色：隐形"
+
+    saved: list[int] = []
+    monkeypatch.setattr(app, "_save_column_config", lambda: saved.append(1))
+    before = int(app._settings_nav_frame.cget("width"))
+    app._sash_start(SimpleNamespace(x_root=100), "settings")
+    app._sash_drag(SimpleNamespace(x_root=130), "settings")
+    app.root.update()
+    # 上限是动态的（右侧内容最小完整宽反推，见 _sash_max_width），硬上限 SIDEBAR_MAX_WIDTH 封顶
+    assert int(app._settings_nav_frame.cget("width")) == min(before + 30, app._sash_max_width("settings"))
+    assert app._sash_max_width("settings") <= g.SIDEBAR_MAX_WIDTH
+    app._sash_end(None, "settings")
+    assert saved, "拖完要落盘"
+    app._apply_sidebar_width("settings", g.SIDEBAR_DEFAULT_WIDTH)
+    app._show_page(g.PAGE_BACKUP)
+    app.root.update()
+
+
+def test_account_edit_list_has_sash_and_smart_scroll(app, monkeypatch):
+    """设置页「账户」列表：手柄独立拖宽（不牵动设置左栏），滚条按内容显隐（智能滚条）。"""
+    app._show_page(g.PAGE_SETTINGS)
+    app.root.update()
+    grip = app._sash_grips["account"]
+    assert hit_test(app, grip) is grip, "账户列表手柄同样不能被 Listbox 盖住"
+    assert str(grip.cget("background")) == str(grip.master.cget("background")), "手柄与空隙同色：隐形"
+
+    saved: list[int] = []
+    monkeypatch.setattr(app, "_save_column_config", lambda: saved.append(1))
+    nav_before = int(app._settings_nav_frame.cget("width"))
+    before = int(app._account_nav_frame.cget("width"))
+    app._sash_start(SimpleNamespace(x_root=100), "account")
+    app._sash_drag(SimpleNamespace(x_root=124), "account")
+    app.root.update()
+    after = int(app._account_nav_frame.cget("width"))
+    assert after == min(before + 24, app._sash_max_width("account")), (before, after)
+    assert int(app._settings_nav_frame.cget("width")) == nav_before, "账户列表拖宽不该牵动设置左栏"
+    app._sash_end(None, "account")
+    assert saved, "拖完要落盘"
+    app._apply_sidebar_width("account", g.SIDEBAR_DEFAULT_WIDTH)
+
+    # 智能滚条：内容装不下才挂出来，装下就收走
+    lst = app.account_edit_list
+    assert not app._account_edit_scroll_shown
+    for i in range(60):
+        lst.insert("end", f"滚动条用的临时账户{i}")
+    app._sync_account_edit_scroll()
+    assert app._account_edit_scroll_shown, "60 行装不下就该挂滚条"
+    lst.delete(0, "end")
+    app._refresh_edit_list(app._editing_account_id)   # 还原成真实账户清单
+    assert not app._account_edit_scroll_shown, "内容装下了滚条要收走"
+    app._show_page(g.PAGE_BACKUP)
+    app.root.update()
+
+
+def test_sash_sits_in_the_gap_band(app):
+    """手柄压在「侧栏右边框与右侧内容之间」的空隙带上（用户选定），不再贴在侧栏内容上。"""
+    app.root.update()
+    for kind, target in (("backup", app.account_pane), ("settings", app._settings_nav_frame),
+                         ("account", app._account_nav_frame)):
+        grip = app._sash_grips[kind]
+        assert grip.master is not target, kind        # 不挂在侧栏里边（别再压出灰条）
+        assert grip.winfo_rootx() == target.winfo_rootx() + target.winfo_width(), kind   # 紧贴右边框、落在空隙上
+        assert 6 <= grip.winfo_width() <= 12, kind    # 手柄宽 = 空隙带宽（8/8/10px）
+    # 命中测试要各自页面可见时做：两页同窗叠放，被盖住的页面量不到自己
+    app._show_page(g.PAGE_BACKUP)
+    app.root.update()
+    assert hit_test(app, app._sash_grips["backup"]) is app._sash_grips["backup"]
+    app._show_page(g.PAGE_SETTINGS)
+    app.root.update()
+    assert hit_test(app, app._sash_grips["settings"]) is app._sash_grips["settings"]
+    assert hit_test(app, app._sash_grips["account"]) is app._sash_grips["account"]
+    app._show_page(g.PAGE_BACKUP)
+    app.root.update()
+
+
+def test_backup_sash_keeps_the_folder_toolbar_visible(app, monkeypatch):
+    """拖宽账户栏/窗口收窄都不得把「邮箱文件夹」工具栏（尤其右上 ⟳）挤没。
+
+    上限按工具栏实测请求宽反推（_backup_detail_min_width）：先前只按 BACKUP_DETAIL_MIN_WIDTH
+    反推，拖宽后 ⟳ 被 pack 挤成一条竖缝（用户截图）。
+    """
+    monkeypatch.setattr(app, "_save_column_config", lambda: None)
+
+    def toolbar_fits():
+        app.root.update()
+        card, bar = app.folder_group, app._folder_toolbar
+        assert bar.winfo_reqwidth() <= bar.winfo_width(), (bar.winfo_reqwidth(), bar.winfo_width())
+        edge = card.winfo_rootx() + card.winfo_width()
+        assert app.reload_btn.winfo_rootx() + app.reload_btn.winfo_reqwidth() <= edge, "⟳ 被挤出卡片"
+
+    app.root.geometry("800x736")   # 窄窗最能暴露问题
+    app.root.update()
+    app._sash_start(SimpleNamespace(x_root=100), "backup")
+    app._sash_drag(SimpleNamespace(x_root=2000), "backup")   # 一把拉到底
+    app._sash_end(None, "backup")
+    assert int(app.account_pane.cget("width")) == app._sash_max_width("backup"), "拖拽上限按右栏最小完整宽钳"
+    toolbar_fits()
+
+    # 窗口收窄同样要护住：实际宽度自动收、用户选定的宽不动（拉宽后自动回来）
+    app._apply_sidebar_width("backup", g.SIDEBAR_MAX_WIDTH)
+    app.root.geometry("800x736")
+    toolbar_fits()
+    assert int(app.account_pane.cget("width")) < g.SIDEBAR_MAX_WIDTH, "窄窗下账户栏要自动收窄"
+    app.root.geometry("1600x736")
+    app.root.update()
+    assert int(app.account_pane.cget("width")) == g.SIDEBAR_MAX_WIDTH, "窗口拉宽回到用户选定的宽"
+    toolbar_fits()
+
+    app.root.geometry("960x736")
+    app.root.update()
+    app._apply_sidebar_width("backup", g.SIDEBAR_DEFAULT_WIDTH)
+
+
+def test_button_gaps_are_uniform(app):
+    """按钮排里相邻按钮的间隔统一为 BTN_GAP（基准 = 备份页账户列表 全选/反选/清空，用户选定）。"""
+    app.root.update()
+
+    def button_row(*texts):
+        """按钮文案恰好是 texts（视觉从左到右）的那一排按钮；文案要能唯一定位那排。"""
+        stack = [app.root]
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if not isinstance(widget, tk.Frame):
+                continue
+            btns = sorted((w for w in widget.winfo_children()
+                           if isinstance(w, tk.Button) and str(w.cget("text")) in texts),
+                          key=lambda b: b.winfo_rootx())
+            if [str(b.cget("text")) for b in btns] == list(texts):
+                return btns
+        raise AssertionError(f"找不到按钮排: {texts}")
+
+    def gaps_of(*texts, exact=True):
+        btns = button_row(*texts)
+        gaps = [b.winfo_rootx() - (a.winfo_rootx() + a.winfo_width()) for a, b in pairwise(btns)]
+        if exact:
+            assert all(gap == g.BTN_GAP for gap in gaps), (texts, gaps)
+        return btns, gaps
+
+    gaps_of("全选", "反选", "清空")                       # 账户列表工具排（基准）
+    gaps_of("新增", "删除")                              # 设置页「账户」列表工具排
+    gaps_of(g.START_BTN_LABEL, g.STOP_BTN_LABEL)         # 底栏 开始备份/停止
+    # 文件夹工具栏：左排按钮之间精确 BTN_GAP；⟳ 右对齐（右上角，用户选定），与左排之间是弹性余量、只保下限
+    gaps = gaps_of("全选", "清空", "仅收件箱", g.RELOAD_GLYPH, exact=False)[1]
+    assert gaps[0] == g.BTN_GAP and gaps[1] == g.BTN_GAP, gaps
+    assert gaps[2] >= g.BTN_GAP, gaps
+
+
+def test_dialogs_are_centered_on_root(app):
+    """自绘弹窗一律落在主窗口正中（_center_on_root：预检/密码补录/关闭询问共用）。
+
+    客户区中心精确重合才算过：geometry 落外框、winfo_rootx 量客户区，装饰偏移补不掉就会偏一截。
+    """
+    win = tk.Toplevel(app.root)
+    win.resizable(False, False)
+    tk.Frame(win, width=240, height=120).pack()
+    app._center_on_root(win)
+    app.root.update()
+    err_x = ((win.winfo_rootx() + win.winfo_width() // 2)
+             - (app.root.winfo_rootx() + app.root.winfo_width() // 2))
+    err_y = ((win.winfo_rooty() + win.winfo_height() // 2)
+             - (app.root.winfo_rooty() + app.root.winfo_height() // 2))
+    assert abs(err_x) <= 2 and abs(err_y) <= 2, (err_x, err_y)
+    win.destroy()
+
+
+def test_backup_root_row_is_capped(app):
+    """设置页「备份」的 path 行封顶 ACCOUNT_FORM_MAX_WIDTH：最大化也不拉成一条长线。"""
+    app.root.geometry("1600x736")
+    app.root.update()
+    app._show_settings_section(g.SETTINGS_BACKUP_SECTION)
+    app.root.update()
+    width = app._backup_root_row.winfo_width()
+    assert 100 < width <= g.ACCOUNT_FORM_MAX_WIDTH, width
+    app.root.geometry("960x736")
+    app.root.update()
+
+
+def test_refresh_button_reloads_folders(app, monkeypatch):
+    """⟳ 强制重拉：快照命中也照样拉（静默去重对它是例外），补录记忆一并清掉。"""
+    account = current_account(app)
+    state = app._state(account["id"])
+    calls: list[str] = []
+    monkeypatch.setattr(g.threading, "Thread", sync_thread)
+    monkeypatch.setattr(app, "_folder_worker", lambda *a: calls.append(a[0]))
+    app._loading_folder_ids.clear()
+    state["snapshot"] = app._account_snapshot(account)
+    state["password_prompted"] = state["snapshot"]
+
+    app._on_refresh_folders()
+    assert calls == [account["id"]]
+    assert state["snapshot"] is None
+    assert state["password_prompted"] is None
+    app._loading_folder_ids.clear()
+
+
+def test_folder_load_failure_shows_hint_and_prompts_password(app, monkeypatch):
+    """加载失败：面板提示可刷新重试；认证失败弹密码补录、补完自动重拉；同快照不重复弹。"""
+    account = current_account(app)
+    state = app._state(account["id"])
+    prompts: list[str] = []
+    answers: list = []
+    loads: list[str] = []
+    monkeypatch.setattr(g.threading, "Thread", sync_thread)
+    monkeypatch.setattr(app, "_folder_worker", lambda *a: loads.append(a[0]))
+    monkeypatch.setattr(app, "_ask_password", lambda aid: prompts.append(aid) or answers.pop(0))
+    app._loading_folder_ids.clear()
+    state["folder_rows"] = []
+    app.folder_rows = []      # 树上没内容才显示提示（失败提示不叠在已加载的树上）
+
+    # 认证失败：文件夹区提示 + 弹补录窗；同快照不重复弹（消息前缀与 core 的口径一致）
+    app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
+    assert app.folder_ph.winfo_manager() == "grid"
+    assert str(app.folder_ph.cget("text")).startswith("文件夹清单加载失败")
+    answers.append(None)
+    app.root.update()
+    assert prompts == [account["id"]]
+    app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
+    app.root.update()
+    assert prompts == [account["id"]], "同快照只弹一次"
+
+    # 手动刷新清掉记忆：失败后又弹
+    answers.append(None)
+    app._on_refresh_folders()
+    app._loading_folder_ids.clear()
+    app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
+    app.root.update()
+    assert prompts == [account["id"], account["id"]]
+
+    # 非认证失败：只提示不弹窗
+    app._on_folder_load_failed(account["id"], "OSError: network is unreachable")
+    app.root.update()
+    assert len(prompts) == 2
+
+    # 补录拿到密码 → 自动强制重拉（勾了保存就落密文）
+    answers.append(("new-pass", True))
+    loads.clear()
+    app._loading_folder_ids.clear()
+    app._ask_folder_password(account["id"])
+    assert loads == [account["id"]]
+    if DPAPI_OK:
+        assert current_account(app)["password_dpapi"]
+    assert state["password_prompted"] is None
+
+    # 缺密码的账户：提示 + 补录入口（_maybe_load_folders 的早退分支）
+    prompts.clear()
+    answers.append(None)
+    cipher = current_account(app).pop("password_dpapi", None)
+    app._run_passwords.pop(account["id"], None)
+    app._loading_folder_ids.clear()
+    state["snapshot"] = None
+    state["password_prompted"] = None
+    app._maybe_load_folders(account["id"])
+    assert str(app.folder_ph.cget("text")) == g.FOLDER_LOAD_NO_PASSWORD_HINT
+    app.root.update()
+    assert prompts == [account["id"]]
+    if cipher:
+        current_account(app)["password_dpapi"] = cipher
+    app._render_account_detail()
+
+
+def test_long_names_are_ellipsized_with_tip(app):
+    """长名称截断 + 悬停看全文：文件夹名与账户名同一口径，拉宽后自动恢复全文（双向）。"""
+    account = current_account(app)
+    account["name"] = "一个稍长的账户名称十二字"
+    app._refresh_account_list()
+    app.root.update()
+    app._fit_account_names()
+    row = app._account_rows[account["id"]]
+    assert row["text_shown"] != row["text_full"]
+    assert row["text_shown"].endswith(g.ELLIPSIS)
+    assert row["label"].cget("text") == row["text_shown"]
+    assert row["tip_full"] == row["text_full"]
+
+    app._apply_sidebar_width("backup", g.SIDEBAR_MAX_WIDTH)
+    app.root.update()
+    app._fit_account_names()
+    assert row["label"].cget("text") == row["text_full"], "拉宽后恢复全文"
+    app._apply_sidebar_width("backup", g.SIDEBAR_DEFAULT_WIDTH)
+
+    # 两段就够长：800px（文件夹栏 2/5）下必截断、1600px 下恢复全文；三段在 3:2 分栏后
+    # 连 1600px 也放不下，那验的就不是「变宽恢复」而是常态截断了
+    long_display = "一个非常非常长的邮箱文件夹名称" * 2
+    load_folders(app, [("LongName", "LongName.mbox", long_display, long_display)])
+    app.root.geometry("800x736")
+    app.root.update()
+    app._fit_folder_names()
+    node = app._folder_nodes[(long_display,)]
+    label = node["label_widget"]
+    assert node["text_shown"] != node["text_full"]
+    assert node["text_shown"].endswith(g.ELLIPSIS)
+    assert label.cget("text") == node["text_shown"]
+    assert node["tip_full"] == long_display
+
+    app.root.geometry("1600x736")
+    app.root.update()
+    app._fit_folder_names()
+    assert label.cget("text") == node["text_full"], "树区变宽后恢复全文"
+
+    # 还原模块状态：几何回默认、文件夹树回到标准数据集
+    app.root.geometry("960x736")
+    load_folders(app, NAMES)
+    account["name"] = "主账户"
+    app._refresh_account_list()
+    app.root.update()
