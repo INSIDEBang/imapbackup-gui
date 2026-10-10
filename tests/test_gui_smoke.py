@@ -22,6 +22,7 @@ from _pytest.monkeypatch import MonkeyPatch
 
 tk = pytest.importorskip("tkinter")
 import tkinter.font as tkfont
+import tkinter.ttk as ttk
 
 import imapbackup_gui as g
 
@@ -192,16 +193,29 @@ def icon_rgb(color: str) -> tuple:
     return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
 
 
+def image_name(btn):
+    """按钮挂的图标名：ttk 的 image 选项返回元组，tk.Button 返回 str。"""
+    img = btn.cget("image")
+    return img[0] if isinstance(img, tuple) else str(img)
+
+
+def is_disabled(w):
+    """控件可用状态判定：ttk 的 cget("state") 返回 index 对象，走归一化口径。"""
+    return g.widget_state(w) == "disabled"
+
+
 def assert_start_button_idle(instance):
-    """开始按钮回到静止态：文案与绿三角图标都回位。"""
+    """开始按钮回到静止态：文案回位，图标按可用性取彩色/灰度（Q4）。"""
     assert instance.start_btn.cget("text") == g.START_BTN_LABEL
-    assert instance.start_btn.cget("image") == str(instance.start_icon)
+    expected = instance.start_icon_off if is_disabled(instance.start_btn) else instance.start_icon
+    assert image_name(instance.start_btn) == str(expected)
 
 
 def assert_stop_button_idle(instance):
-    """停止按钮回到静止态：文案与红方块图标都回位。"""
+    """停止按钮回到静止态（永远禁用）：文案回位，图标按可用性取彩色/灰度。"""
     assert instance.stop_btn.cget("text") == g.STOP_BTN_LABEL
-    assert instance.stop_btn.cget("image") == str(instance.stop_icon)
+    expected = instance.stop_icon_off if is_disabled(instance.stop_btn) else instance.stop_icon
+    assert image_name(instance.stop_btn) == str(expected)
 
 
 class FakeBox:
@@ -234,12 +248,13 @@ def _message(folder="INBOX", index=1, total=23, **overrides):
 
 def test_window_initial_state(app):
     assert app.root.title() == "IMAP Backup GUI"
-    assert str(app.start_btn.cget("state")) == "disabled"
+    assert is_disabled(app.start_btn)
     # 两个按钮各自挂着一枚代码画的图标，静止态文案固定（改动前开始/停止按钮都是纯文字）
     assert app.start_btn.cget("text") == g.START_BTN_LABEL
     assert app.stop_btn.cget("text") == g.STOP_BTN_LABEL
-    assert app.start_btn.cget("image") == str(app.start_icon)
-    assert app.stop_btn.cget("image") == str(app.stop_icon)
+    # 图标按可用性取彩色/灰度（Q4）：初始两颗都禁用，挂的应是灰度版
+    assert image_name(app.start_btn) == str(app.start_icon_off if is_disabled(app.start_btn) else app.start_icon)
+    assert image_name(app.stop_btn) == str(app.stop_icon_off if is_disabled(app.stop_btn) else app.stop_icon)
     assert app.folder_ph.cget("text") == g.FOLDER_PLACEHOLDER_TEXT
     assert app.folder_ph.winfo_manager() == "grid"
     assert app.list_ph.cget("text") == g.LIST_PLACEHOLDER_TEXT
@@ -260,11 +275,18 @@ def test_button_icons_are_code_drawn_in_color(app):
     size = app.start_icon.width()
     assert size == app.stop_icon.width()
     assert size == g._icon_size()
-    for icon, color in ((app.start_icon, g.PLAY_ICON_COLOR), (app.stop_icon, g.STOP_ICON_COLOR)):
+    for icon, color in ((app.start_icon, g.PLAY_ICON_COLOR), (app.stop_icon, g.STOP_ICON_COLOR),
+                        (app.add_icon, g.PLAY_ICON_COLOR), (app.del_icon, g.STOP_ICON_COLOR),
+                        (app.start_icon_off, g.ICON_DISABLED_COLOR), (app.stop_icon_off, g.ICON_DISABLED_COLOR)):
         center = size // 2
+        assert icon.width() == size, icon.width()
         assert tuple(icon.get(center, center))[:3] == icon_rgb(color), (icon.get(center, center), color)
         assert not icon.transparency_get(center, center)
     assert app.start_icon.get(size // 2, size // 2) != app.stop_icon.get(size // 2, size // 2)
+    # 新增=绿加号 / 删除=红叉，icon + text 挂载（compound=left，与开始/停止同口径）
+    assert image_name(app.add_btn) == str(app.add_icon)
+    assert image_name(app.del_btn) == str(app.del_icon)
+    assert str(app.add_btn.cget("compound")) == "left" and str(app.del_btn.cget("compound")) == "left"
 
 
 def test_version_is_shared_and_status_bar_starts_on_one_row(app):
@@ -290,7 +312,7 @@ def test_folder_load_fills_the_tree(app):
     assert [r["foldername"] for r in app.folder_rows] == ["Archive/2024", "INBOX", OTHER, CHILD, DUP_A, DUP_B]
     assert row_by(app, "INBOX")["var"].get() is True
     assert not row_by(app, "Archive/2024")["var"].get()
-    assert str(app.start_btn.cget("state")) == "normal", app.start_btn.cget("state")
+    assert not is_disabled(app.start_btn), app.start_btn.cget("state")
 
 
 def branch_of(instance, key):
@@ -463,7 +485,7 @@ def test_parent_check_cascades_and_shows_a_third_state(app):
     assert row_by(app, OTHER)["var"].get() and row_by(app, CHILD)["var"].get()
     assert row_by(app, DUP_A)["var"].get() and row_by(app, DUP_B)["var"].get()
     assert row_by(app, OTHER)["check_btn"].cget("text") == "☑ 其他文件夹"
-    assert str(app.start_btn.cget("state")) == "normal"
+    assert not is_disabled(app.start_btn)
     sub = {r["foldername"] for r in app._folder_subtree(PARENT)}
     for fn in (OTHER, CHILD, DUP_A, DUP_B):
         assert fn in sub, sorted(sub)
@@ -601,7 +623,7 @@ def test_run_done_summaries(app):
     assert "测试日志行" in app.log_text.get("1.0", "end")
     assert "完成：本次备份 1 封" in app.status_var.get() and "用时 1:05" in app.status_var.get(), (
         app.status_var.get())
-    assert str(app.start_btn.cget("state")) == "normal"
+    assert not is_disabled(app.start_btn)
 
     app.events.put(("totals", aid, 100, 0))
     app.events.put(("account_done", aid, 0, 100, 3.0, False, 0))
@@ -622,13 +644,14 @@ def test_config_is_locked_during_a_run(app):
     """
     app.running = True
     app._begin_run_ui()
-    lockable = [w for w, _ in app._config_widgets if isinstance(w, (tk.Button, tk.Checkbutton))]
-    assert all(str(w.cget("state")) == "disabled" for w in lockable), len(app._config_widgets)
+    lockable = [w for w, _ in app._config_widgets
+                if isinstance(w, (tk.Button, tk.Checkbutton, ttk.Button))]
+    assert all(is_disabled(w) for w in lockable), len(app._config_widgets)
     assert bool(app._folder_clickables)
     assert all(str(w.cget("foreground")) == "gray" and str(w.cget("cursor")) == "arrow"
                for w, _ in app._folder_clickables), len(app._folder_clickables)
-    assert str(app.start_btn.cget("state")) == "disabled"
-    assert str(app.stop_btn.cget("state")) == "normal"
+    assert is_disabled(app.start_btn)
+    assert not is_disabled(app.stop_btn)
 
     # 锁定期间点击必须无效：勾选不翻转、展开态不变
     states_before = [r["var"].get() for r in app.folder_rows]
@@ -649,8 +672,8 @@ def test_config_is_locked_during_a_run(app):
     assert [r["var"].get() for r in app.folder_rows] != states_before
     click(app, inbox_btn)
     assert [r["var"].get() for r in app.folder_rows] == states_before
-    assert all(str(w.cget("state")) == "normal" for w, _ in app._config_widgets
-               if isinstance(w, (tk.Button, tk.Checkbutton)))
+    assert all(not is_disabled(w) for w, _ in app._config_widgets
+               if isinstance(w, (tk.Button, tk.Checkbutton, ttk.Button)))
     app._update_start_state()
 
 
@@ -815,9 +838,9 @@ def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monke
     app._begin_run_ui()
     text = str(app.start_btn.cget("text"))
     assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
-    assert app.start_btn.cget("image") == str(app.blank_icon)  # 绿三角让位给透明占位（撤成 "" 会矮/高一截）
-    assert str(app.start_btn.cget("state")) == "disabled"
-    assert str(app.stop_btn.cget("state")) == "normal"
+    assert image_name(app.start_btn) == str(app.blank_icon)  # 绿三角让位给透明占位（撤成 "" 会矮/高一截）
+    assert is_disabled(app.start_btn)
+    assert not is_disabled(app.stop_btn)
 
     app._end_run_controls()
     assert_start_button_idle(app)
@@ -1086,10 +1109,10 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     assert app.stopping is True and app.stop_flag.is_set()
     text = str(app.stop_btn.cget("text"))
     assert text.endswith(g.STOPPING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
-    assert app.stop_btn.cget("image") == str(app.blank_icon)  # 红方块让位给转圈文字
-    assert str(app.stop_btn.cget("state")) == "disabled"
+    assert image_name(app.stop_btn) == str(app.blank_icon)  # 红方块让位给转圈文字
+    assert is_disabled(app.stop_btn)
     assert_start_button_idle(app)                             # 开始按钮：文案与绿三角回位
-    assert str(app.start_btn.cget("state")) == "disabled"     # 但仍不可点（运行还没真正结束）
+    assert is_disabled(app.start_btn)     # 但仍不可点（运行还没真正结束）
     assert app.status_var.get() == "" and app._status_full == ""           # 第二行清空
     assert app._msg_bar.winfo_manager() == "pack"             # 行不收回
     assert app.version_label.winfo_manager() == "pack"        # 版本号留在原处
@@ -1159,7 +1182,7 @@ def test_loading_buttons_keep_their_height(app):
     app._begin_run_ui()
     app._stop_run_spinner()                            # 停掉真实帧链，免得它把文案改回别的帧
     app.root.update()
-    assert app.start_btn.cget("image") == str(app.blank_icon), app.start_btn.cget("image")
+    assert image_name(app.start_btn) == str(app.blank_icon), app.start_btn.cget("image")
     # 占位只借高度、不占宽：1px 宽 × 图标高，转圈符才贴近左边框
     assert (app.blank_icon.width(), app.blank_icon.height()) == (1, g._icon_size()), (
         app.blank_icon.width(), app.blank_icon.height())
@@ -1169,7 +1192,7 @@ def test_loading_buttons_keep_their_height(app):
     # 停止中：转圈换到停止按钮上，两颗按钮的高度仍然一致
     app._on_stop()
     app.root.update()
-    assert app.stop_btn.cget("image") == str(app.blank_icon)
+    assert image_name(app.stop_btn) == str(app.blank_icon)
     assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
         app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
 
@@ -2655,7 +2678,7 @@ def test_button_gaps_are_uniform(app):
             if not isinstance(widget, tk.Frame):
                 continue
             btns = sorted((w for w in widget.winfo_children()
-                           if isinstance(w, tk.Button) and str(w.cget("text")) in texts),
+                           if isinstance(w, (tk.Button, ttk.Button)) and str(w.cget("text")) in texts),
                           key=lambda b: b.winfo_rootx())
             if [str(b.cget("text")) for b in btns] == list(texts):
                 return btns
@@ -2834,3 +2857,235 @@ def test_long_names_are_ellipsized_with_tip(app):
     account["name"] = "主账户"
     app._refresh_account_list()
     app.root.update()
+
+
+# ── 加载态 / 保存反馈 / 新增弹窗 / 删除确认（Q1–Q15 定案） ──────────────────
+
+def descendants(widget):
+    """递归遍历后代控件（驱动真实弹窗时按文本找按钮/输入框用）。"""
+    for child in widget.winfo_children():
+        yield child
+        yield from descendants(child)
+
+
+def titled_toplevel(app, title):
+    """主窗口名下标题为 title 的弹窗（after 预排驱动时定位真实 Toplevel）。"""
+    return next(w for w in app.root.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.title() == title)
+
+
+def test_folder_loading_shows_spinner_and_hides_tree(app, monkeypatch):
+    """加载态（Q2/Q3/Q4）：拉取清单期间树区盖上旋转 spinner、⟳ 禁用；加载完恢复。"""
+    monkeypatch.setattr(g.threading, "Thread", sync_thread)
+    monkeypatch.setattr(app, "_folder_worker", lambda *a: None)   # 不投事件：加载态停留
+    account = current_account(app)
+    app._loading_folder_ids.clear()
+    app._state(account["id"])["snapshot"] = None
+
+    app._maybe_load_folders(account["id"])
+    assert account["id"] in app._loading_folder_ids
+    assert app.folder_loading.winfo_manager() == "grid"
+    assert app.folder_canvas.winfo_manager() == "grid"   # 树还在，只是被动画层盖住（不可交互）
+    text = str(app.folder_loading_label.cget("text"))
+    assert text.startswith(tuple(g.SPINNER_FRAMES)) and text.endswith(g.FOLDER_LOADING_TEXT), text
+    assert is_disabled(app.reload_btn)
+
+    load_folders(app, NAMES)   # folders_loaded：树回、动画层收、⟳ 恢复
+    assert app.folder_loading.winfo_manager() == ""
+    assert not is_disabled(app.reload_btn)
+    assert len(app.folder_rows) == 6
+    app._loading_folder_ids.clear()
+
+
+def test_folder_loading_follows_the_selected_account(app, monkeypatch):
+    """加载态只跟随当前选中账户（Q8）：切走即换目标账户视图，切回继续转。"""
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda aid: None)
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "后台账户", "user": "bg@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._loading_folder_ids.clear()
+    app._loading_folder_ids.add(first["id"])   # A 在拉取
+    try:
+        app._switch_account(first["id"])
+        assert app.folder_loading.winfo_manager() == "grid"
+
+        app._switch_account(second["id"])      # B 没在拉取：动画层收起，B 的树/占位正常
+        assert app.folder_loading.winfo_manager() == ""
+        assert not is_disabled(app.reload_btn)
+
+        app._switch_account(first["id"])       # 切回 A：动画层回来
+        assert app.folder_loading.winfo_manager() == "grid"
+    finally:
+        app._loading_folder_ids.clear()
+        app._sync_folder_loading_view()
+        app.accounts.remove(second)
+        app._states.pop(second["id"], None)
+        app._refresh_account_list()
+        app._switch_account(first["id"])
+        app._render_account_detail()
+
+
+def test_account_save_reports_result_in_status_text(app, monkeypatch):
+    """保存反馈（Q5/Q7/Q10）：校验失败红字写原因、成功绿「已保存」，都不再弹 messagebox。"""
+    box = FakeBox()
+    monkeypatch.setattr(g, "messagebox", box)
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda aid: None)
+    account = current_account(app)
+    app._refresh_edit_list(account["id"])
+    orig_port = app._acct_port_var.get()
+
+    app._acct_port_var.set("0")
+    app._on_account_save()
+    assert str(app._account_save_status.cget("text")) == g.SAVE_STATUS_FAIL_PREFIX + "端口必须是 1-65535 的整数。"
+    assert str(app._account_save_status.cget("foreground")) == g.STATUS_ERR_FG
+    assert box.warnings == [], box.warnings   # Q10：校验提示收口到状态文案
+
+    app._acct_port_var.set(orig_port)
+    app._on_account_save()
+    assert str(app._account_save_status.cget("text")) == g.SAVE_STATUS_OK_TEXT
+    assert str(app._account_save_status.cget("foreground")) == g.STATUS_OK_FG
+    assert app._account_save_status_job is not None   # 约 3 秒后自动消失（job 已排定）
+    app._clear_account_save_status()
+    assert str(app._account_save_status.cget("text")) == ""
+
+
+def test_new_account_dialog_creates_account_only_on_save(app, monkeypatch):
+    """新增弹窗（Q11–Q13）：叉掉/取消零副作用；校验红字留窗内，成功闪「已保存」自动关窗并选中。"""
+    loaded: list[str] = []
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda aid: loaded.append(aid))
+    main_id = app._selected_account_id
+
+    # 取消路径（叉掉/取消同路）：零副作用
+    real_ask = app._ask_new_account
+    monkeypatch.setattr(app, "_ask_new_account", lambda: None)
+    before = len(app.accounts)
+    app._on_account_add()
+    assert len(app.accounts) == before
+
+    # 真实弹窗：after 预排驱动（wait_window 的事件循环里执行），填值 → 校验 → 保存
+    seen: dict = {}
+    monkeypatch.setattr(app, "_ask_new_account", lambda: real_ask())
+
+    def drive():
+        dialog = titled_toplevel(app, g.NEW_ACCOUNT_DLG_TITLE)
+        entries = [w for w in descendants(dialog) if isinstance(w, tk.Entry)]
+        seen["entry_count"] = len(entries)   # 名称/邮箱/服务器/端口/密码
+        save = next(w for w in descendants(dialog)
+                    if isinstance(w, ttk.Button) and str(w.cget("text")) == "保存")
+        cancel = next(w for w in descendants(dialog)
+                      if isinstance(w, ttk.Button) and str(w.cget("text")) == g.CANCEL_BTN_TEXT)
+        status = next(w for w in save.master.master.winfo_children() if isinstance(w, tk.Label))
+        app.root.update()
+        seen["equal_width"] = abs(save.winfo_width() - cancel.winfo_width()) <= 2   # messagebox 口径（Q4）
+        seen["gap"] = cancel.winfo_rootx() - (save.winfo_rootx() + save.winfo_width())
+        seen["focus_is_save"] = dialog.focus_get() is save   # 默认按钮 = 保存（Q6/Q9）
+        save.invoke()                              # 空表单：红字原因留在窗内
+        seen["fail_text"] = str(status.cget("text"))
+        seen["fail_fg"] = str(status.cget("foreground"))
+        seen["open_after_fail"] = bool(dialog.winfo_exists())
+        entries[0].insert(0, "弹窗账户")
+        entries[1].insert(0, "popup@example.com")
+        entries[2].insert(0, "imap.example.com")
+        entries[4].insert(0, "pw")
+        save.invoke()                              # 合法：绿「已保存」，0.8 秒后自动关窗
+        seen["ok_text"] = str(status.cget("text"))
+        seen["ok_fg"] = str(status.cget("foreground"))
+
+    app.root.after(0, drive)
+    app._on_account_add()
+    assert seen["entry_count"] == 5, seen
+    assert seen["equal_width"] and seen["gap"] == g.BTN_GAP, seen   # messagebox 口径（Q4）
+    assert seen["focus_is_save"] is True                            # 默认按钮 = 保存（Q6/Q9）
+    assert seen["fail_text"] == g.SAVE_STATUS_FAIL_PREFIX + "请填写邮箱地址。"
+    assert seen["fail_fg"] == g.STATUS_ERR_FG and seen["open_after_fail"] is True
+    assert seen["ok_text"] == g.SAVE_STATUS_OK_TEXT and seen["ok_fg"] == g.STATUS_OK_FG
+    account = current_account(app)
+    assert account["name"] == "弹窗账户" and account["user"] == "popup@example.com"
+    assert account["id"] == app._editing_account_id   # 进列表并选中（Q13）
+    assert loaded and loaded[-1] == account["id"]
+
+    # 还原模块状态：删掉弹窗建的账户，选中回主账户
+    app.accounts.remove(account)
+    app._states.pop(account["id"], None)
+    app._refresh_account_list()
+    app._switch_account(main_id)
+    app._refresh_edit_list(main_id)
+
+
+def test_delete_confirm_is_a_self_drawn_centered_dialog(app):
+    """删除确认（Q14）：自绘弹窗居中到主窗口；X/Esc/取消不删，「删除」才删。"""
+    account = g.new_account()
+    account.update({"name": "待删账户", "user": "del@example.com", "server": "imap.example.com"})
+    seen: dict = {}
+
+    def drive_cancel():
+        dialog = titled_toplevel(app, g.DELETE_DLG_TITLE)
+        app.root.update()
+        seen["err_x"] = ((dialog.winfo_rootx() + dialog.winfo_width() // 2)
+                         - (app.root.winfo_rootx() + app.root.winfo_width() // 2))
+        seen["err_y"] = ((dialog.winfo_rooty() + dialog.winfo_height() // 2)
+                         - (app.root.winfo_rooty() + app.root.winfo_height() // 2))
+        seen["text"] = str(next(w for w in descendants(dialog)
+                                if isinstance(w, tk.Label)).cget("text"))
+        cancel = next(w for w in descendants(dialog)
+                      if isinstance(w, ttk.Button) and str(w.cget("text")) == g.CANCEL_BTN_TEXT)
+        delete = next(w for w in descendants(dialog)
+                      if isinstance(w, ttk.Button) and str(w.cget("text")) == g.DELETE_DLG_CONFIRM)
+        seen["equal_width"] = abs(cancel.winfo_width() - delete.winfo_width()) <= 2   # messagebox 口径（Q4）
+        seen["gap"] = delete.winfo_rootx() - (cancel.winfo_rootx() + cancel.winfo_width())
+        seen["focus_is_cancel"] = dialog.focus_get() is cancel   # 默认按钮给安全侧（Q6）
+        dialog.destroy()   # X/Esc 同路：answer 为空 = 不删
+
+    app.root.after(0, drive_cancel)
+    assert app._ask_delete_account(account) is False
+    assert abs(seen["err_x"]) <= 2 and abs(seen["err_y"]) <= 2, (seen["err_x"], seen["err_y"])
+    assert seen["equal_width"] and seen["gap"] == g.BTN_GAP, seen
+    assert seen["focus_is_cancel"] is True
+    assert "已备份到磁盘的邮件不会被删除。" in seen["text"]
+
+    def drive_confirm():
+        dialog = titled_toplevel(app, g.DELETE_DLG_TITLE)
+        next(w for w in descendants(dialog)
+             if isinstance(w, ttk.Button) and str(w.cget("text")) == g.DELETE_DLG_CONFIRM).invoke()
+
+    app.root.after(0, drive_confirm)
+    assert app._ask_delete_account(account) is True
+
+
+def test_add_delete_buttons_fill_the_account_list_width(app):
+    """新增/删除占满账户列表全部宽度（Q15）：并排各半、间隔 BTN_GAP、随列表宽度联动。"""
+    app.root.update()
+    nav = app._account_nav_frame
+    area = app.account_edit_list.master
+    tools = next(w for w in nav.winfo_children()
+                 if isinstance(w, tk.Frame)
+                 and {str(b.cget("text")) for b in w.winfo_children()
+                      if isinstance(b, (tk.Button, ttk.Button))} == {"新增", "删除"})
+    add_btn, del_btn = sorted((b for b in tools.winfo_children() if isinstance(b, (tk.Button, ttk.Button))),
+                              key=lambda b: b.winfo_rootx())
+    assert isinstance(add_btn, ttk.Button) and isinstance(del_btn, ttk.Button)   # 原生观感（Q5）
+
+    def assert_tiles_list():
+        app.root.update()
+        left = add_btn.winfo_rootx()
+        right = del_btn.winfo_rootx() + del_btn.winfo_width()
+        # 净 4px 内缩（Q1-A 按钮排基线）：整排平铺列表宽 − 2×4px
+        assert abs(left - (area.winfo_rootx() + 4)) <= 2, (left, area.winfo_rootx())
+        assert abs(right - (area.winfo_rootx() + area.winfo_width() - 4)) <= 2, (right, area.winfo_width())
+        gap = del_btn.winfo_rootx() - (add_btn.winfo_rootx() + add_btn.winfo_width())
+        assert gap == g.BTN_GAP, gap
+        assert abs(add_btn.winfo_width() - del_btn.winfo_width()) <= 2   # 各占一半
+
+    assert_tiles_list()
+    nav.configure(width=app._account_list_width + 80)   # 拖宽联动：按钮排跟着占满
+    assert_tiles_list()
+    nav.configure(width=app._account_list_width)
+    app.root.update()
+
+
+def test_all_buttons_are_themed(app):
+    """所有按钮都是 ttk.Button（Q3 硬契约）：全应用不再有经典立体按钮残留。"""
+    classics = [w for w in descendants(app.root) if isinstance(w, tk.Button)]
+    assert classics == [], [str(w) for w in classics]

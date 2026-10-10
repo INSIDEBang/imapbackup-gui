@@ -45,6 +45,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -84,6 +85,8 @@ STOP_ICON_COLOR = "#d13438"     # 停止：红色
 ICON_MIN_SIZE = 9               # 图标边长下限(px)
 ICON_LINESPACE_GAP = 5          # 图标边长 = 默认字体行高 − 这个值：行高变大图标同比例变大，不设上限
 STOP_ICON_INSET_RATIO = 0.125   # 红方块相对外接框的内缩比例：方块视觉比同框三角重，缩一圈才平衡
+ICON_STROKE = 2                 # 加号/叉的笔画粗细(px)
+ICON_DISABLED_COLOR = "#9d9d9d"  # 禁用态灰度图标色（ttk 主题不给图片置灰，禁用时换挂）
 ZEBRA_TAG = "zebra"    # 邮件列表偶数行（第 2、4… 行）的 tag；奇数行走 Treeview 默认白底
 ZEBRA_BG = "#f0f0f0"   # 不跟随系统深色模式，与运行日志 Text 的 #ffffff 同一取舍
 
@@ -193,6 +196,22 @@ FOLDER_LOAD_FAIL_HINT = "文件夹清单加载失败：{reason}，点右上角�
 FOLDER_LOAD_NO_PASSWORD_HINT = "该账户未保存密码，点右上角刷新补录"
 FOLDER_LOAD_INCOMPLETE_HINT = "连接信息不完整，请到设置页「账户」补全"
 FOLDER_FAIL_REASON_MAX = 40   # 失败原因进提示行前的截断长度（防爆宽）
+FOLDER_LOADING_TEXT = "正在加载邮箱文件夹…"   # 加载态（Q2）：树区整体替换为居中 spinner + 这行文案
+
+# 保存反馈（Q5/Q9/Q10）：保存按钮旁的状态文案，一套出口，不再弹 messagebox。
+SAVE_STATUS_OK_TEXT = "已保存"
+SAVE_STATUS_FAIL_PREFIX = "保存失败："
+SAVE_STATUS_CLEAR_MS = 3000   # 文案自动消失；重复保存重置计时
+STATUS_OK_FG = SSL_CHIP_ON_FG  # 与 SSL chip 同一支绿
+STATUS_ERR_FG = "#b3261e"
+
+# 新增账户弹窗（Q11–Q13）与删除确认自绘弹窗（Q14）：与预检/密码补录/关闭询问同一家族。
+NEW_ACCOUNT_DLG_TITLE = "新增账户"
+NEW_ACCOUNT_DIALOG_CLOSE_DELAY_MS = 800   # 「已保存」的停留时长，随后自动关窗（用户选定 0.5–1s）
+DELETE_DLG_TITLE = "删除账户"
+DELETE_DLG_TEXT = "确定删除账户「{name}」吗？\n已备份到磁盘的邮件不会被删除。"
+DELETE_DLG_CONFIRM = "删除"
+CANCEL_BTN_TEXT = "取消"
 
 # 账户（多账户配置）：连接设置在设置页「账户」分类维护；备份页左列表 + 右只读详情。
 # 账户名称是纯显示名，不参与 <备份根>/<账号>/ 目录名生成（账号目录取邮箱地址，见 ADR 0002/0010）。
@@ -371,24 +390,57 @@ def _heading_font(base: tkfont.Font) -> tkfont.Font:
                        size=abs(int(base.cget("size"))) + HEADING_SIZE_DELTA, weight="bold")
 
 
-def _make_square_button(btn: tk.Button) -> None:
-    """把 icon-only 按钮钉成正方形：宽迭代逼近自身实测高（误差 ≤2px）。
+def _make_square_button(btn: ttk.Button) -> None:
+    """把 icon-only 按钮钉成正方形（误差 ≤2px）。
 
     Note:
-        Button 的 width 单位是「0」字符宽、height 单位是文本行高，两者单位不同，
-        width=2 出来是竖长条（用户「刷新按钮应正方形」）。以请求高为基准换算字符数
-        迭代逼近：请求宽偏小就加宽，反之收窄，两三轮内收敛。
+        tk/ttk 的 width 都是「0」字符宽单位（约 8px 粒度）：实测 ttk 的 ⟳ 默认 24×27、
+        差 3px，字符步进 round(3/8)=0 直接卡死，永远进不了 ±2px。改用 ttk 的 padding
+        按像素精调：先 `padding=[0, 0]` 量出内容基准，再把「目标边长 − 基准」对半摊到
+        横/纵 padding，一次算准不迭代。目标边长取按钮默认请求高（与工具栏行高同源）。
     """
-    font = tkfont.nametofont(str(btn.cget("font")) or "TkDefaultFont")
-    char_w = max(font.measure("0"), 1)
-    for _ in range(3):
-        want, have = btn.winfo_reqheight(), btn.winfo_reqwidth()
-        if abs(want - have) <= 2:
-            return
-        step = round((want - have) / char_w)
-        if step == 0:
-            return
-        btn.configure(width=max(1, int(btn.cget("width")) + step))
+    btn.update_idletasks()
+    target = btn.winfo_reqheight()
+    btn.configure(padding=[0, 0])
+    btn.update_idletasks()
+    w0, h0 = btn.winfo_reqwidth(), btn.winfo_reqheight()
+    btn.configure(padding=[max(0, (target - w0) // 2), max(0, (target - h0) // 2)])
+
+
+def widget_state(widget: tk.Widget) -> str:
+    """控件可用状态归一化：ttk 的 `cget("state")` 返回 index 对象（不是 str），tk 返回 str。"""
+    if isinstance(widget, ttk.Widget):
+        return "disabled" if widget.instate(["disabled"]) else "normal"
+    return str(widget.cget("state"))
+
+
+def _make_equal_button_row(parent: tk.Widget, specs: list[tuple[str, Callable[[], None]]]) -> list[ttk.Button]:
+    """弹窗按钮排（messagebox 口径）：同排按钮等宽、间隔精确 BTN_GAP、整排居中。
+
+    Args:
+        parent: 按钮排的宿主。
+        specs: [(按钮文案, command), …]，视觉顺序即列表顺序（主操作的位置由调用方定）。
+
+    Returns:
+        建好的按钮列表（顺序同 specs），调用方拿去做默认聚焦等后续处理。
+
+    Note:
+        等宽靠 grid 的 uniform 列：同组列取组内最大请求宽，按钮 `sticky="we"` 铺满列就渲染成
+        等宽（= 最宽自然宽）——messagebox 按钮排的另一半特征。行内只放按钮，收缩到内容宽后
+        `pack(anchor="center")` 居中（用户选定；调用方的容器要 `fill="x"` 才居得中，
+        与状态文案同排时先包一层内容宽 group、再整体 `anchor="center"`）。
+    """
+    row = tk.Frame(parent)
+    row.pack(anchor="center")
+    buttons: list[ttk.Button] = []
+    for i, (text, command) in enumerate(specs):
+        btn = ttk.Button(row, text=text, command=command)
+        # 两侧各 BTN_GAP//2（grid 口径，gui.md）：相邻间距合成 BTN_GAP，且各按钮可用宽一致——
+        # 不对称 padx 会让末颗比别的宽一截（回归自等宽断言炸掉）
+        btn.grid(row=0, column=i, sticky="we", padx=BTN_GAP // 2)
+        row.columnconfigure(i, uniform="dlgbtn")
+        buttons.append(btn)
+    return buttons
 
 
 def last_folder_segment(display: str, path: tuple[str, ...]) -> str:
@@ -588,6 +640,28 @@ def _stop_icon(color: str, size: int) -> tk.PhotoImage:
     return img
 
 
+def _plus_icon(color: str, size: int) -> tk.PhotoImage:
+    """加号（新增）：横竖两条居中笔画，内缩与方块同款（同框视觉重量接近）。"""
+    img = tk.PhotoImage(width=size, height=size)
+    inset = max(1, round(size * STOP_ICON_INSET_RATIO))
+    mid = size // 2
+    _put(img, color, inset, mid - ICON_STROKE // 2, size - inset, mid - ICON_STROKE // 2 + ICON_STROKE)
+    _put(img, color, mid - ICON_STROKE // 2, inset, mid - ICON_STROKE // 2 + ICON_STROKE, size - inset)
+    return img
+
+
+def _cross_icon(color: str, size: int) -> tk.PhotoImage:
+    """叉（删除）：两条对角线逐行阶梯画出，中点两笔交叉（中心像素必有颜色）。"""
+    img = tk.PhotoImage(width=size, height=size)
+    inset = max(1, round(size * STOP_ICON_INSET_RATIO))
+    for y in range(inset, size - inset):
+        x = min(y, size - inset - ICON_STROKE)                       # 45° 对角线（笔画不出内缩框）
+        _put(img, color, x, y, x + ICON_STROKE, y + 1)
+        xm = max(inset, size - inset - ICON_STROKE - (y - inset))    # 镜像对角线
+        _put(img, color, xm, y, xm + ICON_STROKE, y + 1)
+    return img
+
+
 def _blank_icon(height: int) -> tk.PhotoImage:
     """生成高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
 
@@ -764,6 +838,7 @@ class BackupApp:
 
         self._build_backup_page()
         self._build_settings_page()
+        self._attach_button_icons()   # 图标挂载统一入口：须在设置页建完（新增/删除按钮）之后
         self._build_context_menus()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Configure>", self._on_root_configure, add="+")
@@ -808,7 +883,7 @@ class BackupApp:
 
     def _register[T: tk.Widget](self, widget: T) -> T:
         """登记配置区控件并原样返回：加入运行中的启停名单，构造时可链式书写。"""
-        self._config_widgets.append((widget, str(widget.cget("state"))))
+        self._config_widgets.append((widget, widget_state(widget)))
         return widget
 
     def _build_backup_page(self) -> None:
@@ -976,16 +1051,18 @@ class BackupApp:
         scroll.bind("<MouseWheel>", self._on_wheel)  # 与面板内滚条同款：走窗口级节奏
         self.account_list.bind("<Configure>", lambda _e: self._sync_account_scroll())
         self.account_canvas.bind("<Configure>", self._on_account_canvas_configure)
-        self.backup_selected_btn = tk.Button(pane, text=BACKUP_SELECTED_BTN_LABEL,
-                                             command=self._on_start_selected)
+        self.backup_selected_btn = ttk.Button(pane, text=BACKUP_SELECTED_BTN_LABEL,
+                                              command=self._on_start_selected)
         tools = tk.Frame(pane)
         tool_actions = (("全选", lambda: self._set_all_account_checks(True)),
                         ("反选", self._invert_account_checks),
                         ("清空", lambda: self._set_all_account_checks(False)))
+        # 三个按钮都给 width=4：ttk 主题在 width=0 时强制 87px 最小宽（实测），会把工具排
+        # 撑出 160px 侧栏；width 是字符数下限，内容更长时照样长，不会截字。
         for column, (label, command) in enumerate(tool_actions):
             tools.columnconfigure(column, weight=1, uniform="account-tools")  # 三格等宽
-            tk.Button(tools, text=label, command=command).grid(row=0, column=column, sticky="we",
-                                                               padx=BTN_GAP // 2)   # 两侧各一半=BTN_GAP
+            ttk.Button(tools, text=label, width=4, command=command).grid(row=0, column=column, sticky="we",
+                                                                         padx=BTN_GAP // 2)   # 两侧各一半=BTN_GAP
         # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
         self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
         tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
@@ -1261,14 +1338,15 @@ class BackupApp:
         toolbar = tk.Frame(group)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=CARD_PAD, pady=(CARD_PAD, 0))
         self._folder_toolbar = toolbar   # 拖拽钳制按它的实测请求宽反推右栏最小宽（见 _backup_detail_min_width）
-        self._register(tk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
-        self._register(tk.Button(toolbar, text="清空", width=7,
-                                 command=lambda: self._set_all_folders(False))).pack(side="left", padx=(BTN_GAP, 0))
-        self._register(tk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
+        self._register(ttk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
+        self._register(ttk.Button(toolbar, text="清空", width=7,
+                                  command=lambda: self._set_all_folders(False))).pack(side="left", padx=(BTN_GAP, 0))
+        self._register(ttk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
         # 刷新入口（icon-only）：静默加载失败后唯一的手动重试入口，右对齐与文件夹工具同排。
-        # 正方形（用户选定）：width=2 只是初值，_make_square_button 按实测高迭代钉成正方形。
-        reload_btn = self._register(tk.Button(toolbar, text=RELOAD_GLYPH, width=2,
-                                              command=self._on_refresh_folders))
+        # 正方形（用户选定）：width=2 绕开 ttk 主题最小宽（width=0 时按钮被钉 87px，正方形数学失效），
+        # _make_square_button 再按 padding 像素精调。
+        reload_btn = self._register(ttk.Button(toolbar, text=RELOAD_GLYPH, width=2,
+                                               command=self._on_refresh_folders))
         _make_square_button(reload_btn)
         self.reload_btn = reload_btn
         reload_btn.pack(side="right", padx=(BTN_GAP, 0))   # 与左排至少 BTN_GAP（右贴工具栏内沿）
@@ -1292,6 +1370,12 @@ class BackupApp:
         # 树区宽度一变就重算名称截断（窗口缩放 / 分栏比例变化都从这里进，双向恢复全文）
         self.folder_canvas.bind("<Configure>", self._on_folder_canvas_configure)
         self.folder_ph = self._empty_hint(group, FOLDER_PLACEHOLDER_TEXT, 1, 0)
+        # 加载态（Q2）：拉取清单期间动画层盖住整个树区（含滚条列），树与旧内容不接受交互；
+        # 只 grid_remove 收放，树与滚条的格位参数不用动（_show_folder_loading）。
+        self.folder_loading = tk.Frame(group)
+        self.folder_loading_label = tk.Label(self.folder_loading, text=FOLDER_LOADING_TEXT)
+        self.folder_loading_label.pack(expand=True)
+        self._folder_loading_job = None
 
         # 滚轮只有一个入口：绑在 root 上（root 的路径是主窗口内所有控件的 toplevel bindtag）。
         # 绑在画布上只有画布自己那一小条空白生效——Tk 把事件投给指针正下方的控件、不冒泡，
@@ -1389,10 +1473,18 @@ class BackupApp:
         nav.configure(width=self._account_list_width)   # 独立记忆宽（用户选定），不跟设置左栏联动
         nav.pack_propagate(False)
         nav.pack(side="left", fill="y")
+        # 新增/删除占满账户列表的全部宽度（Q15）：两列等权各占一半，随列表宽度拖拽联动；
+        # 外边距 4px（Q1-A 按钮排基线，与备份页 全选/反选/清空 排净 4px 同值）
         tools = tk.Frame(nav)
         tools.pack(side="bottom", fill="x", padx=4, pady=4)
-        tk.Button(tools, text="新增", width=7, command=self._on_account_add).pack(side="left")
-        tk.Button(tools, text="删除", width=7, command=self._on_account_delete).pack(side="left", padx=(BTN_GAP, 0))
+        tools.columnconfigure(0, weight=1)
+        tools.columnconfigure(1, weight=1)
+        # ttk.Button：vista 主题原生观感（与自绘弹窗按钮同口径，Q4/Q5）；图标挂 _attach_button_icons。
+        # width=4 绕开 ttk 主题最小宽（width=0 时 87px 会把按钮撑出列表宽），内容长照样长
+        self.add_btn = ttk.Button(tools, text="新增", width=4, command=self._on_account_add)
+        self.add_btn.grid(row=0, column=0, sticky="we")
+        self.del_btn = ttk.Button(tools, text="删除", width=4, command=self._on_account_delete)
+        self.del_btn.grid(row=0, column=1, sticky="we", padx=(BTN_GAP, 0))
         # 列表 + 智能滚条：内容装不下才把滚条挂出来（与备份页账户列表同口径）
         area = tk.Frame(nav)
         area.pack(fill="both", expand=True)
@@ -1451,8 +1543,14 @@ class BackupApp:
         tk.Label(form, text="密码：").grid(row=4, column=0, sticky="e", padx=(0, 4), pady=3)
         self._acct_password_entry = tk.Entry(form, textvariable=self._acct_password_var, show="*")
         self._acct_password_entry.grid(row=4, column=1, columnspan=4, sticky="we", pady=3)
-        tk.Button(form, text="保存", width=10, command=self._on_account_save).grid(
-            row=5, column=1, sticky="w", pady=(6, 0))
+        # 保存反馈（Q5/Q9）：状态文案与保存按钮同排、贴在按钮旁 8px，约 3 秒自动消失
+        # 按钮自然宽（Q8）：与弹窗按钮、messagebox 同口径，不设 width=10
+        save_row = tk.Frame(form)
+        save_row.grid(row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Button(save_row, text="保存", command=self._on_account_save).pack(side="left")
+        self._account_save_status = tk.Label(save_row, text="")
+        self._account_save_status.pack(side="left", padx=(8, 0))
+        self._account_save_status_job = None
 
         for entry in [*form_entries, self._acct_password_entry]:
             for key in ("<Return>", "<KP_Enter>"):
@@ -1492,7 +1590,8 @@ class BackupApp:
         tk.Label(row, text="备份保存位置：").pack(side="left")
         self.backup_root_entry = tk.Entry(row, textvariable=self.backup_root_var)
         self.backup_root_entry.pack(side="left", fill="x", expand=True, padx=4)
-        tk.Button(row, text="浏览…", command=self._on_browse_backup_root).pack(side="left")
+        # width=4 绕开 ttk 主题最小宽（短文案被钉 87px），内容长照样长
+        ttk.Button(row, text="浏览…", width=4, command=self._on_browse_backup_root).pack(side="left")
         self.backup_root_entry.bind("<Button-3>", self._on_entry_context)
         tk.Label(body, text=BACKUP_ROOT_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
                  wraplength=TIP_WRAP).pack(fill="x", pady=(8, 0))
@@ -1683,7 +1782,7 @@ class BackupApp:
         log_toolbar = tk.Frame(log_frame)
         # 按钮与板面同一竖线；左/上留白与板面一样按 4px 统一（用户口径：按下边距统一）
         log_toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=4, pady=(4, 0))
-        tk.Button(log_toolbar, text="打开日志文件夹", command=self._on_open_log_dir).pack(side="left")
+        ttk.Button(log_toolbar, text="打开日志文件夹", command=self._on_open_log_dir).pack(side="left")
         # 日志板保留 Tk 自带的下沉边框：那圈凹陷边缘是「白色板面」的视觉标识，压平后白底与
         # 灰底直接相接很违和（用户复核，issues/15）。四周留出灰边距，免得这圈边缘与包裹边框
         # 贴成双线；右侧贴住滚条、不留缝。边距一律 4px：以原本最短的下边距为准（用户口径）。
@@ -1700,14 +1799,12 @@ class BackupApp:
         self.count_var = tk.StringVar(value=self._count_full)
         self.count_label = tk.Label(bar, textvariable=self.count_var, anchor="w")
         self.count_label.pack(side="left")
-        # 两个按钮都不给 -width：带图标的按钮里该选项按像素解释（纯文字时才按字符数），
-        # 写死就既不随 DPI 也不随文案长度走——实测 width=10 会把带图标的按钮塌到 18px。
-        # 交给 Tk 按「图标 + 文字」的内在尺寸算，缩放与文案变化都自动跟得上。
-        self.stop_btn = tk.Button(bar, text=STOP_BTN_LABEL, state="disabled", command=self._on_stop)
+        # 两颗按钮给 width=4：只为绕开 ttk 主题的 87px 最小宽（width=0 时「停止」这种短文案
+        # 也被钉 87px，挤扁计数行）；width 是字符数下限，加载态的长文案照样把按钮撑宽。
+        self.stop_btn = ttk.Button(bar, text=STOP_BTN_LABEL, width=4, state="disabled", command=self._on_stop)
         self.stop_btn.pack(side="right")
-        self.start_btn = tk.Button(bar, text=START_BTN_LABEL, command=self._on_start)
+        self.start_btn = ttk.Button(bar, text=START_BTN_LABEL, width=4, command=self._on_start)
         self.start_btn.pack(side="right", padx=(0, BTN_GAP))
-        self._attach_button_icons()
         # 进度条是这一行唯一可伸缩的控件：文字变长它先缩水，触及地板宽度后文字才截断
         self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)
         self.progress.pack(side="left", fill="x", expand=True, padx=(16, 8))
@@ -1732,18 +1829,26 @@ class BackupApp:
         msg_bar.pack_forget()
 
     def _attach_button_icons(self) -> None:
-        """给两个按钮挂上代码画的彩色图标（开始=绿三角、停止=红方块）。
+        """给带图标按钮挂上代码画的彩色图标（开始=绿三角、停止=红方块、新增=绿加号、删除=红叉）。
 
         Note:
             位图必须由 Python 侧持引用：Tkinter 不持引用，PhotoImage 一旦被 GC，按钮上的图标
             会变空白。blank_icon 是加载态的透明占位（见 _blank_icon），同样要持引用。
+            时机在设置页建完之后（新增/删除按钮在 `_build_settings_account` 里）。
         """
         size = _icon_size()
         self.start_icon = _play_icon(PLAY_ICON_COLOR, size)
         self.stop_icon = _stop_icon(STOP_ICON_COLOR, size)
         self.blank_icon = _blank_icon(size)
+        self.add_icon = _plus_icon(PLAY_ICON_COLOR, size)
+        self.del_icon = _cross_icon(STOP_ICON_COLOR, size)
+        # 灰度版（Q4）：ttk 主题只压暗按钮面、不给图片置灰，禁用时换挂灰度图
+        self.start_icon_off = _play_icon(ICON_DISABLED_COLOR, size)
+        self.stop_icon_off = _stop_icon(ICON_DISABLED_COLOR, size)
         self.start_btn.configure(image=self.start_icon, compound="left")
-        self.stop_btn.configure(image=self.stop_icon, compound="left")
+        self.stop_btn.configure(image=self.stop_icon_off, compound="left")   # 创建即禁用：先挂灰度
+        self.add_btn.configure(image=self.add_icon, compound="left")
+        self.del_btn.configure(image=self.del_icon, compound="left")
 
     # ------------------------------------------------------- connect handlers
 
@@ -1849,6 +1954,7 @@ class BackupApp:
         self._loading_folder_ids.add(account_id)
         threading.Thread(target=self._folder_worker,
                          args=(account_id, v, self._account_snapshot(account)), daemon=True).start()
+        self._sync_folder_loading_view()   # 加载态立即显示（Q3）：可见账户才盖动画层
 
     def _on_refresh_folders(self) -> None:
         """手动刷新（邮箱文件夹工具栏的 ⟳）：丢掉快照强制重拉，密码类失败照旧弹补录。
@@ -1870,6 +1976,50 @@ class BackupApp:
             return
         self.folder_ph.configure(text=text)
         self._toggle_hint(self.folder_ph, True)
+
+    def _show_folder_loading(self, show: bool) -> None:
+        """加载层的收放：盖在树区上方（Q2 的「整体替换」观感），收掉即恢复树与提示的原样。"""
+        self.folder_loading.grid_remove()
+        if show:
+            self.folder_loading.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            self.folder_loading.tkraise()
+
+    def _start_folder_loading(self) -> None:
+        """文件夹加载动画的帧链入口（防重复进入：旧 job 不取消会留下第二条帧链）。"""
+        if self._folder_loading_job is None:
+            self._folder_loading_tick(0)
+
+    def _folder_loading_tick(self, index: int) -> None:
+        """画第 index 帧；可见账户仍在拉取就排下一帧，否则收链（帧推进单独成方法，测试可直接驱动）。"""
+        if self._selected_account_id not in self._loading_folder_ids:
+            self._folder_loading_job = None
+            return
+        self.folder_loading_label.configure(
+            text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {FOLDER_LOADING_TEXT}")
+        self._folder_loading_job = self.root.after(SPINNER_INTERVAL_MS, self._folder_loading_tick, index + 1)
+
+    def _stop_folder_loading(self) -> None:
+        if self._folder_loading_job is not None:
+            self.root.after_cancel(self._folder_loading_job)
+            self._folder_loading_job = None
+
+    def _sync_folder_loading_view(self) -> None:
+        """加载态的唯一裁决点（Q8）：可见账户在拉清单就盖动画层并禁 ⟳，否则收掉恢复。
+
+        Note:
+            只跟随当前选中账户：别的账户在后台加载/完成都不打断眼前的树（切账户经
+            `_render_account_detail` 回到这里换视图）。⟳ 的禁用只管加载态；运行中的
+            配置锁由 `_set_config_enabled` 负责，两者不抢同一个 state。
+        """
+        loading = (self._selected_account_id is not None
+                   and self._selected_account_id in self._loading_folder_ids)
+        self._show_folder_loading(loading)
+        if not self.running:
+            self.reload_btn.configure(state="disabled" if loading else "normal")
+        if loading:
+            self._start_folder_loading()
+        else:
+            self._stop_folder_loading()
 
     def _maybe_prompt_folder_password(self, account_id: str) -> None:
         """密码类失败的补录入口：同账户同快照只弹一次（手动刷新清记忆后必再弹）。
@@ -1943,6 +2093,7 @@ class BackupApp:
         if account_id == self._selected_account_id:
             self._render_folder_tree(state)
             self._update_start_state()
+        self._sync_folder_loading_view()   # 收动画层；后台账户完成不打断可见账户的显示（Q8）
 
     def _on_folder_load_failed(self, account_id: str, message: str) -> None:
         """静默拉清单失败：写日志 + 文件夹区提示可刷新重试；密码类失败再弹补录窗。"""
@@ -1952,6 +2103,7 @@ class BackupApp:
         self.log.warning("账户 %s：文件夹清单加载失败（%s）", name, message)
         reason = message if len(message) <= FOLDER_FAIL_REASON_MAX else message[:FOLDER_FAIL_REASON_MAX] + ELLIPSIS
         self._show_folder_hint(account_id, FOLDER_LOAD_FAIL_HINT.format(reason=reason))
+        self._sync_folder_loading_view()   # 失败即退出加载态（Q4），旧树/提示恢复显示
         if _is_auth_failure(message):
             self._maybe_prompt_folder_password(account_id)
 
@@ -2383,6 +2535,7 @@ class BackupApp:
             self.mbox_var.set(False)
             self.eml_var.set(True)
             self._update_start_state()
+            self._sync_folder_loading_view()
             return
         self._render_folder_tree(state)
         self._render_messages(state)
@@ -2392,6 +2545,7 @@ class BackupApp:
         self.eml_var.set(bool(account.get("eml", True)))
         self._set_config_enabled(not self.running)
         self._update_start_state()
+        self._sync_folder_loading_view()   # 切账户换视图：目标账户在拉清单就盖动画层（Q8）
 
     def _render_card(self, account: dict | None) -> None:
         """只读信息卡：账户缺失时全部显示占位符；密码不在卡片上（只在设置页账户表单维护）。"""
@@ -2539,25 +2693,163 @@ class BackupApp:
         self._acct_ssl_var.set(not self._acct_ssl_var.get())
         self._on_acct_ssl_toggle()
 
+    def _ask_new_account(self) -> dict | None:
+        """新增账户弹窗（Q11–Q13）：自绘模态表单，返回填好的账户字段；取消/叉掉返回 None。
+
+        Note:
+            展示与决策分离：测试替换本方法即可绕开真实 Toplevel（与 `_ask_close_action` 同口径）。
+            与编辑表单不同：密码框没有掩码哨兵（新账户没有已存密码），空 = 不设密码。
+            保存成功在保存按钮旁闪「已保存」，约 0.8 秒后自动关窗（Q13）；校验失败红字留在窗内。
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(NEW_ACCOUNT_DLG_TITLE)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        result: list[dict] = []
+        name_var, user_var, server_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        ssl_var = tk.BooleanVar(value=DEFAULT_ACCOUNT_SSL)
+        port_var = tk.StringVar(value=DEFAULT_ACCOUNT_PORT)
+        password_var = tk.StringVar()
+        body = tk.Frame(dialog)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        form = tk.Frame(body)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        # 行序与设置页表单一致（邮箱类型置顶，SSL 与端口并进服务器行）
+        tk.Label(form, text="邮箱类型：").grid(row=0, column=0, sticky="e", padx=(0, 4), pady=3)
+        tk.Label(form, text=MAIL_TYPE_TEXT, anchor="w").grid(row=0, column=1, columnspan=4, sticky="w", pady=3)
+        entries = [self._account_form_row(form, 1, "名称：", name_var),
+                   self._account_form_row(form, 2, "邮箱地址：", user_var)]
+        entries.append(self._account_form_row(form, 3, "收件服务器：", server_var))
+        ssl_chip = tk.Label(form, text=SSL_CHIP_TEXT, padx=6, pady=1, cursor="hand2")
+        ssl_chip.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=3)
+
+        def on_ssl_click(_event=None) -> None:
+            ssl_var.set(not ssl_var.get())
+            if port_var.get().strip() in ("993", "143"):   # 只联动默认端口（与编辑表单同规则）
+                port_var.set("993" if ssl_var.get() else "143")
+            self._style_ssl_chip(ssl_chip, ssl_var.get())
+
+        ssl_chip.bind("<Button-1>", on_ssl_click)
+        self._style_ssl_chip(ssl_chip, ssl_var.get())
+        tk.Label(form, text="端口：").grid(row=3, column=3, sticky="e", padx=(4, 4), pady=3)
+        port_entry = tk.Entry(form, textvariable=port_var, width=7)
+        port_entry.grid(row=3, column=4, sticky="w", pady=3)
+        entries.append(port_entry)
+        tk.Label(form, text="密码：").grid(row=4, column=0, sticky="e", padx=(0, 4), pady=3)
+        password_entry = tk.Entry(form, textvariable=password_var, show="*")
+        password_entry.grid(row=4, column=1, columnspan=4, sticky="we", pady=3)
+        entries.append(password_entry)
+
+        # 按钮排（messagebox 口径）：整排居中（用户选定），状态文案贴保存按钮左侧 8px（Q13），
+        # [保存/取消] 等宽（_make_equal_button_row）；与文案同排时包一层内容宽 group 整体居中
+        buttons = tk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        center = tk.Frame(buttons)
+        center.pack(anchor="center")
+        status = tk.Label(center, text="")
+        status.pack(side="left", padx=(0, 8))
+
+        def do_save() -> None:
+            user = user_var.get().strip()
+            server = server_var.get().strip()
+            if not user:
+                status.configure(text=SAVE_STATUS_FAIL_PREFIX + "请填写邮箱地址。", foreground=STATUS_ERR_FG)
+                return
+            if not server:
+                status.configure(text=SAVE_STATUS_FAIL_PREFIX + "请填写收件服务器。", foreground=STATUS_ERR_FG)
+                return
+            try:
+                port = int(port_var.get().strip())
+                if not 0 < port < 65536:
+                    raise ValueError
+            except ValueError:
+                status.configure(text=SAVE_STATUS_FAIL_PREFIX + "端口必须是 1-65535 的整数。",
+                                 foreground=STATUS_ERR_FG)
+                return
+            fields = {"name": name_var.get().strip(), "user": user, "server": server,
+                      "ssl": bool(ssl_var.get()), "port": str(port)}
+            password = password_var.get()
+            cipher = _dpapi_encrypt(password) if password and sys.platform == "win32" else None
+            if password and cipher is None:
+                # 与编辑保存同语义：其余字段照存，只是密码没落盘
+                status.configure(text="密码加密失败，本次未保存密码。", foreground=STATUS_ERR_FG)
+            else:
+                status.configure(text=SAVE_STATUS_OK_TEXT, foreground=STATUS_OK_FG)
+            if cipher:
+                fields["password_dpapi"] = cipher
+            result.append(fields)
+            save_btn.state(["disabled"])   # 防重复提交（ttk state 口径）
+            dialog.after(NEW_ACCOUNT_DIALOG_CLOSE_DELAY_MS, dialog.destroy)
+
+        save_btn, _cancel_btn = _make_equal_button_row(
+            center, [("保存", do_save), (CANCEL_BTN_TEXT, dialog.destroy)])
+        for entry in entries:
+            for key in ("<Return>", "<KP_Enter>"):
+                entry.bind(key, lambda _e: do_save())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        self._center_on_root(dialog)   # 弹窗居中到主窗口（与其余自绘弹窗同一助手）
+        save_btn.focus_set()           # 默认按钮 = 保存（Q6/Q9）：Enter 触发主操作
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return result[0] if result else None
+
     def _on_account_add(self) -> None:
-        """新增一个空账户并立刻落盘：先有账户，再去表单里填连接信息。"""
+        """新增账户（Q11）：弹窗填表单，叉掉/取消零副作用；保存成功入库并选中、静默补拉清单。"""
+        fields = self._ask_new_account()
+        if fields is None:
+            return
         account = new_account()
+        account.update(fields)
         self.accounts.append(account)
         self._refresh_edit_list(account["id"])   # 勾选默认态由 _refresh_account_list 统一给出
+        self._switch_account(account["id"])      # 新账户进列表并选中（Q13）
         self._refresh_account_list()
-        if self._selected_account_id is None:
-            self._switch_account(account["id"])
         self._save_column_config()
+        self._maybe_load_folders(account["id"])  # 加载态动画随即出现在文件夹卡
         self.log.info("新增账户 %s", account_display(account))
+
+    def _ask_delete_account(self, account: dict) -> bool:
+        """删除确认自绘弹窗（Q14）：居中到主窗口，X/Esc = 不删。
+
+        Note:
+            展示与决策分离：测试替换本方法即可绕开真实 Toplevel（与 `_ask_close_action` 同口径）。
+            自绘的原因：系统 messagebox 的居中不保证落在主窗口内，本家族一律 `_center_on_root`。
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(DELETE_DLG_TITLE)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        answer: list[bool] = []
+        body = tk.Frame(dialog)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        tk.Label(body, text=DELETE_DLG_TEXT.format(name=account_display(account)),
+                 justify="left", anchor="w").pack(fill="x")
+        buttons = tk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+
+        def choose(ok: bool) -> None:
+            answer.append(ok)
+            dialog.destroy()
+
+        # 视觉序「取消 / 删除」：主操作最右（与关闭询问家族一致）；等宽、整排居中（用户选定）
+        cancel_btn, _del_btn = _make_equal_button_row(
+            buttons, [(CANCEL_BTN_TEXT, lambda: choose(False)), (DELETE_DLG_CONFIRM, lambda: choose(True))])
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        self._center_on_root(dialog)   # 弹窗居中到主窗口（与其余自绘弹窗同一助手）
+        cancel_btn.focus_set()         # 默认按钮给安全侧（Q6）：回车不误删
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return answer[0] if answer else False
 
     def _on_account_delete(self) -> None:
         """删除当前编辑的账户；磁盘上已备份的邮件不归这里管。"""
         account = self._find_account(self._editing_account_id)
         if account is None:
             return
-        if not messagebox.askokcancel("删除账户",
-                                      f"确定删除账户「{account_display(account)}」吗？\n"
-                                      "已备份到磁盘的邮件不会被删除。", parent=self.root):
+        if not self._ask_delete_account(account):
             return
         self.accounts.remove(account)
         self._states.pop(account["id"], None)
@@ -2570,25 +2862,41 @@ class BackupApp:
         self._save_column_config()
         self.log.info("删除账户 %s", account_display(account))
 
+    def _show_account_save_status(self, text: str, ok: bool) -> None:
+        """保存反馈（Q5/Q9/Q10）：保存按钮旁的状态文案，约 3 秒自动消失；重复保存重置计时。"""
+        self._account_save_status.configure(text=text, foreground=STATUS_OK_FG if ok else STATUS_ERR_FG)
+        if self._account_save_status_job is not None:
+            self.root.after_cancel(self._account_save_status_job)
+        self._account_save_status_job = self.root.after(SAVE_STATUS_CLEAR_MS, self._clear_account_save_status)
+
+    def _clear_account_save_status(self) -> None:
+        self._account_save_status_job = None
+        self._account_save_status.configure(text="")
+
     def _on_account_save(self) -> None:
-        """校验并保存当前编辑的账户；密码框原样（掩码）= 不修改，清空 = 删除已存密码。"""
+        """校验并保存当前编辑的账户；密码框原样（掩码）= 不修改，清空 = 删除已存密码。
+
+        Note:
+            校验与保存结果一律用保存按钮旁的状态文案反馈（Q10 收口，不再弹 messagebox）；
+            只陈述保存本身，保存后自动重拉的加载态是另一套反馈（Q6）。
+        """
         account = self._find_account(self._editing_account_id)
         if account is None:
             return
         user = self._acct_user_var.get().strip()
         server = self._acct_server_var.get().strip()
         if not user:
-            messagebox.showwarning("信息不完整", "请填写邮箱地址。", parent=self.root)
+            self._show_account_save_status(SAVE_STATUS_FAIL_PREFIX + "请填写邮箱地址。", ok=False)
             return
         if not server:
-            messagebox.showwarning("信息不完整", "请填写收件服务器。", parent=self.root)
+            self._show_account_save_status(SAVE_STATUS_FAIL_PREFIX + "请填写收件服务器。", ok=False)
             return
         try:
             port = int(self._acct_port_var.get().strip())
             if not 0 < port < 65536:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("端口无效", "端口必须是 1-65535 的整数。", parent=self.root)
+            self._show_account_save_status(SAVE_STATUS_FAIL_PREFIX + "端口必须是 1-65535 的整数。", ok=False)
             return
         password = self._acct_password_var.get()
         if password == PASSWORD_MASK_TEXT:
@@ -2596,7 +2904,8 @@ class BackupApp:
         elif password:
             cipher = _dpapi_encrypt(password) if sys.platform == "win32" else None
             if cipher is None:
-                messagebox.showwarning("无法保存密码", "密码加密失败，本次未保存密码。", parent=self.root)
+                # 半保存语义不变：其余字段照存，只是密码没落盘——红字说清楚是哪一半
+                self._show_account_save_status("密码加密失败，本次未保存密码。", ok=False)
             else:
                 account["password_dpapi"] = cipher
         else:
@@ -2611,6 +2920,7 @@ class BackupApp:
         if account["id"] == self._selected_account_id:
             self._render_card(account)
         self._save_column_config()
+        self._show_account_save_status(SAVE_STATUS_OK_TEXT, ok=True)   # 只报保存本身（Q6）
         self._maybe_load_folders(account["id"])   # 保存后静默补拉该账户的文件夹清单
         self.log.info("保存账户 %s（%s）", account_display(account), user)
 
@@ -3221,9 +3531,12 @@ class BackupApp:
               and (self.mbox_var.get() or self.eml_var.get())
               and not self.running)
         self.start_btn.configure(state="normal" if ok else "disabled")
+        if not self.running:
+            # 图标随可用性换彩色/灰度（Q4）；运行中图标归 spinner 的透明占位，不碰
+            self.start_btn.configure(image=self.start_icon if ok else self.start_icon_off)
         self.backup_selected_btn.configure(state="normal" if self.accounts and not self.running else "disabled")
 
-    def _set_loading_frame(self, button: tk.Button, label: str, index: int) -> None:
+    def _set_loading_frame(self, button: ttk.Button, label: str, index: int) -> None:
         """把按钮画成加载态的第 index 帧（开始/停止按钮的转圈共用这一个入口）。
 
         Args:
@@ -3273,12 +3586,20 @@ class BackupApp:
             self._run_spinner_job = None
 
     def _restore_start_button(self) -> None:
-        """回到静止态：文案与绿三角一并回位（完成/停止/失败三条结局与帧链自愈分支都收口到这里）。"""
-        self.start_btn.configure(text=START_BTN_LABEL, image=self.start_icon)
+        """回到静止态：文案与图标一并回位，图标按可用性取彩色/灰度（完成/停止/失败与帧链自愈收口）。"""
+        self.start_btn.configure(
+            text=START_BTN_LABEL,
+            image=self.start_icon if widget_state(self.start_btn) != "disabled" else self.start_icon_off)
 
     def _restore_stop_button(self) -> None:
-        """回到静止态：文案与红方块一并回位（与 _restore_start_button 成对、同两个收口点）。"""
-        self.stop_btn.configure(text=STOP_BTN_LABEL, image=self.stop_icon)
+        """回到静止态：文案与图标一并回位（与 _restore_start_button 成对、同两个收口点）。
+
+        Note:
+            静止的停止按钮永远是禁用态，图标取灰度版（Q4）。
+        """
+        self.stop_btn.configure(
+            text=STOP_BTN_LABEL,
+            image=self.stop_icon if widget_state(self.stop_btn) != "disabled" else self.stop_icon_off)
 
     def _set_config_enabled(self, enabled: bool) -> None:
         for widget, default_state in self._config_widgets:
@@ -3316,7 +3637,7 @@ class BackupApp:
         self._set_config_enabled(False)
         self._start_run_spinner()
         self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self.stop_btn.configure(state="normal", image=self.stop_icon)   # 启用即彩色（Q4）
         self.notebook.select(0)
 
     def _on_start(self) -> None:
@@ -3376,8 +3697,8 @@ class BackupApp:
             （真机实测 8px 边框 + 31px 标题栏）——直接套「root 中心 - 弹窗一半」的公式会整体偏右下
             一截。这里先 withdraw 着摆一次 +0+0 量出装饰偏移，再按客户区中心反推外框坐标，
             实测落点误差 0px；弹窗全程未显示过，不会闪。调用时机在弹窗内容建完之后、grab/wait 之前。
-            系统 messagebox/filedialog 是原生对话框、随 owner（parent=self.root）居中，不用这里管；
-            悬停气泡跟随鼠标，也不走这里。
+            系统 messagebox/filedialog 走原生居中、不保证落在主窗口内，本助手只管自绘弹窗
+            （删除确认已并入自绘家族）；悬停气泡跟随鼠标，也不走这里。
         """
         win.withdraw()
         win.update_idletasks()
@@ -3423,8 +3744,8 @@ class BackupApp:
             status = tk.Label(line, text=PREFLIGHT_ROW_WAIT, anchor="w", foreground=EMPTY_HINT_FG)
             status.pack(side="left", fill="x", expand=True)
             rows[snapshot["id"]] = status
-        tk.Button(body, text=PREFLIGHT_CANCEL_BTN,
-                  command=self._cancel_preflight).pack(pady=(12, 0))
+        ttk.Button(body, text=PREFLIGHT_CANCEL_BTN,
+                   command=self._cancel_preflight).pack(pady=(12, 0))
         self._center_on_root(win)   # 弹窗居中到主窗口（内容建完后量真实尺寸）
         win.protocol("WM_DELETE_WINDOW", self._cancel_preflight)
         self._preflight = {"win": win, "rows": rows, "snapshots": snapshots,
@@ -3567,8 +3888,8 @@ class BackupApp:
             result["value"] = None
             win.destroy()
 
-        tk.Button(buttons, text=PASSWORD_RETRY_BTN, command=retry).pack(side="left")
-        tk.Button(buttons, text=PASSWORD_SKIP_BTN, command=skip).pack(side="left", padx=(BTN_GAP, 0))
+        # [重试/跳过] 等宽、整排居中（用户选定）；初始焦点照旧给密码输入框
+        _make_equal_button_row(buttons, [(PASSWORD_RETRY_BTN, retry), (PASSWORD_SKIP_BTN, skip)])
         self._center_on_root(win)   # 弹窗居中到主窗口（内容建完后量真实尺寸）
         win.protocol("WM_DELETE_WINDOW", skip)
         entry.focus_set()
@@ -4227,12 +4548,14 @@ class BackupApp:
             answer.append((action, bool(remember_var.get())))
             dialog.destroy()
 
-        tk.Button(buttons, text=CLOSE_DLG_EXIT, command=lambda: choose(CLOSE_ACTION_EXIT)).pack(side="right")
-        tk.Button(buttons, text=CLOSE_DLG_HIDE,
-                  command=lambda: choose(CLOSE_ACTION_TRAY)).pack(side="right", padx=(0, BTN_GAP))
+        # 视觉序「隐藏到后台 / 退出程序」：主操作（退出）最右；等宽、整排居中（用户选定）
+        hide_btn, _exit_btn = _make_equal_button_row(
+            buttons, [(CLOSE_DLG_HIDE, lambda: choose(CLOSE_ACTION_TRAY)),
+                      (CLOSE_DLG_EXIT, lambda: choose(CLOSE_ACTION_EXIT))])
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         self._center_on_root(dialog)   # 弹窗居中到主窗口（与其余自绘弹窗同一助手）
+        hide_btn.focus_set()           # 默认按钮给安全侧（Q6）：回车=隐藏而非退出
         dialog.grab_set()
         self.root.wait_window(dialog)
         return answer[0] if answer else None
