@@ -126,8 +126,20 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * The backup page is a two-pane layout: the account list on the left, the selected account's detail on the right. The detail shows the connection information and the backup root as a read-only card — no text fields — and the only editable controls are the mbox/eml format checkboxes and the folder selection tree, both stored per account.
 * The account list scrolls on its own once the accounts no longer fit the pane; the scrollbar only appears then, and the mouse wheel moves it one row per notch.
 * Each account keeps its own folder selection (defaults to INBOX for a new account), message list, counts, progress and status; switching accounts does not interrupt a connection or a run in progress.
-* "备份所选" backs up every checked account in list order, one after another. Each row carries a checkbox and 全选/反选/清空 switch the whole set; a new or restored account starts checked, and the set is UI state that is not written to the settings file. A failing account is logged and reported without stopping the rest; Stop finishes the current message and skips the remaining accounts.
+* "备份所选" backs up every checked account; each row carries a checkbox and 全选/反选/清空 switch the whole set; a new or restored account starts checked, and the set is UI state that is not written to the settings file. A failing account is logged and reported without stopping the rest; Stop finishes the current message and stops all accounts.
 * The account name is a display-only label: renaming it never moves existing backups or causes messages to be downloaded again.
+
+**Connection folded into the backup run**
+
+* There is no separate "connect" button any more. Folder lists load silently in the background (on startup, on switching accounts, and after saving an account), so the folder tree simply fills in on its own; a failure only writes to the run log.
+* Starting a backup first opens a connection-check dialog that probes each account in turn (sign in, list folders, sign out) and shows per-account status. Only after every account checks out does the dialog close on its own and the accounts sync **concurrently** — each with its own IMAP connection.
+* A wrong (or missing) password opens a password prompt: type the right one and retry that account, or skip it and carry on with the rest. A "save password" checkbox (checked by default) stores it encrypted; leaving it unchecked uses the password only for this run. Closing the check dialog cancels the whole backup.
+* Run log lines from concurrent accounts carry an account-name prefix so interleaved output stays readable; the mail list shows only the selected account's messages and switches with the selection.
+
+**Resizable sidebars and capped layout**
+
+* The backup page's account list and the settings page's left bar can each be dragged at their right edge to resize (120–320 px, default 160); each remembers its own width across sessions.
+* Card values and the account form no longer stretch to fill a maximized window: values cap at 620px and the form block at 640px, long values truncate with a hover tooltip, and the two upper cards line up on a shared bottom edge.
 
 **Background backup and the tray**
 
