@@ -1057,12 +1057,13 @@ class BackupApp:
         tool_actions = (("全选", lambda: self._set_all_account_checks(True)),
                         ("反选", self._invert_account_checks),
                         ("清空", lambda: self._set_all_account_checks(False)))
-        # 三个按钮都给 width=4：ttk 主题在 width=0 时强制 87px 最小宽（实测），会把工具排
-        # 撑出 160px 侧栏；width 是字符数下限，内容更长时照样长，不会截字。
+        # 三格视觉等宽由 grid uniform 列 + sticky="we" 强制分配，与按钮自身请求宽无关；
+        # width 只给负值（-1＝至少 1 字符、内容更长照长）：正 width 是固定文本槽，短中文案
+        # 超出槽宽会被直接裁切（正 4 槽约 28px，放两字 CJK 勉强、放「浏览…」这类必裁）。
         for column, (label, command) in enumerate(tool_actions):
             tools.columnconfigure(column, weight=1, uniform="account-tools")  # 三格等宽
-            ttk.Button(tools, text=label, width=4, command=command).grid(row=0, column=column, sticky="we",
-                                                                         padx=BTN_GAP // 2)   # 两侧各一半=BTN_GAP
+            ttk.Button(tools, text=label, width=-1, command=command).grid(row=0, column=column, sticky="we",
+                                                                          padx=BTN_GAP // 2)  # 两侧各一半=BTN_GAP
         # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
         self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
         tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
@@ -1338,14 +1339,16 @@ class BackupApp:
         toolbar = tk.Frame(group)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="we", padx=CARD_PAD, pady=(CARD_PAD, 0))
         self._folder_toolbar = toolbar   # 拖拽钳制按它的实测请求宽反推右栏最小宽（见 _backup_detail_min_width）
-        self._register(ttk.Button(toolbar, text="全选", width=7, command=lambda: self._set_all_folders(True))).pack(side="left")
-        self._register(ttk.Button(toolbar, text="清空", width=7,
+        # width=-7＝文本槽下限 7 字符（约 59px）：三颗取同一下限保持等宽整齐，「仅收件箱」
+        # 更长也不会被裁；负号让槽只做下限、不做上限（正数是固定槽，长文案必被裁）。
+        self._register(ttk.Button(toolbar, text="全选", width=-7, command=lambda: self._set_all_folders(True))).pack(side="left")
+        self._register(ttk.Button(toolbar, text="清空", width=-7,
                                   command=lambda: self._set_all_folders(False))).pack(side="left", padx=(BTN_GAP, 0))
-        self._register(ttk.Button(toolbar, text="仅收件箱", width=7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
+        self._register(ttk.Button(toolbar, text="仅收件箱", width=-7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
         # 刷新入口（icon-only）：静默加载失败后唯一的手动重试入口，右对齐与文件夹工具同排。
-        # 正方形（用户选定）：width=2 绕开 ttk 主题最小宽（width=0 时按钮被钉 87px，正方形数学失效），
-        # _make_square_button 再按 padding 像素精调。
-        reload_btn = self._register(ttk.Button(toolbar, text=RELOAD_GLYPH, width=2,
+        # 正方形（用户选定）完全靠 _make_square_button 的 padding 像素精调；width=0 让按钮
+        # 先按 ⟳ 单字形取自然请求宽，padding 再补成精确正方形（实测误差 0px）。
+        reload_btn = self._register(ttk.Button(toolbar, text=RELOAD_GLYPH, width=0,
                                                command=self._on_refresh_folders))
         _make_square_button(reload_btn)
         self.reload_btn = reload_btn
@@ -1480,10 +1483,10 @@ class BackupApp:
         tools.columnconfigure(0, weight=1)
         tools.columnconfigure(1, weight=1)
         # ttk.Button：vista 主题原生观感（与自绘弹窗按钮同口径，Q4/Q5）；图标挂 _attach_button_icons。
-        # width=4 绕开 ttk 主题最小宽（width=0 时 87px 会把按钮撑出列表宽），内容长照样长
-        self.add_btn = ttk.Button(tools, text="新增", width=4, command=self._on_account_add)
+        # 两格视觉等宽由 grid uniform 列分配；width=-1 只做下限，避免正 width 固定槽裁 CJK 文案。
+        self.add_btn = ttk.Button(tools, text="新增", width=-1, command=self._on_account_add)
         self.add_btn.grid(row=0, column=0, sticky="we")
-        self.del_btn = ttk.Button(tools, text="删除", width=4, command=self._on_account_delete)
+        self.del_btn = ttk.Button(tools, text="删除", width=-1, command=self._on_account_delete)
         self.del_btn.grid(row=0, column=1, sticky="we", padx=(BTN_GAP, 0))
         # 列表 + 智能滚条：内容装不下才把滚条挂出来（与备份页账户列表同口径）
         area = tk.Frame(nav)
@@ -1590,8 +1593,8 @@ class BackupApp:
         tk.Label(row, text="备份保存位置：").pack(side="left")
         self.backup_root_entry = tk.Entry(row, textvariable=self.backup_root_var)
         self.backup_root_entry.pack(side="left", fill="x", expand=True, padx=4)
-        # width=4 绕开 ttk 主题最小宽（短文案被钉 87px），内容长照样长
-        ttk.Button(row, text="浏览…", width=4, command=self._on_browse_backup_root).pack(side="left")
+        # width=-1 贴内容（「浏览…」三字带省略号，正 width=4 固定槽实测裁掉尾字）
+        ttk.Button(row, text="浏览…", width=-1, command=self._on_browse_backup_root).pack(side="left")
         self.backup_root_entry.bind("<Button-3>", self._on_entry_context)
         tk.Label(body, text=BACKUP_ROOT_HINT_TEXT, justify="left", anchor="w", foreground=EMPTY_HINT_FG,
                  wraplength=TIP_WRAP).pack(fill="x", pady=(8, 0))
@@ -1799,11 +1802,14 @@ class BackupApp:
         self.count_var = tk.StringVar(value=self._count_full)
         self.count_label = tk.Label(bar, textvariable=self.count_var, anchor="w")
         self.count_label.pack(side="left")
-        # 两颗按钮给 width=4：只为绕开 ttk 主题的 87px 最小宽（width=0 时「停止」这种短文案
-        # 也被钉 87px，挤扁计数行）；width 是字符数下限，加载态的长文案照样把按钮撑宽。
-        self.stop_btn = ttk.Button(bar, text=STOP_BTN_LABEL, width=4, state="disabled", command=self._on_stop)
+        # 两颗按钮 width=-1：负 width 是文本槽下限（至少 1 字符），按钮请求宽随当前文案+图标
+        # 贴合——静止态「开始备份」74px/「停止」50px，加载态长文案「⠋ 正在备份/停止…」长到 97px。
+        # 不能用正 width（如 4）：正数是固定槽（约 4 个 avgchar=28px），长文案被标签元素直接
+        # 裁切、按钮也不会被撑宽（旧注释「下限、照样撑宽」是错的，实测）。盲文转圈 10 帧等宽，
+        # 帧内不横跳，宽度只在状态切换瞬间变一次；pack(side=right) 变宽时向左生长，进度条让宽。
+        self.stop_btn = ttk.Button(bar, text=STOP_BTN_LABEL, width=-1, state="disabled", command=self._on_stop)
         self.stop_btn.pack(side="right")
-        self.start_btn = ttk.Button(bar, text=START_BTN_LABEL, width=4, command=self._on_start)
+        self.start_btn = ttk.Button(bar, text=START_BTN_LABEL, width=-1, command=self._on_start)
         self.start_btn.pack(side="right", padx=(0, BTN_GAP))
         # 进度条是这一行唯一可伸缩的控件：文字变长它先缩水，触及地板宽度后文字才截断
         self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=1)

@@ -1201,6 +1201,64 @@ def test_loading_buttons_keep_their_height(app):
     assert_start_button_idle(app)
 
 
+def test_run_buttons_fit_each_state_and_hold_width_across_frames(app):
+    """开始/停止按钮宽度逐态贴合文案（不裁切），转圈 10 帧间宽度恒定。
+
+    回归自：正 width=4 是固定文本槽（约 4 个 avgchar ≈ 28px），「⠋ 正在停止…」要约 97px，
+    被标签元素裁成「⠋ 正在…」，且按钮不会被撑宽（旧注释误把正 width 当下限）。改负 width 后
+    请求宽随文案贴合：每态都与同文案/同图标的临时参照按钮（同主题同 chrome、width=-1）等宽；
+    盲文各帧等宽，帧推进按钮不许左右横跳，宽度只在状态切换瞬间变一次。
+    """
+    app.root.geometry("960x736")
+
+    def fit_width(text, image):
+        """同内容参照按钮的贴内容请求宽（量完即销，不留在控件树里）。"""
+        ref = ttk.Button(app.root, text=text, image=image, compound="left", width=-1)
+        app.root.update_idletasks()
+        width = ref.winfo_reqwidth()
+        ref.destroy()
+        return width
+
+    def assert_hugs(btn, text, image):
+        app.root.update_idletasks()
+        assert btn.winfo_reqwidth() == fit_width(text, image), (
+            text, btn.winfo_reqwidth(), fit_width(text, image))
+
+    # 静止态：开始钮图标按可用性取彩色/灰度，直接拿它当前挂的图
+    assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
+    assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_btn.cget("image"))
+
+    # 运行态：开始钮挂透明占位 + 转圈文案；停止钮彩色方块，两钮都贴各自内容
+    app.running = True
+    app._begin_run_ui()
+    app._stop_run_spinner()
+    running_text = f"{g.SPINNER_FRAMES[0]} {g.RUNNING_BTN_LABEL}"
+    assert str(app.start_btn.cget("text")) == running_text
+    assert_hugs(app.start_btn, running_text, app.blank_icon)
+    assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_icon)
+
+    # 停止态：转圈挪到停止钮。逐帧量宽——10 帧必须同一个请求宽（帧内零横跳）
+    app._on_stop()
+    frame_widths = set()
+    for index in range(len(g.SPINNER_FRAMES)):
+        app._run_spinner_tick(index)
+        app.root.update_idletasks()
+        frame_widths.add(app.stop_btn.winfo_reqwidth())
+        app._stop_run_spinner()   # 取消该帧刚排的下一帧，不留游离 after
+    assert len(frame_widths) == 1, frame_widths
+    stopping_text = f"{g.SPINNER_FRAMES[0]} {g.STOPPING_BTN_LABEL}"
+    assert_hugs(app.stop_btn, stopping_text, app.blank_icon)
+    # 动态变宽真实发生：停止态明显宽于静止态，而不是一直被钉在短槽里
+    assert app.stop_btn.winfo_reqwidth() > fit_width(g.STOP_BTN_LABEL, app.stop_icon_off) + 20
+    # 开始钮已复位静止，依旧贴合
+    assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
+
+    app._end_run_controls()
+    app.root.update_idletasks()
+    assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
+    assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_btn.cget("image"))
+
+
 def test_row_selection_clears_on_click_outside(app):
     """选中高亮只属于「刚点过的那一行」：点非行区域即清空；换选、Ctrl 多选与列表滚条是例外。
 
@@ -3089,3 +3147,19 @@ def test_all_buttons_are_themed(app):
     """所有按钮都是 ttk.Button（Q3 硬契约）：全应用不再有经典立体按钮残留。"""
     classics = [w for w in descendants(app.root) if isinstance(w, tk.Button)]
     assert classics == [], [str(w) for w in classics]
+
+
+def test_all_ttk_buttons_use_flexible_width(app):
+    """width 硬契约：正 width 是固定文本槽（avgchar 倍数），CJK 文案超出即裁切且不撑宽。
+
+    全库按钮只许 width≤0：0＝按内容自然宽（⟳ 再经 _make_square_button 的 padding 补成正方形），
+    负数＝字符数下限（-1 贴内容、文件夹工具栏 -7 保三颗等宽）。回归自开始/停止/浏览按钮被裁。
+    """
+    offenders = []
+    for w in descendants(app.root):
+        if isinstance(w, ttk.Button):
+            raw = str(w.cget("width"))
+            width = int(raw) if raw else 0
+            if width > 0:
+                offenders.append((str(w.cget("text")), raw))
+    assert offenders == [], offenders

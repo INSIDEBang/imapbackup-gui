@@ -53,15 +53,15 @@
 
 - 开始与停止图标由 `PhotoImage` 在代码中生成，不增加图片资产；Python 侧必须持有引用，避免图标被垃圾回收。
 - **图标语言**：开始=绿三角、停止=红方块、新增=绿加号、删除=红叉（`_plus_icon`/`_cross_icon`，笔画粗 `ICON_STROKE`、内缩同方块）；色板只用 `PLAY_ICON_COLOR`/`STOP_ICON_COLOR`/`ICON_DISABLED_COLOR`、边长一律 `_icon_size()`，全部由 `_attach_button_icons` **统一挂载**（`compound="left"`，时机在两页建完之后——新增/删除按钮在设置页里，早挂会 AttributeError）。**禁用换灰度图**（ttk 主题只压暗按钮面、不给图片置灰）：`start_icon_off`/`stop_icon_off` 在状态写点换挂，`_restore_start_button`/`_restore_stop_button`/`_update_start_state` 按可用性取彩色/灰度。
-- **按钮一律 `ttk.Button`**（vista 主题原生观感，与系统 messagebox 同视觉；`test_all_buttons_are_themed` 守「无经典 tk.Button 残留」）。**ttk 主题有 87px 最小宽**：`width=0` 时按钮被钉 87px（短文案的「停止」也 87px，实测挤扁计数行、撑爆工具栏），**短文案按钮一律给小 `width=` 绕开**（width 是字符数下限，内容更长照样长）：工具栏三颗 `width=7`（≈59px 旧观感）、⟳ `width=2`、开始/停止/新增/删除/浏览… `width=4`。弹窗按钮排不设 width（87px 下限恰是 messagebox 按钮观感）。弹窗按钮排一律走 `_make_equal_button_row`：同排**等宽**（grid uniform 列取组内最宽自然宽、`sticky="we"` 铺满）、**整排居中**（`pack(anchor="center")`，容器要 `fill="x"`；与状态文案同排时包一层内容宽 group 整体居中）、两侧各 `BTN_GAP//2` 合成 4px 相邻间距——**不对称 padx 会让末颗宽一截**（回归自等宽断言炸掉，这也是 gui.md grid 间隔口径的由来）。**默认按钮**聚焦呈现（vista 主题画不进 messagebox 那圈蓝描边，行为语义靠焦点承载）：新增弹窗=保存、删除确认/关闭询问=安全侧（取消/隐藏到后台），密码补录焦点照旧在密码框；Enter 触发主操作、Esc 走安全侧。
+- **按钮一律 `ttk.Button`**（vista 主题原生观感，与系统 messagebox 同视觉；`test_all_buttons_are_themed` 守「无经典 tk.Button 残留」）。**width 语义（实测 Tk 8.6/vista）**：正数＝**固定**文本槽（avgchar 倍数，正 4 约 28px），CJK 文案超出槽宽被标签元素直接裁切、按钮也不会被撑宽（「浏览…」、加载态「⠋ 正在停止…」都这么被裁过）；`0`＝按内容自然宽；**负数＝字符数下限**（至少 N 字符、内容更长照长）。旧版注释里「`width=0` 被钉 87px 最小宽」在已映射窗口上不复现（短文案 width=0 即贴内容），但带图标按钮在未映射控件上量到过该宽度，所以**短文案按钮统一给负 width 双保险**：开始/停止 `width=-1`（逐态贴合：静止 74/50px、加载态长文案 97px，宽度只在状态切换瞬间变一次，盲文帧等宽不横跳，`pack(side=right)` 变宽向左生长）、新增/删除/浏览…/账户列表三键 `width=-1`（网格键的视觉等宽由 uniform 列保证，与 width 无关）、邮箱文件夹工具栏三颗 `width=-7`（同下限保三颗等宽 ≈59px）；⟳ `width=0`；弹窗按钮排不设 width（自然宽恰是 messagebox 观感）。硬契约见 `test_all_ttk_buttons_use_flexible_width`（全库按钮 width≤0）。弹窗按钮排一律走 `_make_equal_button_row`：同排**等宽**（grid uniform 列取组内最宽自然宽、`sticky="we"` 铺满）、**整排居中**（`pack(anchor="center")`，容器要 `fill="x"`；与状态文案同排时包一层内容宽 group 整体居中）、两侧各 `BTN_GAP//2` 合成 4px 相邻间距——**不对称 padx 会让末颗宽一截**（回归自等宽断言炸掉，这也是 gui.md grid 间隔口径的由来）。**默认按钮**聚焦呈现（vista 主题画不进 messagebox 那圈蓝描边，行为语义靠焦点承载）：新增弹窗=保存、删除确认/关闭询问=安全侧（取消/隐藏到后台），密码补录焦点照旧在密码框；Enter 触发主操作、Esc 走安全侧。
 - **状态读写双口径**：ttk 的 `cget("state")` 返回 **index 对象**（不是 str），统一走 `widget_state()` 归一化（内部 `instate`）；`configure(state=…)`/`widget["state"] = …` 写法对 ttk 仍然有效（实测），`_register` 存默认态用 `widget_state()`。`_make_square_button` 走 **padding 像素精调**（width 字符粒度 ±8px 调不进 ±2px）：`padding=[0,0]` 量内容基准后对半摊。
 - **按钮排外边距契约**：面板内按钮排到边框 **4px**（备份页 全选/反选/清空 排净 4px：容器 `padx=2`+按钮 `padx=BTN_GAP//2`；设置页新增/删除 `padx=4, pady=4`；日志工具栏 4px），卡片内按钮排随卡片 **8px**（文件夹工具栏 `CARD_PAD`）。两套基线暂行并存，全局标准待统一（用户口径）。
 - 加载态用 `SPINNER_FRAMES`、`SPINNER_INTERVAL_MS` 和 `_set_loading_frame()`。帧链有**两条**、各有自己的 job 槽：运行 spinner（`_run_spinner_tick`，画在开始/停止按钮上）与文件夹加载 spinner（`_folder_loading_tick`，画在「邮箱文件夹」卡的加载层上）；连接 spinner 已随连接按钮移除。
 - **文件夹加载态**：拉取文件夹清单期间（启动静默加载 / 切账户 / 保存后 / 补录后 / 手动 ⟳，全走 `_maybe_load_folders`）「邮箱文件夹」卡盖上加载层（`folder_loading`：居中旋转 spinner +「正在加载邮箱文件夹…」），树与旧内容在层下不可交互、⟳ 禁用防重入；**只跟随当前选中账户**（`_sync_folder_loading_view` 是唯一裁决点，切账户经 `_render_account_detail` 换视图，后台账户完成不打断当前显示），失败即退出加载态、恢复原有失败提示与密码补录。
-- 开始和停止按钮的 `width=4` 只是绕开 ttk 主题最小宽的**字符数下限**（不是固定宽：加载态长文案照样撑宽）。加载态使用 `_blank_icon()` 占住「有 image」这个高度前提，不把 `image` 设为 `""`，避免按钮高度变化；占位是 1px 宽 × 图标高——只借高度不占宽，转圈符贴近左边框、左右留白与静止态对称（回归自：整图标宽的占位让左边一大块空白、左松右紧）。宽度在加载/静止之间会随文案与图标槽变化，不再是「只随文案走」。
+- 开始和停止按钮 `width=-1`：负 width 是**字符数下限**，请求宽随当前文案+图标逐态贴合（静止「开始备份」74px/「停止」50px，加载态「⠋ 正在备份/停止…」97px），长文案不再被裁；宽度只在开始/停止/收尾三个状态切换瞬间变一次（转圈 10 帧实测等宽、帧内零横跳），`pack(side=right)` 变宽向左生长、进度条让宽。加载态使用 `_blank_icon()` 占住「有 image」这个高度前提，不把 `image` 设为 `""`，避免按钮高度变化；占位是 1px 宽 × 图标高——只借高度不占宽，转圈符贴近左边框、左右留白与静止态对称（回归自：整图标宽的占位让左边一大块空白、左松右紧）。
 - 点击停止后，转圈移到停止按钮；开始按钮恢复静止外观但保持禁用；状态行只清除文案而不收回布局。
 - 完成、停止、失败以及帧链自愈路径都必须恢复两颗按钮。
-- 邮箱文件夹工具栏右上角的 **⟳ 刷新按钮**是 icon-only 字形按钮（`RELOAD_GLYPH`；PhotoImage 画不了圆弧，不自绘图标），**正方形**（`_make_square_button`：ttk 口径走 padding 像素精调、误差 ≤2px，width=2 只为绕开主题最小宽），悬停有气泡（`_bind_widget_tip`，无截断语义、悬停即弹），运行中随 `_register` 名单一起禁用。
+- 邮箱文件夹工具栏右上角的 **⟳ 刷新按钮**是 icon-only 字形按钮（`RELOAD_GLYPH`；PhotoImage 画不了圆弧，不自绘图标），**正方形**（`width=0` 取单字形自然宽，`_make_square_button` 再按 padding 像素精调补成精确正方形、实测误差 0px），悬停有气泡（`_bind_widget_tip`，无截断语义、悬停即弹），运行中随 `_register` 名单一起禁用。
 
 相关回归：
 
@@ -70,7 +70,8 @@
 - `test_stopping_feedback_covers_buttons_status_line_and_hint`
 - `test_stopping_then_failing_restores_the_controls`
 - `test_folder_loading_shows_spinner_and_hides_tree` / `test_folder_loading_follows_the_selected_account`
-- `test_all_buttons_are_themed` / `test_reload_button_is_square`
+- `test_all_buttons_are_themed` / `test_all_ttk_buttons_use_flexible_width` / `test_reload_button_is_square`
+- `test_run_buttons_fit_each_state_and_hold_width_across_frames`
 
 ## 布局与滚轮
 
