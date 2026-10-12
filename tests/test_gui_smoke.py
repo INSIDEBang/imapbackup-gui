@@ -5,7 +5,8 @@
 这个顺序依赖是有意保留的，别重排测试。
 
 多账户改造后的事件都带 account_id：`folders_loaded` / `totals` / `message` / `account_done`
-一律针对某个账户，批量结束走 `batch_done`。`load_folders` 是本文件唯一的“连接成功”入口。
+一律针对某个账户；账户各自独立运行（ADR 0012），活动集合排空即本轮结束，没有 `batch_done`。
+`load_folders` 是本文件唯一的“连接成功”入口。
 
 标了 @pytest.mark.gui：需要真实 Tk 显示与 ttk 主题，几何断言（winfo_width、
 winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示环境的 runner 用
@@ -13,6 +14,7 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 """
 import json
 import logging
+import time
 from datetime import datetime
 from itertools import pairwise
 from types import SimpleNamespace
@@ -172,6 +174,16 @@ def sync_thread(target=None, args=(), **_kwargs):
         if target is not None:
             target(*args)
     return SimpleNamespace(start=run)
+
+
+def set_phase(instance, account_id, phase):
+    """把账户直接置为某备份阶段并刷新活动集合（不联网、不起线程；ADR 0012 测试专用）。"""
+    instance._state(account_id)["run_phase"] = phase
+    if phase != g.PHASE_IDLE:
+        instance._cycle = {"t0": time.monotonic(), "backed": 0, "skipped": 0,
+                           "failures": [], "stopped": False, "ids": {account_id}}
+    instance._on_active_set_changed()
+    instance.root.update_idletasks()   # 让「停止所有」的 pack/forget 落到映射状态
 
 
 def row_by(instance, foldername):
@@ -614,11 +626,10 @@ def test_message_rows_are_zebra_striped(app):
 
 
 def test_run_done_summaries(app):
-    """单账户跑完 + 批量结束：完成 / 已是最新 / 已停止三种状态文案。"""
+    """单账户跑完：完成 / 已是最新 / 已停止三种状态文案（账户各自独立，无批量结束事件）。"""
     aid = app._selected_account_id
-    app.events.put(("log", "2026-09-11 10:00:00 | INFO    | gui        | _batch_worker:1 | 测试日志行"))
+    app.events.put(("log", "2026-09-11 10:00:00 | INFO    | gui        | _launch_accounts:1 | 测试日志行"))
     app.events.put(("account_done", aid, 1, 12322, 65.0, False, 23))
-    app.events.put(("batch_done", False, []))
     pump(app)
     assert "测试日志行" in app.log_text.get("1.0", "end")
     assert "完成：本次备份 1 封" in app.status_var.get() and "用时 1:05" in app.status_var.get(), (
@@ -627,23 +638,22 @@ def test_run_done_summaries(app):
 
     app.events.put(("totals", aid, 100, 0))
     app.events.put(("account_done", aid, 0, 100, 3.0, False, 0))
-    app.events.put(("batch_done", False, []))
     pump(app)
     assert app.status_var.get() == "已是最新，无待备份邮件", app.status_var.get()
 
     app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
-    app.events.put(("batch_done", True, []))
     pump(app)
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
 
 
 def test_config_is_locked_during_a_run(app):
     """树里的箭头与名称是 tk.Label：它有 -state 选项，但置灰和阻断绑定都不生效，
-    所以不进 _config_widgets，改由 _set_config_enabled 置灰 + 两个 handler 的 running
-    判定拦截。Entry/Button（含文件夹工具栏）走 state=disabled。
+    所以不进 _config_widgets，改由 _set_config_enabled 置灰 + 两个 handler 的「可见账户
+    活动中」判定拦截。Entry/Button（含文件夹工具栏）走 state=disabled。后台别的账户在跑、
+    当前可见账户空闲时不锁（ADR 0012）。
     """
-    app.running = True
-    app._begin_run_ui()
+    aid = app._selected_account_id
+    set_phase(app, aid, g.PHASE_BACKING)
     lockable = [w for w, _ in app._config_widgets
                 if isinstance(w, (tk.Button, tk.Checkbutton, ttk.Button))]
     assert all(is_disabled(w) for w in lockable), len(app._config_widgets)
@@ -652,6 +662,7 @@ def test_config_is_locked_during_a_run(app):
                for w, _ in app._folder_clickables), len(app._folder_clickables)
     assert is_disabled(app.start_btn)
     assert not is_disabled(app.stop_btn)
+    assert app.stop_all_btn.winfo_ismapped()   # 有活动账户：「停止所有」出现
 
     # 锁定期间点击必须无效：勾选不翻转、展开态不变
     states_before = [r["var"].get() for r in app.folder_rows]
@@ -661,8 +672,8 @@ def test_config_is_locked_during_a_run(app):
     assert [r["var"].get() for r in app.folder_rows] == states_before
     assert {key: node["open"] for key, node in app._folder_nodes.items()} == open_before
 
-    app.running = False
-    app._set_config_enabled(True)
+    set_phase(app, aid, g.PHASE_IDLE)
+    assert not app.stop_all_btn.winfo_ismapped()  # 活动集合排空：「停止所有」消失
     assert all(str(w.cget("foreground")) == fg and str(w.cget("cursor")) == "hand2"
                for w, fg in app._folder_clickables)
 
@@ -825,42 +836,51 @@ def test_ellipsis_tooltip_arms_only_when_truncated(app):
 
 
 def test_start_button_borrows_the_connecting_spinner_while_backing_up(app, monkeypatch):
-    """备份中开始按钮把绿三角换成透明占位、显示「⠋ 正在备份…」，与连接按钮同一套帧与节奏。
+    """选中账户活动时开始按钮把绿三角换成透明占位、转圈显示阶段文案；停止后转圈挪到停止钮。
 
     帧推进（_run_spinner_tick / _set_loading_frame）与 after 调度是分开的，所以第 i 帧长什么样
     可以直接断言，不必 sleep 等定时器。
     """
+    aid = app._selected_account_id
     for index in (0, 3, len(g.SPINNER_FRAMES) - 1):
         app._set_loading_frame(app.start_btn, g.RUNNING_BTN_LABEL, index)
         assert app.start_btn.cget("text") == f"{g.SPINNER_FRAMES[index]} {g.RUNNING_BTN_LABEL}"
 
-    app.running = True
-    app._begin_run_ui()
+    # 统计阶段：开始钮转圈文案「正在统计…」、透明占位、禁用；停止钮可用红方块
+    set_phase(app, aid, g.PHASE_SCANNING)
+    app._stop_run_spinner()
+    app._run_spinner_tick(0)
     text = str(app.start_btn.cget("text"))
-    assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+    assert text.endswith(g.SCANNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
     assert image_name(app.start_btn) == str(app.blank_icon)  # 绿三角让位给透明占位（撤成 "" 会矮/高一截）
     assert is_disabled(app.start_btn)
     assert not is_disabled(app.stop_btn)
 
-    app._end_run_controls()
-    assert_start_button_idle(app)
-    assert app._run_spinner_job is None
+    # 下载阶段：文案换「正在备份…」
+    set_phase(app, aid, g.PHASE_BACKING)
+    app._stop_run_spinner()
+    app._run_spinner_tick(0)
+    text = str(app.start_btn.cget("text"))
+    assert text.endswith(g.RUNNING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
 
-    # 自愈：有的路径直接把 running 置假、不走 _end_run_controls，帧推进函数得自己复位，
-    # 否则「正在备份…」会残留在按钮上
-    app.running = True
-    app._begin_run_ui()
-    app._stop_run_spinner()  # 停掉真实帧链，下面手动推进
-    app.running = False
+    # 单账户停止：转圈挪到停止钮，开始钮复位静止
+    app._on_stop()
+    assert app._state(aid)["run_phase"] == g.PHASE_STOPPING
+    assert image_name(app.stop_btn) == str(app.blank_icon)
+    assert is_disabled(app.stop_btn)
+    assert_start_button_idle(app)
+
+    # 活动集合排空：帧链自愈退出，两按钮复位
+    set_phase(app, aid, g.PHASE_IDLE)
     app._run_spinner_tick(2)
     assert_start_button_idle(app)
+    assert_stop_button_idle(app)
     assert app._run_spinner_job is None
 
     # 失败路径同样要走复位（messagebox 换替身，否则会弹真对话框）
     monkeypatch.setattr(g, "messagebox", FakeBox())
-    app.running = True
-    app._begin_run_ui()
-    app.events.put(("batch_done", False, [("主账户", "boom")]))
+    set_phase(app, aid, g.PHASE_BACKING)
+    app.events.put(("account_failed", aid, "boom"))
     pump(app)
     assert_start_button_idle(app)
     assert app._run_spinner_job is None
@@ -1098,15 +1118,15 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
     第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
     """
-    app.running = True
-    app._begin_run_ui()
+    aid = app._selected_account_id
+    set_phase(app, aid, g.PHASE_BACKING)
     app._stop_run_spinner()  # 停掉真实帧链，手动驱动帧（与开始按钮那套用例同法）
     app._set_counts("已备份 3 / 10")
     app._set_status("备份 INBOX（7 封）", error=False)
     counts_before, progress_before = app.count_var.get(), float(app.progress["value"])
 
-    app._on_stop()
-    assert app.stopping is True and app.stop_flag.is_set()
+    app._on_stop()   # 右下停止只停当前选中账户
+    assert app._state(aid)["run_phase"] == g.PHASE_STOPPING and app._stop_events[aid].is_set()
     text = str(app.stop_btn.cget("text"))
     assert text.endswith(g.STOPPING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
     assert image_name(app.stop_btn) == str(app.blank_icon)  # 红方块让位给转圈文字
@@ -1128,34 +1148,30 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
         assert_start_button_idle(app)
 
     # 运行真正结束：按钮、状态行全部回位，不残留「正在停止…」
-    aid = app._selected_account_id
     app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
-    app.events.put(("batch_done", True, []))
     pump(app)
-    assert app.running is False and app.stopping is False
+    assert app.running is False
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
     assert_stop_button_idle(app)
     assert_start_button_idle(app)
 
     # 不在运行时按停止（那时按钮本就禁用）不产生任何变化
     app._on_stop()
-    assert app.stopping is False
+    assert app._state(aid)["run_phase"] == g.PHASE_IDLE
     assert_stop_button_idle(app)
 
 
 def test_stopping_then_failing_restores_the_controls(app, monkeypatch):
     """停止中撞上运行失败：除弹窗外按钮与状态行也要完整复位（messagebox 换替身，别弹真框）。"""
     monkeypatch.setattr(g, "messagebox", FakeBox())
-    app._states[app._selected_account_id]["connect_state"] = "connected"
-    app.running = True
-    app._begin_run_ui()
+    aid = app._selected_account_id
+    set_phase(app, aid, g.PHASE_BACKING)
     app._on_stop()
-    assert app.stopping is True
+    assert app._state(aid)["run_phase"] == g.PHASE_STOPPING
 
-    app.events.put(("account_failed", app._selected_account_id, "boom"))
-    app.events.put(("batch_done", False, [("主账户", "boom")]))
+    app.events.put(("account_failed", aid, "boom"))
     pump(app)
-    assert app.running is False and app.stopping is False
+    assert app.running is False
     assert app._run_spinner_job is None
     assert_stop_button_idle(app)
     assert_start_button_idle(app)
@@ -1172,14 +1188,14 @@ def test_loading_buttons_keep_their_height(app):
     左右留白与静止态一样对称（回归自：占位按整图标宽时左边一大块空白、左松右紧）。
     断言只比同一颗按钮的前后高度，不钉绝对像素值（异 DPI/主题下数字会变）。
     """
+    aid = app._selected_account_id
     app.root.geometry("960x736")
     app.root.update()
     idle = (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
     assert idle[0] == idle[1], idle                    # 同一行两颗按钮本就该等高
 
     # 运行中：开始按钮的图标槽换成透明占位，高度与静止态一致，同行的停止按钮不被顶高
-    app.running = True
-    app._begin_run_ui()
+    set_phase(app, aid, g.PHASE_BACKING)
     app._stop_run_spinner()                            # 停掉真实帧链，免得它把文案改回别的帧
     app.root.update()
     assert image_name(app.start_btn) == str(app.blank_icon), app.start_btn.cget("image")
@@ -1196,7 +1212,7 @@ def test_loading_buttons_keep_their_height(app):
     assert (app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight()) == idle, (
         app.start_btn.winfo_reqheight(), app.stop_btn.winfo_reqheight())
 
-    app._end_run_controls()
+    set_phase(app, aid, g.PHASE_IDLE)
     assert_stop_button_idle(app)
     assert_start_button_idle(app)
 
@@ -1224,13 +1240,21 @@ def test_run_buttons_fit_each_state_and_hold_width_across_frames(app):
         assert btn.winfo_reqwidth() == fit_width(text, image), (
             text, btn.winfo_reqwidth(), fit_width(text, image))
 
+    aid = app._selected_account_id
     # 静止态：开始钮图标按可用性取彩色/灰度，直接拿它当前挂的图
     assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
     assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_btn.cget("image"))
 
-    # 运行态：开始钮挂透明占位 + 转圈文案；停止钮彩色方块，两钮都贴各自内容
-    app.running = True
-    app._begin_run_ui()
+    # 统计态：开始钮挂透明占位 +「⠋ 正在统计…」；停止钮彩色方块，两钮都贴各自内容
+    set_phase(app, aid, g.PHASE_SCANNING)
+    app._stop_run_spinner()
+    scanning_text = f"{g.SPINNER_FRAMES[0]} {g.SCANNING_BTN_LABEL}"
+    assert str(app.start_btn.cget("text")) == scanning_text
+    assert_hugs(app.start_btn, scanning_text, app.blank_icon)
+    assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_icon)
+
+    # 备份态：开始钮文案换「正在备份…」
+    set_phase(app, aid, g.PHASE_BACKING)
     app._stop_run_spinner()
     running_text = f"{g.SPINNER_FRAMES[0]} {g.RUNNING_BTN_LABEL}"
     assert str(app.start_btn.cget("text")) == running_text
@@ -1253,7 +1277,7 @@ def test_run_buttons_fit_each_state_and_hold_width_across_frames(app):
     # 开始钮已复位静止，依旧贴合
     assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
 
-    app._end_run_controls()
+    set_phase(app, aid, g.PHASE_IDLE)
     app.root.update_idletasks()
     assert_hugs(app.start_btn, g.START_BTN_LABEL, app.start_btn.cget("image"))
     assert_hugs(app.stop_btn, g.STOP_BTN_LABEL, app.stop_btn.cget("image"))
@@ -2209,30 +2233,28 @@ def test_backup_selected_runs_only_checked_accounts(app, monkeypatch):
     assert app._checked_accounts == {first["id"]}
 
 
-def test_batch_worker_runs_accounts_concurrently_and_isolates_failures(app, monkeypatch):
-    """并发同步：每账户一线程，单个账户失败不影响其余；停止后不再发起备份。"""
+def test_launch_runs_accounts_concurrently_and_isolates_failures(app, monkeypatch):
+    """每账户一线程独立备份：单个账户失败不影响其余；没有批量结束事件（ADR 0012）。"""
     first = g.new_account()
     first.update({"name": "甲", "user": "a@example.com", "server": "imap.example.com", "password": "p"})
     second = g.new_account()
     second.update({"name": "乙", "user": "b@example.com", "server": "imap.example.com", "password": "p"})
     third = g.new_account()
     third.update({"name": "丙", "user": "c@example.com", "server": "imap.example.com", "password": "p"})
+    app.accounts.extend([first, second, third])
     calls: list[str] = []
 
-    def fake_backup(account, outdir, eq, log):
+    def fake_backup(account, outdir, eq, log, stop_event):
         calls.append(account["id"])
         if account["id"] == second["id"]:
             raise RuntimeError("boom")
         eq.put(("account_done", account["id"], 1, 0, 0.5, False, 1))
 
+    monkeypatch.setattr(g.threading, "Thread", lambda *a, **k: sync_thread(*a, **k))
     monkeypatch.setattr(app, "_backup_account", fake_backup)
-    snapshots = [{"id": a["id"], "user": a["user"], "server": a["server"], "password": "p",
-                  "ssl": True, "port": "993", "folders": [], "mbox": False, "eml": True,
-                  "name": a["name"]}
-                 for a in (first, second, third)]
-    app.stop_flag.clear()
-    app._batch_worker(snapshots, "D:\\out")
-    assert sorted(calls) == sorted([first["id"], second["id"], third["id"]])   # 并发，顺序不保证
+    monkeypatch.setattr(g, "messagebox", FakeBox())   # 失败账户非选中：本来也不弹，双保险
+    app._launch_accounts([first["id"], second["id"], third["id"]])
+    assert sorted(calls) == sorted([first["id"], second["id"], third["id"]])   # 各起一线，顺序不保证
 
     events = []
     while True:
@@ -2241,27 +2263,63 @@ def test_batch_worker_runs_accounts_concurrently_and_isolates_failures(app, monk
         except g.queue.Empty:
             break
     kinds = [e[0] for e in events if e[0] != "log"]
-    # 三个账户并发，各收到 account_begin；两个 done、一个 failed；最后 batch_done
+    # 三个账户各收到 account_begin；两个 done、一个 failed；不存在 batch_done/account_skipped
     assert kinds.count("account_begin") == 3
     assert kinds.count("account_done") == 2
     assert kinds.count("account_failed") == 1
-    assert kinds[-1] == "batch_done"
-    assert events[-1][2] == [("乙", "RuntimeError: boom")]
+    assert "batch_done" not in kinds and "account_skipped" not in kinds
 
-    # 停止后：不再发起备份，只收到 account_skipped
-    calls.clear()
-    app.stop_flag.set()
-    app._batch_worker(snapshots, "D:\\out")
-    app.stop_flag.clear()
-    assert calls == []
-    events = []
-    while True:
-        try:
-            events.append(app.events.get_nowait())
-        except g.queue.Empty:
-            break
-    kinds = [e[0] for e in events if e[0] != "log"]
-    assert kinds == ["account_skipped", "account_skipped", "account_skipped", "batch_done"]
+    for ev in events:   # 上面 drain 已把事件取空，直接回放给分发器，再刷布局看收口
+        app._handle_event(ev)
+    app.root.update_idletasks()
+    assert not app.running and not app.stop_all_btn.winfo_ismapped()
+    assert app._state(second["id"])["result"][0] == "failed"  # 失败红叉持久
+
+    # 「停止所有」给每个活动账户各自的信号：单停一个不影响其余
+    for account in (first, second, third):
+        app._stop_events[account["id"]] = g.threading.Event()
+        set_phase(app, account["id"], g.PHASE_BACKING)
+    assert app.stop_all_btn.winfo_ismapped()
+    app._on_stop_all()
+    assert all(app._stop_events[a["id"]].is_set() for a in (first, second, third))
+    assert all(app._state(a["id"])["run_phase"] == g.PHASE_STOPPING for a in (first, second, third))
+    assert is_disabled(app.stop_all_btn)
+    text = str(app.stop_all_btn.cget("text"))
+    assert text.endswith(g.STOPPING_BTN_LABEL) and text[0] in g.SPINNER_FRAMES, text
+
+    # 收尾还原：三账户回空闲，「停止所有」消失
+    for account in (first, second, third):
+        set_phase(app, account["id"], g.PHASE_IDLE)
+    app.accounts[:] = [a for a in app.accounts if a["id"] not in {first["id"], second["id"], third["id"]}]
+    for account in (first, second, third):
+        app._states.pop(account["id"], None)
+    app._refresh_account_list()
+    app._on_active_set_changed()
+
+
+def test_stop_all_does_not_touch_an_unaffected_account(app):
+    """右下停止只停选中账户：另一活动账户的信号不被置位、阶段不变。"""
+    other = g.new_account()
+    other.update({"name": "隔壁", "user": "other@example.com", "server": "imap.example.com", "password": "p"})
+    app.accounts.append(other)
+    app._refresh_account_list()
+    aid = app._selected_account_id
+    app._stop_events[aid] = g.threading.Event()
+    app._stop_events[other["id"]] = g.threading.Event()
+    set_phase(app, aid, g.PHASE_BACKING)
+    set_phase(app, other["id"], g.PHASE_BACKING)
+
+    app._on_stop()   # 右下停止：只停当前选中账户
+    assert app._stop_events[aid].is_set()
+    assert not app._stop_events[other["id"]].is_set()
+    assert app._state(other["id"])["run_phase"] == g.PHASE_BACKING
+    assert app.running and app.stop_all_btn.winfo_ismapped()   # 另一账户仍在跑，按钮不消失
+
+    set_phase(app, aid, g.PHASE_IDLE)
+    set_phase(app, other["id"], g.PHASE_IDLE)
+    app.accounts.remove(other)
+    app._states.pop(other["id"], None)
+    app._refresh_account_list()
 
 
 def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, tmp_path):
@@ -2293,8 +2351,8 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
                         lambda names, basedir, account: scanned.setdefault("dir", account))
     monkeypatch.setattr(g.core, "download_messages", lambda *a, **k: None)
 
-    app.stop_flag.clear()
-    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"))
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
+                        g.threading.Event())
     assert scanned["dir"] == "a@example.com", scanned
     assert scanned["label"] == "a@example.com/INBOX.mbox", scanned
     assert "工作邮箱" not in str(scanned)
@@ -3141,6 +3199,268 @@ def test_add_delete_buttons_fill_the_account_list_width(app):
     assert_tiles_list()
     nav.configure(width=app._account_list_width)
     app.root.update()
+
+
+def test_account_row_status_icons_follow_phases_and_ttl(app, monkeypatch):
+    """行尾图标：统计蓝/备份绿/停止红块/完成绿勾 60s/已停止灰块 5s/失败红叉持久（ADR 0012）。"""
+    monkeypatch.setattr(g, "messagebox", FakeBox())   # 可见账户失败会弹错误框，替身挡掉
+    aid = app._selected_account_id
+    row = app._account_rows[aid]
+    state = app._state(aid)
+
+    def icon_is(image):
+        app.root.update_idletasks()
+        return str(row["icon"].cget("image")) == str(image)
+
+    assert icon_is(app.row_icon_blank)
+    app._on_phase(aid, "扫描 1/3：INBOX")
+    assert icon_is(app.row_scan_icon) and state["run_phase"] == g.PHASE_SCANNING
+    app._on_phase(aid, "备份 INBOX（7 封）")
+    assert icon_is(app.row_download_icon) and state["run_phase"] == g.PHASE_BACKING
+    # stopping 后到达的 phase 事件不许把阶段降回去，图标保持红块
+    app._stop_events[aid] = g.threading.Event()
+    app._on_stop()
+    assert icon_is(app.row_stop_icon)
+    app._on_phase(aid, "备份 INBOX（7 封）")
+    assert state["run_phase"] == g.PHASE_STOPPING and icon_is(app.row_stop_icon)
+
+    # 已停止：灰方块 + 5s TTL；到期回调把图标清回空白
+    app._on_account_done(aid, 5, 100, 9.0, True, 20)
+    assert icon_is(app.row_stopped_icon) and state["result"][0] == "stopped"
+    stamp = state["result_at"]
+    app._clear_result_icon(aid, stamp)
+    assert icon_is(app.row_icon_blank) and state["result"] is None
+
+    # 正常完成：绿勾 + 60s 冷却窗（同一常量）；到期清回空白
+    state["run_phase"] = g.PHASE_BACKING
+    app._on_account_done(aid, 3, 0, 2.0, False, 3)
+    assert icon_is(app.row_done_icon) and state["result"][0] == "done"
+    assert app._in_done_cooldown(app._find_account(aid))
+    state["result_at"] = time.monotonic() - (g.DONE_COOLDOWN_S + 1)
+    assert not app._in_done_cooldown(app._find_account(aid))
+    app._clear_result_icon(aid, state["result_at"] - 1)  # 旧戳：空转不清
+    assert icon_is(app.row_done_icon)
+    app._clear_result_icon(aid, app._state(aid)["result_at"])
+    assert icon_is(app.row_icon_blank)
+
+    # 失败：红叉常驻到下次启动；脱钩立即清
+    state["run_phase"] = g.PHASE_BACKING
+    app._on_account_failed(aid, "boom")
+    assert icon_is(app.row_fail_icon) and state["result"][0] == "failed"
+    app._account_rows[aid]["var"].set(False)
+    app._sync_account_checks()
+    assert icon_is(app.row_icon_blank) and state["result"] is None
+    app._account_rows[aid]["var"].set(True)
+    app._sync_account_checks()
+    set_phase(app, aid, g.PHASE_IDLE)
+
+
+def test_done_cooldown_skips_batch_but_not_single_start(app, monkeypatch):
+    """完成冷却：批量入口跳过该账户并提示，到期后纳入；右下「开始备份」始终绕过冷却。"""
+    aid = app._selected_account_id
+    started: list[list[str]] = []
+    monkeypatch.setattr(app, "_begin_preflight", lambda ids: started.append(list(ids)))
+    monkeypatch.setattr(app, "_backup_root_ready", lambda: True)
+    box = FakeBox()
+    monkeypatch.setattr(g, "messagebox", box)
+    state = app._state(aid)
+
+    state["run_phase"] = g.PHASE_BACKING
+    app._on_account_done(aid, 3, 0, 2.0, False, 3)
+    app._on_start_selected()
+    assert started == []                                   # 冷却中：不进预检
+    assert box.warnings and box.warnings[-1][0] == g.COOLING_WARN_TITLE
+
+    state["result_at"] = time.monotonic() - (g.DONE_COOLDOWN_S + 1)
+    app._on_start_selected()
+    assert started == [[aid]]                              # 冷却过：纳入
+
+    state["result_at"] = time.monotonic()                  # 重新进窗
+    started.clear()
+    app._on_start()                                        # 右下入口绕过冷却
+    assert started == [[aid]]
+
+    state["result"] = None
+    state["result_at"] = None
+    app._apply_account_icon(aid)
+    set_phase(app, aid, g.PHASE_IDLE)
+
+
+def test_backup_selected_appends_only_the_new_account_while_others_run(app, monkeypatch):
+    """已有账户在跑时再点「备份所选」：只启动勾着、空闲的新账户，在跑的不受影响。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "后来者", "user": "later@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._switch_account(first["id"])
+
+    started: list[list[str]] = []
+    monkeypatch.setattr(app, "_begin_preflight", lambda ids: started.append(list(ids)))
+    monkeypatch.setattr(app, "_account_credentials", lambda account, warn=True: {"server": "s"})
+    monkeypatch.setattr(app, "_backup_root_ready", lambda: True)
+
+    set_phase(app, first["id"], g.PHASE_BACKING)
+    app._on_start_selected()
+    assert started == [[second["id"]]], started
+
+    set_phase(app, first["id"], g.PHASE_IDLE)
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+
+
+def test_run_controls_follow_the_selected_account(app):
+    """右下开始/停止只描述选中账户：看活动账户时停止可用，切到空闲账户停止即禁用。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "安静账户", "user": "idle@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+
+    app._switch_account(first["id"])
+    set_phase(app, first["id"], g.PHASE_BACKING)
+    assert is_disabled(app.start_btn) and not is_disabled(app.stop_btn)
+
+    app._switch_account(second["id"])
+    assert is_disabled(app.stop_btn)                        # 空闲账户：停止禁用
+    assert not is_disabled(app.backup_selected_btn)        # 备份所选运行中也始终可用
+
+    app._switch_account(first["id"])
+    assert not is_disabled(app.stop_btn)
+    set_phase(app, first["id"], g.PHASE_IDLE)
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
+
+
+def test_active_account_cannot_be_deleted(app, monkeypatch):
+    """活动账户删除被拦在确认弹窗前，弹「请先停止」警告；空闲后删除流程照常。"""
+    aid = app._selected_account_id
+    app._editing_account_id = aid
+    box = FakeBox()
+    monkeypatch.setattr(g, "messagebox", box)
+    asked: list[bool] = []
+    monkeypatch.setattr(app, "_ask_delete_account", lambda account: asked.append(True) or False)
+
+    set_phase(app, aid, g.PHASE_BACKING)
+    app._on_account_delete()
+    assert box.warnings and box.warnings[-1][0] == g.ACTIVE_DELETE_WARN_TITLE
+    assert asked == [] and app._find_account(aid) is not None
+
+    set_phase(app, aid, g.PHASE_IDLE)
+    app._on_account_delete()
+    assert asked == [True]
+
+
+def test_stop_all_button_lives_below_backup_selected(app):
+    """「停止所有」在「备份所选」正下方、同宽；初始不映射，有活动才出现；隐藏时底距仍在。"""
+    assert not app.stop_all_btn.winfo_ismapped()
+    parent = app.stop_all_btn.master
+    assert parent is app.backup_selected_btn.master
+    aid = app._selected_account_id
+    set_phase(app, aid, g.PHASE_BACKING)
+    app.root.update_idletasks()
+    assert app.stop_all_btn.winfo_ismapped()
+    assert app.stop_all_btn.winfo_rooty() > app.backup_selected_btn.winfo_rooty()
+    assert app.stop_all_btn.winfo_width() == app.backup_selected_btn.winfo_width()
+    set_phase(app, aid, g.PHASE_IDLE)
+    app.root.update_idletasks()
+    assert not app.stop_all_btn.winfo_ismapped()
+    # 「停止所有」隐藏时，底部容器到 LabelFrame 内底边仍留 4px（容器统一 pady），按钮不贴边框
+    pane = parent.master
+    pane_inner_bottom = pane.winfo_rooty() + pane.winfo_height() - int(pane.cget("borderwidth"))
+    container_bottom = parent.winfo_rooty() + parent.winfo_height()
+    assert pane_inner_bottom - container_bottom >= 4
+
+
+def test_row_icon_click_selects_the_account(app):
+    """点行尾状态图标等同点行：切换到该账户（图标本身也是行的命中区）。"""
+    first = current_account(app)
+    other = g.new_account()
+    other.update({"name": "点图标", "user": "icon@x.com", "server": "s"})
+    app.accounts.append(other)
+    app._refresh_account_list()
+    app._switch_account(first["id"])
+    icon = app._account_rows[other["id"]]["icon"]
+    icon.event_generate("<Button-1>", x=1, y=1)
+    app.root.update_idletasks()
+    assert app._selected_account_id == other["id"]
+    app.accounts.remove(other)
+    app._states.pop(other["id"], None)
+    app._refresh_account_list()
+    app._switch_account(first["id"])   # 删除后恢复选中真实账户（与 _on_account_delete 同口径）
+
+
+def test_progress_bar_value_tracks_messages_without_overfilling(app):
+    """多消息高频更新：进度条 value/max 始终与计数同源，2.5% 不会显示成满格。"""
+    aid = current_account(app)["id"]
+    app._switch_account(aid)
+    st = app._state(aid)
+    st["backed"] = 0
+    st["run_phase"] = g.PHASE_BACKING
+    app._handle_event(("totals", aid, 5626, 4839))
+    for i in range(1, 123):
+        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<p{i}>")))
+    assert float(app.progress.cget("maximum")) == 4839.0
+    assert float(app.progress.cget("value")) == 122.0
+    assert float(app.progress.cget("value")) / float(app.progress.cget("maximum")) < 0.1
+    # state 进度被持续回写：切走再切回不归零
+    assert app._state(aid)["progress"] == (122.0, 4839.0)
+    # 计数超出 maximum 也被钳住，不产生满格
+    app.backed_count = 99999
+    app._refresh_counts()
+    assert float(app.progress.cget("value")) == 4839.0
+
+
+def test_progress_length_not_reconfigured_every_message(app):
+    """连续消息在同一布局档位：进度条 length 不被逐封重配（原生填充错位的抖动源）。"""
+    aid = current_account(app)["id"]
+    app._switch_account(aid)
+    st = app._state(aid)
+    st["backed"] = 0
+    st["run_phase"] = g.PHASE_BACKING
+    app.root.geometry("960x736")
+    app.root.update()
+    app._handle_event(("totals", aid, 5626, 4839))
+    configured = []
+    original = app.progress.configure
+
+    def spy(*a, **k):
+        if (a and a[0] == "length") or "length" in k:
+            configured.append(k.get("length", a[1] if len(a) > 1 else None))
+        return original(*a, **k)
+
+    app.progress.configure = spy
+    length_before = getattr(app, "_progress_length", None)
+    for i in range(1, 50):
+        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<l{i}>")))
+    app.progress.configure = original
+    # 位数没变（都 <100），length 全程不重配
+    assert configured == [] or all(v == length_before for v in configured)
+
+
+def test_stop_restores_start_button_at_full_width_without_resize(app):
+    """停止后开始按钮恢复静止文案，同批即完成布局（不必 resize 窗口，文本不被裁）。"""
+    aid = app._selected_account_id
+    set_phase(app, aid, g.PHASE_BACKING)
+    app.root.update_idletasks()
+    app._on_stop()
+    app.root.update_idletasks()
+    assert str(app.start_btn.cget("text")) == g.START_BTN_LABEL
+    assert app.start_btn.winfo_width() >= app.start_btn.winfo_reqwidth() - 1
+
+
+def test_fit_account_names_survives_missing_icons(app):
+    """启动期画布 Configure 早于图标挂载时，名称截断静默跳过而不抛 AttributeError。"""
+    saved = app.row_icon_blank
+    del app.row_icon_blank
+    try:
+        app._fit_account_names()   # 不抛异常即可
+    finally:
+        app.row_icon_blank = saved
 
 
 def test_all_buttons_are_themed(app):

@@ -68,9 +68,26 @@ ICON_FILENAME = "imapbackup-gui.ico"
 _instance_mutex_handle: int | None = None  # 进程级持有，不 CloseHandle：进程活着互斥量就该活着
 UPTODATE_STATUS = "已是最新，无待备份邮件"
 START_BTN_LABEL = "开始备份"
+SCANNING_BTN_LABEL = "正在统计…"   # 连接+统计阶段：转圈画在开始按钮上的文案
 RUNNING_BTN_LABEL = "正在备份…"
 STOP_BTN_LABEL = "停止"
 STOPPING_BTN_LABEL = "正在停止…"  # 停止中：转圈挪到停止按钮上，开始按钮退回静止外观
+STOP_ALL_BTN_LABEL = "停止所有"
+
+# 账户备份阶段（self._states[id]["run_phase"]）：活动集合＝除 idle 外的四态
+PHASE_IDLE = "idle"
+PHASE_CONNECTING = "connecting"
+PHASE_SCANNING = "scanning"
+PHASE_BACKING = "backing"
+PHASE_STOPPING = "stopping"
+ACTIVE_PHASES = (PHASE_CONNECTING, PHASE_SCANNING, PHASE_BACKING, PHASE_STOPPING)
+
+# 完成冷却＝绿勾显示窗＝「备份所选」跳过窗，同一个常量（ADR 0012）：刚跑完的账户短时间内
+# 不被批量入口重连重扫，但右下「开始备份」可绕过它立即更新这一个账户。
+DONE_COOLDOWN_S = 60
+STOPPED_ICON_TTL_S = 5            # 已停止灰方块的显示窗（秒）：停止是用户发起的，只需一个短反馈
+QUIT_STOP_TIMEOUT_S = 15.0        # 退出时等各账户写完当前封、干净收尾的上限，超时强退
+SCAN_ICON_COLOR = "#2b6fd0"       # 统计中（含连接）：蓝色扫描
 
 # 加载动画：开始按钮的加载态（停止中改画到停止按钮上）。
 # 帧是盲文点阵（U+2800 段，Windows 字体普遍有字形），画在按钮文字前缀上，不需要图片资产；
@@ -279,8 +296,17 @@ CLOSE_DLG_TEXT_IDLE = ("隐藏到后台：窗口收进托盘，程序继续运�
 CLOSE_DLG_REMEMBER = "记住我的选择，以后不再询问"
 CLOSE_DLG_HIDE = "隐藏到后台"
 CLOSE_DLG_EXIT = "退出程序"
+# 活动账户未收尾时的退出确认（关闭按钮的「退出程序」与托盘退出共用，ADR 0012）
 QUIT_CONFIRM_TITLE = "退出"
-QUIT_CONFIRM_TEXT = "备份正在进行中，退出会中断本次备份。确定要退出吗？"
+QUIT_CONFIRM_TEXT = ("仍有 {n} 个账户正在备份。\n\n"
+                     "退出将先停止这些备份（当前邮件写完后干净退出），确定要退出吗？")
+QUIT_CONFIRM_BTN = "退出程序"
+QUIT_WAITING_TEXT = "正在停止，等待 {n} 个账户收尾…"
+COOLING_WARN_TITLE = "账户刚完成备份"
+COOLING_WARN_TEXT = ("以下账户刚完成备份，{cooldown} 秒内不会被「备份所选」重复启动：\n{names}\n\n"
+                     "想立即更新其中某个账户，选中它后点右下角「开始备份」。")
+ACTIVE_DELETE_WARN_TITLE = "账户正在备份"
+ACTIVE_DELETE_WARN_TEXT = "请先停止该账户的备份，再删除账户。"
 SETTINGS_HINT_TEXT = ("托盘图标（任务栏右下角通知区域）从程序启动起常驻，直到退出：左键单击它恢复窗口，右键菜单可停止备份或退出。\n"
                       "Windows 11 默认把新托盘图标收进溢出区（任务栏的 ^ 小箭头里），找不到时点开那里看看。\n"
                       "在关闭对话框里勾选「记住我的选择」与在这里选定等价。")
@@ -662,6 +688,70 @@ def _cross_icon(color: str, size: int) -> tk.PhotoImage:
     return img
 
 
+def _scan_icon(color: str, size: int) -> tk.PhotoImage:
+    """放大镜（统计中，含连接阶段）：圆环 + 右下 45° 柄，蓝色逐像素画。"""
+    img = tk.PhotoImage(width=size, height=size)
+    cx = cy = round(size * 0.40)
+    r = size * 0.30
+    ring = max(1.2, size / 7.0)
+    hx0 = round(cx + r * 0.55)
+    hx1 = size - 1
+    for y in range(size):
+        for x in range(size):
+            dx, dy = x - cx, y - cy
+            dist2 = dx * dx + dy * dy
+            on_ring = (r - ring) ** 2 <= dist2 <= (r + ring) ** 2
+            if not on_ring and hx0 <= x <= hx1 and hx0 <= y <= hx1:
+                d = abs((x - hx0) - (y - hx0))   # 点到 y=x 柄线的横向距离
+                if d <= ring:
+                    on_ring = True
+            if on_ring:
+                _put(img, color, x, y, x + 1, y + 1)
+    return img
+
+
+def _download_icon(color: str, size: int) -> tk.PhotoImage:
+    """向下箭头（备份中）：竖杆接实心三角头，与开始/停止图标同外接框。"""
+    img = tk.PhotoImage(width=size, height=size)
+    stroke = max(2, round(size * 0.16))
+    inset = max(1, round(size * STOP_ICON_INSET_RATIO))
+    mid = size // 2
+    tip_y = size - inset - 1
+    head_top = round(size * 0.40)
+    half = round(size * 0.32)
+    # 竖杆：从顶到头部中部，与三角重叠一段
+    _put(img, color, mid - stroke // 2, inset, mid - stroke // 2 + stroke, round(size * 0.62))
+    # 三角头：从头部上沿收到中轴尖端
+    height = max(1, tip_y - head_top)
+    for y in range(head_top, tip_y + 1):
+        t = (y - head_top) / height
+        w = max(stroke, round(half * (1 - t) + stroke / 2))
+        _put(img, color, mid - w // 2, y, mid - w // 2 + w, y + 1)
+    return img
+
+
+def _check_icon(color: str, size: int) -> tk.PhotoImage:
+    """对勾（完成）：两段折线，先下后上，笔画粗细与加号/叉一致。"""
+    img = tk.PhotoImage(width=size, height=size)
+    stroke = max(2, round(size * 0.14))
+    ax, ay = round(size * 0.14), round(size * 0.52)
+    bx, by = round(size * 0.40), size - round(size * 0.16)
+    cx, cy = size - round(size * 0.12), round(size * 0.18)
+
+    def segment(px: int, py: int, qx: int, qy: int) -> None:
+        steps = max(abs(qx - px), abs(qy - py), 1) * 4
+        for i in range(steps + 1):
+            t = i / steps
+            x = round(px + (qx - px) * t)
+            y = round(py + (qy - py) * t)
+            _put(img, color, x - stroke // 2, y - stroke // 2,
+                 x - stroke // 2 + stroke, y - stroke // 2 + stroke)
+
+    segment(ax, ay, bx, by)
+    segment(bx, by, cx, cy)
+    return img
+
+
 def _blank_icon(height: int) -> tk.PhotoImage:
     """生成高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
 
@@ -765,7 +855,6 @@ class BackupApp:
         self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.events: queue.Queue[tuple] = queue.Queue()
-        self.stop_flag = threading.Event()
         self.log = logging.getLogger("gui")
         self._setup_logging()
         self._ui_settings = self._read_ui_settings()
@@ -781,15 +870,19 @@ class BackupApp:
         self.backup_root_var = tk.StringVar(value=self._ui_settings.get("backup_root") or DEFAULT_BACKUP_ROOT)
         self._states: dict[str, dict] = {}      # 每账户独立状态（连接、文件夹树、邮件行、计数、进度）
         self._editing_account_id: str | None = None
-        self._run_account_ids: list[str] = []   # 本次批量运行参与的账户（按运行顺序）
-        self._run_t0 = 0.0
+        # 每账户独立的协作停止信号（ADR 0012）：停一个账户不影响其余；账户启动时建、终态后留着
+        self._stop_events: dict[str, threading.Event] = {}
+        self._stopping_all = False              # 「停止所有」进行中：按钮转圈画在它自己身上
+        # 本周期（活动集合「空→非空」到再次排空）的汇总记账，供结束日志与后台气泡
+        self._cycle = {"t0": 0.0, "backed": 0, "skipped": 0, "failures": [], "stopped": False, "ids": set()}
         # 左栏勾选（「备份所选」跑哪些账户）：纯界面态，不落盘；新建/读入的账户默认勾上
         self._checked_accounts: set[str] = {account["id"] for account in self.accounts}
         self._account_rows: dict[str, dict] = {}
 
         # ---- state ----
+        # running＝存在活动账户（run_phase ∈ ACTIVE_PHASES），由 _on_active_set_changed 维护；
+        # 每账户各自的停止中状态在 state["run_phase"]=="stopping"，没有全局 stopping。
         self.running = False
-        self.stopping = False  # 运行中的子阶段：已按停止、工作线程还在收尾（按钮与提示都跟着换口径）
         self.folder_rows: list[dict] = []
         self._folder_nodes: dict[tuple[str, ...], dict] = {}
         self._folder_clickables: list[tuple[tk.Label, str]] = []
@@ -799,6 +892,7 @@ class BackupApp:
         self._sash_layout: dict[str, tuple[tk.Widget, int, int]] = {}   # kind -> (宿主, 空隙带宽, 带左缘偏移)
         self._run_passwords: dict[str, str] = {}  # 本次运行的临时密码（预检补录但未保存时只在本次生效）
         self._preflight: dict | None = None  # 连接预检弹窗状态（None = 未在预检）
+        self._quit_wait_win: tuple | None = None  # 退出确认窗转等待态后的 (弹窗, 文案 Label)
         self._backup_sidebar_width = self._ui_settings.get(
             BACKUP_SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH)   # 备份页账户列表宽（可拖拽）
         self._settings_sidebar_width = self._ui_settings.get(
@@ -1051,8 +1145,6 @@ class BackupApp:
         scroll.bind("<MouseWheel>", self._on_wheel)  # 与面板内滚条同款：走窗口级节奏
         self.account_list.bind("<Configure>", lambda _e: self._sync_account_scroll())
         self.account_canvas.bind("<Configure>", self._on_account_canvas_configure)
-        self.backup_selected_btn = ttk.Button(pane, text=BACKUP_SELECTED_BTN_LABEL,
-                                              command=self._on_start_selected)
         tools = tk.Frame(pane)
         tool_actions = (("全选", lambda: self._set_all_account_checks(True)),
                         ("反选", self._invert_account_checks),
@@ -1064,8 +1156,16 @@ class BackupApp:
             tools.columnconfigure(column, weight=1, uniform="account-tools")  # 三格等宽
             ttk.Button(tools, text=label, width=-1, command=command).grid(row=0, column=column, sticky="we",
                                                                           padx=BTN_GAP // 2)  # 两侧各一半=BTN_GAP
-        # 三块都先于列表以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 / 备份所选
-        self.backup_selected_btn.pack(side="bottom", fill="x", padx=4, pady=4)
+        # 底部容器先于 tools 以 side=bottom 打包（先打包的落最底）：自上而下是 列表 / 勾选工具 /
+        # [备份所选 / 停止所有]。容器恒定留 4px 下边距：「停止所有」隐藏时「备份所选」也不贴
+        # LabelFrame 底边框；「停止所有」仅在有活动账户时 pack 出来（_on_active_set_changed 收口）。
+        bottom_actions = tk.Frame(pane)
+        bottom_actions.pack(side="bottom", fill="x", pady=(0, 4))
+        self.backup_selected_btn = ttk.Button(bottom_actions, text=BACKUP_SELECTED_BTN_LABEL,
+                                              command=self._on_start_selected)
+        self.backup_selected_btn.pack(side="top", fill="x", padx=4, pady=(4, 0))
+        self.stop_all_btn = ttk.Button(bottom_actions, text=STOP_ALL_BTN_LABEL, command=self._on_stop_all)
+        # 初始不 pack：无活动账户时这颗按钮不存在于界面上
         tools.pack(side="bottom", fill="x", padx=2, pady=(4, 0))
         area.pack(fill="both", expand=True, pady=(4, 0))
         return pane
@@ -1855,6 +1955,17 @@ class BackupApp:
         self.stop_btn.configure(image=self.stop_icon_off, compound="left")   # 创建即禁用：先挂灰度
         self.add_btn.configure(image=self.add_icon, compound="left")
         self.del_btn.configure(image=self.del_icon, compound="left")
+        # 「停止所有」与右下停止钮同红方块；停止中转圈期换 1px 透明占位（与单账户停止同口径）
+        self.stop_all_btn.configure(image=self.stop_icon, compound="left")
+        # 账户行行尾状态图标（ADR 0012）：同尺寸、代码逐像素；blank 是整格透明位图，
+        # 与按钮转圈用的 1px 宽 blank_icon 不是一个东西——行槽要固定占住图标宽，名称才不横跳
+        self.row_icon_blank = tk.PhotoImage(width=size, height=size)
+        self.row_scan_icon = _scan_icon(SCAN_ICON_COLOR, size)
+        self.row_download_icon = _download_icon(PLAY_ICON_COLOR, size)
+        self.row_done_icon = _check_icon(PLAY_ICON_COLOR, size)
+        self.row_stopped_icon = _stop_icon(ICON_DISABLED_COLOR, size)
+        self.row_fail_icon = _cross_icon(STOP_ICON_COLOR, size)
+        self.row_stop_icon = _stop_icon(STOP_ICON_COLOR, size)
 
     # ------------------------------------------------------- connect handlers
 
@@ -1873,7 +1984,10 @@ class BackupApp:
                      "messages": [], "row_index": 0,
                      "server_total": 0, "pending_total": 0, "backed": 0,
                      "count_text": "尚未开始备份", "status_text": "", "status_error": False,
-                     "progress": None, "result": None}
+                     "progress": None, "result": None,
+                     "run_phase": PHASE_IDLE,        # 账户独立备份阶段（见 ACTIVE_PHASES）
+                     "result_at": None,             # 终态时刻（monotonic）：冷却窗与绿勾 TTL 共用
+                     "icon_job": None}              # 终态图标的自动清除 after 句柄
             self._states[account_id] = state
         return state
 
@@ -1969,7 +2083,7 @@ class BackupApp:
             「同快照只弹一次」的记忆一并清掉——手动刷新就是要再问一次密码。
         """
         account_id = self._selected_account_id
-        if account_id is None or self.running:
+        if account_id is None or self._visible_account_active():
             return
         state = self._state(account_id)
         state["snapshot"] = None
@@ -2020,7 +2134,7 @@ class BackupApp:
         loading = (self._selected_account_id is not None
                    and self._selected_account_id in self._loading_folder_ids)
         self._show_folder_loading(loading)
-        if not self.running:
+        if not self._visible_account_active():
             self.reload_btn.configure(state="disabled" if loading else "normal")
         if loading:
             self._start_folder_loading()
@@ -2272,8 +2386,8 @@ class BackupApp:
         return own + self._descendant_rows(key)
 
     def _on_folder_check(self, key: tuple[str, ...]) -> None:
-        if self.running:
-            return  # 运行中配置区锁定；标签只能置灰，点击要靠这里挡住
+        if self._visible_account_active():
+            return  # 可见账户备份中配置区锁定；标签只能置灰，点击要靠这里挡住
         subtree = self._folder_subtree(key)
         turning_on = not any(r["var"].get() for r in subtree)
         for r in subtree:
@@ -2292,8 +2406,8 @@ class BackupApp:
         self._update_start_state()
 
     def _toggle_folder_open(self, key: tuple[str, ...]) -> None:
-        if self.running:
-            return  # 运行中配置区锁定；标签只能置灰，点击要靠这里挡住
+        if self._visible_account_active():
+            return  # 可见账户备份中配置区锁定；标签只能置灰，点击要靠这里挡住
         node = self._folder_nodes[key]
         node["open"] = not node["open"]
         self._pack_kids(node)
@@ -2454,16 +2568,23 @@ class BackupApp:
                                activebackground=ACCOUNT_ROW_BG, highlightthickness=0, borderwidth=0,
                                padx=0, pady=0, cursor="hand2", command=self._sync_account_checks)
         check.pack(side="left", padx=(2, 0))
+        # 行尾状态图标槽（统计/备份/完成/已停止/失败，ADR 0012）：先 pack 到右边占位，空白期挂
+        # 透明 blank，名称横跳与行高变化都不会发生；背景随行底色（选中蓝行上彩图标仍可辨）。
+        icon = tk.Label(frame, image=self.row_icon_blank, background=ACCOUNT_ROW_BG, padx=0, pady=0,
+                        cursor="hand2")
+        icon.pack(side="right", padx=(0, 2))
         label = tk.Label(frame, text=account_display(account), anchor="w", cursor="hand2", padx=0,
                          background=ACCOUNT_ROW_BG, foreground=ACCOUNT_ROW_FG)
         label.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self._account_rows[account_id] = {"frame": frame, "check": check, "label": label, "var": var}
+        self._account_rows[account_id] = {"frame": frame, "check": check, "label": label,
+                                          "icon": icon, "var": var}
         # 名称截断的 store（口径同文件夹名）：超侧边栏宽就省略号，悬停看全文
         store = self._account_rows[account_id]
         store["text_full"] = store["tip_full"] = account_display(account)
         store["text_shown"] = store["text_full"]
         self._bind_name_tip(label, store)
-        for widget in (frame, label):
+        # 点行内任何位置（含行尾状态图标）都切换到该账户；点复选框由它自己的 command 处理
+        for widget in (frame, label, icon):
             widget.bind("<Button-1>", lambda _e, _id=account_id: self._on_account_row_click(_id))
 
     def _render_account_rows(self) -> None:
@@ -2476,6 +2597,61 @@ class BackupApp:
                                    foreground=ACCOUNT_ROW_SELECTED_FG if selected else ACCOUNT_ROW_FG)
             # activebackground 跟着行底色走：不然按复选框时会在蓝行上闪出灰方块
             row["check"].configure(background=background, activebackground=background)
+            row["icon"].configure(background=background)
+            self._apply_account_icon(account_id)
+
+    def _apply_account_icon(self, account_id: str) -> None:
+        """按账户阶段/终态把对应状态图标挂到行尾（无行控件或活动集合外的清理后静默跳过）。"""
+        row = self._account_rows.get(account_id)
+        if row is None:
+            return
+        state = self._states.get(account_id)
+        phase = state["run_phase"] if state is not None else PHASE_IDLE
+        result = state["result"] if state is not None else None
+        if phase in (PHASE_CONNECTING, PHASE_SCANNING):
+            image = self.row_scan_icon
+        elif phase == PHASE_BACKING:
+            image = self.row_download_icon
+        elif phase == PHASE_STOPPING:
+            image = self.row_stop_icon
+        elif isinstance(result, tuple) and result[0] == "failed":
+            image = self.row_fail_icon
+        elif isinstance(result, tuple) and result[0] == "stopped":
+            image = self.row_stopped_icon
+        elif isinstance(result, tuple) and result[0] == "done":
+            image = self.row_done_icon
+        else:
+            image = self.row_icon_blank
+        row["icon"].configure(image=image)
+
+    def _schedule_result_icon(self, account_id: str, result_tuple: tuple, ttl_s: float | None) -> None:
+        """落终态结果与图标；给了 ttl_s 的（完成/已停止）到期自动清回空白，失败常驻到下次启动。"""
+        state = self._state(account_id)
+        state["result"] = result_tuple
+        state["result_at"] = time.monotonic()
+        self._cancel_result_icon_job(state)
+        self._apply_account_icon(account_id)
+        if ttl_s is not None:
+            state["icon_job"] = self.root.after(int(ttl_s * 1000),
+                                                lambda a=account_id, t=state["result_at"]:
+                                                self._clear_result_icon(a, t))
+
+    def _clear_result_icon(self, account_id: str, stamped_at: float | None) -> None:
+        """TTL 到期：终态时刻没被新一轮结果替换才清（重启账户/新结果会换戳，旧 after 空转）。"""
+        state = self._states.get(account_id)
+        if state is None or state["run_phase"] != PHASE_IDLE or state["result_at"] != stamped_at:
+            return
+        state["result"] = None
+        state["result_at"] = None
+        state["icon_job"] = None
+        self._apply_account_icon(account_id)
+
+    def _cancel_result_icon_job(self, state: dict) -> None:
+        job = state.get("icon_job")
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+            state["icon_job"] = None
 
     def _on_account_row_click(self, account_id: str) -> None:
         """点行（复选框以外的地方）= 切换右侧详情，与勾选互不牵连。"""
@@ -2484,8 +2660,17 @@ class BackupApp:
 
     def _sync_account_checks(self) -> None:
         """把行的勾选收成账户 id 集合（三个工具按钮与单个复选框共用这一个入口）。"""
+        previous = set(self._checked_accounts)
         self._checked_accounts = {account_id for account_id, row in self._account_rows.items()
                                   if row["var"].get()}
+        for account_id in previous - self._checked_accounts:
+            # 脱钩＝撤掉备份意愿：空闲账户的终态图标/冷却立即清掉（活动账户跑完也不再挂终态图标）
+            state = self._states.get(account_id)
+            if state is not None and state["run_phase"] == PHASE_IDLE and state["result"] is not None:
+                self._cancel_result_icon_job(state)
+                state["result"] = None
+                state["result_at"] = None
+                self._apply_account_icon(account_id)
         self._update_start_state()
 
     def _set_all_account_checks(self, value: bool) -> None:
@@ -2549,9 +2734,13 @@ class BackupApp:
         # 格式复选框按账户还原（command 只在用户点击时触发，这里 set 不会写回账户）
         self.mbox_var.set(bool(account.get("mbox", False)))
         self.eml_var.set(bool(account.get("eml", True)))
-        self._set_config_enabled(not self.running)
+        self._set_config_enabled(not self._visible_account_active())
         self._update_start_state()
         self._sync_folder_loading_view()   # 切账户换视图：目标账户在拉清单就盖动画层（Q8）
+        # 别的账户还在跑时帧链仍在：切账户当帧重画，转圈立刻落到新选中账户对应的按钮上
+        if self.running:
+            self._stop_run_spinner()
+            self._run_spinner_tick(0)
 
     def _render_card(self, account: dict | None) -> None:
         """只读信息卡：账户缺失时全部显示占位符；密码不在卡片上（只在设置页账户表单维护）。"""
@@ -2855,10 +3044,16 @@ class BackupApp:
         account = self._find_account(self._editing_account_id)
         if account is None:
             return
+        if self._is_account_active(account["id"]):
+            messagebox.showwarning(ACTIVE_DELETE_WARN_TITLE, ACTIVE_DELETE_WARN_TEXT, parent=self.root)
+            return
         if not self._ask_delete_account(account):
             return
+        state = self._states.pop(account["id"], None)
+        if state is not None:
+            self._cancel_result_icon_job(state)
+        self._stop_events.pop(account["id"], None)
         self.accounts.remove(account)
-        self._states.pop(account["id"], None)
         if self._selected_account_id == account["id"]:
             self._selected_account_id = self.accounts[0]["id"] if self.accounts else None
             self._ui_settings["selected_account"] = self._selected_account_id
@@ -3531,19 +3726,33 @@ class BackupApp:
     # ------------------------------------------------------------- run control
 
     def _update_start_state(self, *_args) -> None:
+        """右下开始/停止按钮只描述**当前选中账户**（ADR 0012：各账户独立运行/停止）。"""
         state = self._visible_state()
-        ok = (state is not None
-              and any(r["var"].get() for r in self.folder_rows)
-              and (self.mbox_var.get() or self.eml_var.get())
-              and not self.running)
-        self.start_btn.configure(state="normal" if ok else "disabled")
-        if not self.running:
-            # 图标随可用性换彩色/灰度（Q4）；运行中图标归 spinner 的透明占位，不碰
-            self.start_btn.configure(image=self.start_icon if ok else self.start_icon_off)
-        self.backup_selected_btn.configure(state="normal" if self.accounts and not self.running else "disabled")
+        phase = state["run_phase"] if state is not None else PHASE_IDLE
+        if phase in (PHASE_CONNECTING, PHASE_SCANNING, PHASE_BACKING):
+            # 活动中：开始位禁用、绿三角换透明占位（转圈文案由帧链写），停止位可用、红方块
+            self.start_btn.configure(state="disabled", image=self.blank_icon)
+            self.stop_btn.configure(state="normal", image=self.stop_icon)
+        elif phase == PHASE_STOPPING:
+            # 该账户停止中：开始位静止禁用，停止位禁用并由帧链写「正在停止…」
+            self.start_btn.configure(state="disabled")
+            self._restore_start_button()
+            self.stop_btn.configure(state="disabled", image=self.blank_icon)
+        else:
+            ok = (state is not None
+                  and any(r["var"].get() for r in self.folder_rows)
+                  and (self.mbox_var.get() or self.eml_var.get()))
+            self.start_btn.configure(state="normal" if ok else "disabled")
+            self._restore_start_button()   # 图标随可用性换彩色/灰度
+            self.stop_btn.configure(state="disabled")
+            self._restore_stop_button()
+        # 按钮文案/图标（如停止后恢复「开始备份」）改变了请求宽，立即重排按钮行，
+        # 否则要等下次窗口 <Configure> 才按新宽度布局，期间文本被裁（问题：停止后显示不全）
+        if self._bar.winfo_ismapped():
+            self._bar.update_idletasks()
 
     def _set_loading_frame(self, button: ttk.Button, label: str, index: int) -> None:
-        """把按钮画成加载态的第 index 帧（开始/停止按钮的转圈共用这一个入口）。
+        """把按钮画成加载态的第 index 帧（开始/停止/停止所有的转圈共用这一个入口）。
 
         Args:
             button: 要画帧的按钮。
@@ -3556,34 +3765,32 @@ class BackupApp:
         button.configure(text=f"{SPINNER_FRAMES[index % len(SPINNER_FRAMES)]} {label}")
 
     def _start_run_spinner(self) -> None:
-        """开始按钮的加载态（进入运行态时调用，此刻 self.running 已置真）：绿三角换透明占位、只留转圈文字。"""
-        self._stop_run_spinner()  # 防重复进入：旧 job 不取消会留下第二条帧链
-        self.start_btn.configure(image=self.blank_icon)
+        """启动（或重启）唯一一条运行 spinner 帧链；防重复进入：旧 job 不取消会留下第二条链。"""
+        self._stop_run_spinner()
         self._run_spinner_tick(0)
 
     def _run_spinner_tick(self, index: int) -> None:
-        """画第 index 帧，并按状态决定排不排下一帧、以及画在哪颗按钮上。
-
-        Args:
-            index: 帧序号。
+        """画第 index 帧：同时画「停止所有」按钮（停止所有进行中）与选中账户的开始/停止按钮。
 
         Note:
-            帧链只有一条（job 槽 self._run_spinner_job）：运行中画开始按钮，停止中改画停止按钮
-            （开始按钮已在 _on_stop 里退回静止外观），所以「谁在忙」永远只有一颗按钮在转。
-            退出时把整段运行态界面复位（两颗按钮）：有的路径会把 running 直接置假
-            而不走 _end_run_controls，不在这儿兜一下，按钮上会残留「正在备份…」/「正在停止…」。
-            帧推进单独成方法，测试可直接驱动。
+            帧链只有一条（job 槽 self._run_spinner_job），但目标可以有两颗：左栏的「停止所有」
+            与右下属于选中账户的按钮。选中账户空闲（别的账户在跑）时两颗右下按钮保持静止。
+            running 变假（活动集合排空）时帧链在这里自愈退出并复位右下按钮。
         """
         if not self.running:
             self._run_spinner_job = None
-            self.stopping = False
-            self._restore_start_button()
-            self._restore_stop_button()
             self._update_start_state()
             return
-        button, label = ((self.stop_btn, STOPPING_BTN_LABEL) if self.stopping
-                         else (self.start_btn, RUNNING_BTN_LABEL))
-        self._set_loading_frame(button, label, index)
+        if self._stopping_all:
+            self._set_loading_frame(self.stop_all_btn, STOPPING_BTN_LABEL, index)
+        state = self._visible_state()
+        phase = state["run_phase"] if state is not None else PHASE_IDLE
+        if phase == PHASE_STOPPING:
+            self._set_loading_frame(self.stop_btn, STOPPING_BTN_LABEL, index)
+        elif phase in (PHASE_CONNECTING, PHASE_SCANNING):
+            self._set_loading_frame(self.start_btn, SCANNING_BTN_LABEL, index)
+        elif phase == PHASE_BACKING:
+            self._set_loading_frame(self.start_btn, RUNNING_BTN_LABEL, index)
         self._run_spinner_job = self.root.after(SPINNER_INTERVAL_MS, self._run_spinner_tick, index + 1)
 
     def _stop_run_spinner(self) -> None:
@@ -3634,21 +3841,9 @@ class BackupApp:
         self._fit_counts()
         self._fit_status()
 
-    def _begin_run_ui(self) -> None:
-        """开始备份的界面侧（调用前 self.running 已置真）。
-
-        锁配置区、切到列表。
-        """
-        self._ensure_status_rows()
-        self._set_config_enabled(False)
-        self._start_run_spinner()
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal", image=self.stop_icon)   # 启用即彩色（Q4）
-        self.notebook.select(0)
-
     def _on_start(self) -> None:
-        """备份当前账户：校验后走连接预检（预检全过才并发同步，ADR 0011）。"""
-        if self.running or self._preflight_active():
+        """备份当前账户（右下入口）：校验后走连接预检。显式单账户命令绕过完成冷却（ADR 0012）。"""
+        if self._visible_account_active() or self._preflight_active():
             return
         account = self._find_account(self._selected_account_id)
         if account is None:
@@ -3662,9 +3857,19 @@ class BackupApp:
         self._sync_visible_folder_choices()
         self._begin_preflight([account["id"]])
 
+    def _in_done_cooldown(self, account: dict) -> bool:
+        """该账户是否处于完成冷却窗（绿勾显示期）：批量入口此时跳过它，单账户入口可绕过。"""
+        state = self._states.get(account["id"])
+        if state is None or state.get("result_at") is None:
+            return False
+        result = state["result"]
+        if not (isinstance(result, tuple) and result[0] == "done"):
+            return False
+        return time.monotonic() - state["result_at"] < DONE_COOLDOWN_S
+
     def _on_start_selected(self) -> None:
-        """备份所选账户：跳过信息不完整的并逐个提示，其余走连接预检。"""
-        if self.running or self._preflight_active():
+        """「备份所选」：跑勾着、空闲且不在完成冷却窗内的账户；活动账户照跑不受影响（ADR 0012）。"""
+        if self._preflight_active():
             return
         if not self.accounts:
             messagebox.showwarning("信息不完整", "还没有账户，请先在设置页的「账户」里新增。", parent=self.root)
@@ -3677,9 +3882,14 @@ class BackupApp:
             return
         ready: list[dict] = []
         skipped: list[str] = []
+        cooling: list[str] = []
         for account in chosen:
+            if self._is_account_active(account["id"]):
+                continue   # 已在备份：不受影响、不重入
             if self._account_credentials(account, warn=False) is None:
                 skipped.append(account_display(account))
+            elif self._in_done_cooldown(account):
+                cooling.append(account_display(account))
             else:
                 ready.append(account)
         if skipped:
@@ -3687,8 +3897,14 @@ class BackupApp:
                                    "以下账户信息不完整（缺邮箱地址、收件服务器或密码），本次不备份：\n"
                                    + "\n".join(skipped), parent=self.root)
         if not ready:
-            messagebox.showwarning("信息不完整", "勾选的账户信息都不完整，请先在设置页补全账户信息与密码。",
-                                   parent=self.root)
+            if cooling and not skipped:
+                messagebox.showwarning(
+                    COOLING_WARN_TITLE,
+                    COOLING_WARN_TEXT.format(cooldown=DONE_COOLDOWN_S, names="\n".join(cooling)),
+                    parent=self.root)
+            elif not skipped:
+                # 勾着的账户都已在备份中：不弹打断框，按钮反馈在行图标与进度上
+                self.log.info("勾选的账户都已在备份中，无需重复启动")
             return
         self._sync_visible_folder_choices()
         self._begin_preflight([account["id"] for account in ready])
@@ -3731,7 +3947,6 @@ class BackupApp:
         snapshots = self._account_snapshots(account_ids)
         if not snapshots:
             return
-        self._run_passwords = {}
         rows: dict[str, tk.Label] = {}
         win = tk.Toplevel(self.root)
         win.title(PREFLIGHT_TITLE)
@@ -3851,7 +4066,8 @@ class BackupApp:
             messagebox.showwarning("没有可备份的账户", "所有账户都未通过连接检测，本次未备份。",
                                    parent=self.root)
             return
-        self._begin_run(ready)
+        self._launch_accounts(ready)
+        self.notebook.select(0)   # 开跑即切到邮件列表页（与旧批量入口一致）
 
     def _close_preflight_win(self, pf: dict) -> None:
         win = pf.get("win")
@@ -3909,13 +4125,21 @@ class BackupApp:
         messagebox.showwarning("信息不完整", "请先在设置页的「备份」里选择备份保存位置。", parent=self.root)
         return False
 
-    def _begin_run(self, account_ids: list[str]) -> None:
-        """进入运行态并把参与账户的重跑基线复位（预检通过后调用）。"""
-        self.running = True
-        self.stopping = False
-        self.stop_flag.clear()
-        self._run_account_ids = list(account_ids)
-        self._run_t0 = time.monotonic()
+    def _launch_accounts(self, account_ids: list[str]) -> None:
+        """预检通过后启动这些账户的备份（账户各自独立，可在已有活动账户时追加，ADR 0012）。
+
+        每账户复位自己的重跑基线、建独立停止信号并各起一条下载线程；活动集合从空变非空时
+        开一个新周期（汇总记账），随后追加的账户并入当前周期。
+        """
+        account_ids = [aid for aid in account_ids if not self._is_account_active(aid)]
+        if not account_ids:
+            return
+        outdir = self.backup_root_var.get().strip()
+        snapshots = self._account_snapshots(account_ids)
+        if not self._has_active_accounts():
+            self._cycle = {"t0": time.monotonic(), "backed": 0, "skipped": 0,
+                           "failures": [], "stopped": False, "ids": set()}
+            self.log.info("开始备份运行：输出 %s", outdir)
         for account_id in account_ids:
             state = self._state(account_id)
             state["messages"] = []
@@ -3923,19 +4147,29 @@ class BackupApp:
             state["server_total"] = state["pending_total"] = state["backed"] = 0
             state["progress"] = None
             state["result"] = None
+            state["result_at"] = None
             state["status_error"] = False
             state["status_text"] = CONNECTING_STATUS_TEXT
-            state["count_text"] = "尚未开始备份"
+            state["count_text"] = "正在统计…"
+            state["run_phase"] = PHASE_CONNECTING
+            self._cancel_result_icon_job(state)
+            self._apply_account_icon(account_id)
+        self._cycle["ids"].update(account_ids)
+        self._ensure_status_rows()
         visible = self._visible_state()
-        if visible is not None:
+        if visible is not None and visible["run_phase"] in ACTIVE_PHASES:
             self._render_messages(visible)
             self._restore_run_state(visible)
-        self._begin_run_ui()
-        outdir = self.backup_root_var.get().strip()
-        snapshots = self._account_snapshots(account_ids)
-        self.log.info("开始备份运行：%d 个账户，输出 %s", len(snapshots), outdir)
-        self._sync_tray()  # 图标常驻时窗口可见也挂着：菜单「停止备份」此刻就该可点
-        threading.Thread(target=self._batch_worker, args=(snapshots, outdir), daemon=True).start()
+        log = logging.getLogger("imapbackup")
+        for snapshot in snapshots:
+            account_id = snapshot["id"]
+            stop_event = threading.Event()
+            self._stop_events[account_id] = stop_event
+            self.events.put(("account_begin", account_id))
+            thread = threading.Thread(target=self._backup_account_thread,
+                                      args=(snapshot, outdir, self.events, log, stop_event), daemon=True)
+            thread.start()
+        self._on_active_set_changed()
 
     def _account_snapshots(self, account_ids: list[str]) -> list[dict]:
         """开跑前把参与账户复制一份（含解出的密码）：运行中改设置不影响本次运行。
@@ -3954,57 +4188,28 @@ class BackupApp:
             snapshots.append(data)
         return snapshots
 
-    def _batch_worker(self, snapshots: list[dict], outdir: str) -> None:
-        """并发同步入口：通过预检的账户各起一条下载线程，任一账户失败不影响其余（ADR 0011）。
-
-        Note:
-            每账户独立 IMAP 连接、独立日志前缀（_AccountLogAdapter），所以日志混排但每行可辨；
-            「每封消息只 fetch 一次」的判重不变量不受并发影响（各自账户独立判重）。
-            等全部线程收尾后汇总 batch_done；停止口径（stop_flag）全局生效。
-        """
-        log = logging.getLogger("imapbackup")
-        eq = self.events
-        failures: list[tuple[str, str]] = []
-        lock = threading.Lock()
-        threads: list[threading.Thread] = []
-        for account in snapshots:
-            account_id = account["id"]
-            if self.stop_flag.is_set():
-                eq.put(("account_skipped", account_id))
-                continue
-            eq.put(("account_begin", account_id))
-            thread = threading.Thread(target=self._backup_account_thread,
-                                      args=(account, outdir, eq, log, failures, lock), daemon=True)
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            thread.join()
-        eq.put(("batch_done", self.stop_flag.is_set(), failures))
-
     def _backup_account_thread(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger,
-                               failures: list[tuple[str, str]], lock: threading.Lock) -> None:
-        """单账户下载线程：跑 _backup_account，异常收口到 failures（并发下加锁写共享列表）。"""
+                               stop_event: threading.Event) -> None:
+        """单账户下载线程：跑 _backup_account，异常统一收口为 account_failed 事件（ADR 0012）。"""
         name = account_display(account)
         account_log = _account_logger(account["id"], name)
         try:
-            self._backup_account(account, outdir, eq, account_log)
+            self._backup_account(account, outdir, eq, account_log, stop_event)
         except SystemExit as e:
-            with lock:
-                failures.append((name, str(e)))
             eq.put(("account_failed", account["id"], str(e)))
         except Exception as e:
             account_log.exception("账户备份失败：%s", name)
-            with lock:
-                failures.append((name, f"{type(e).__name__}: {e}"))
             eq.put(("account_failed", account["id"], f"{type(e).__name__}: {e}"))
 
-    def _backup_account(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger) -> None:
+    def _backup_account(self, account: dict, outdir: str, eq: queue.Queue, log: logging.Logger,
+                        stop_event: threading.Event) -> None:
         """单个账户的备份：先统计待备份总量、再逐文件夹下载，进度经事件队列回主线程。
 
         Note:
             每次运行都自己 LIST 一次文件夹（不依赖界面上那份清单）：从没连接过的账户在批量里
             也要能直接跑，且以服务器此刻的文件夹为准。账户目录名取邮箱地址（ADR 0002），
-            账户名称只是显示名、不参与路径。
+            账户名称只是显示名、不参与路径。停止只看本账户的 stop_event（ADR 0012：停一个
+            账户不影响其余）。
         """
         account_id = account["id"]
         t0 = time.monotonic()
@@ -4040,7 +4245,7 @@ class BackupApp:
             server_total = 0
             pending_total = 0
             for i, n in enumerate(selected, 1):
-                if self.stop_flag.is_set():
+                if stop_event.is_set():
                     break
                 foldername, filename, eml_relpath, display = n
                 eq.put(("phase", account_id, f"扫描 {i}/{len(selected)}：{display}"))
@@ -4065,12 +4270,12 @@ class BackupApp:
             eq.put(("totals", account_id, server_total, pending_total))
 
             # pass 2: download; folders were re-selectable because scan_folder moved the selection each time
-            if pending_total > 0 and not self.stop_flag.is_set():
+            if pending_total > 0 and not stop_event.is_set():
                 if basedir is not None:
                     core.ensure_basedir(basedir)
                     core.create_folder_structure([p[0] for p in plans], basedir, account_dir)
                 for n, new, local_mbox, local_eml in plans:
-                    if self.stop_flag.is_set():
+                    if stop_event.is_set():
                         break
                     foldername, filename, eml_relpath, display = n
                     if not new:
@@ -4086,34 +4291,92 @@ class BackupApp:
                                            basedir, False, quiet=False, log=log,
                                            eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                            foldername=display,
-                                           report=report, should_stop=self.stop_flag.is_set)
+                                           report=report, should_stop=stop_event.is_set)
         finally:
             with contextlib.suppress(Exception):
                 server.logout()
         seconds = time.monotonic() - t0
         eq.put(("account_done", account_id, backed, server_total - pending_total, seconds,
-                self.stop_flag.is_set(), pending_total))
+                stop_event.is_set(), pending_total))
+
+    def _is_account_active(self, account_id: str | None) -> bool:
+        """该账户是否处于备份活动态（连接/统计/下载/停止中）。"""
+        if account_id is None:
+            return False
+        state = self._states.get(account_id)
+        return state is not None and state["run_phase"] in ACTIVE_PHASES
+
+    def _visible_account_active(self) -> bool:
+        return self._is_account_active(self._selected_account_id)
+
+    def _active_account_ids(self) -> list[str]:
+        return [account["id"] for account in self.accounts if self._is_account_active(account["id"])]
+
+    def _has_active_accounts(self) -> bool:
+        return bool(self._active_account_ids())
 
     def _on_stop(self) -> None:
-        """停止中：多处同时给反馈。
-
-        停止按钮接手转圈、开始按钮退回静止外观、状态行清空、配置区提示换口径。
-
-        Note:
-            帧链不用重启（工作线程还在收尾、self.running 仍为真），下一帧起 _run_spinner_tick
-            会按 stopping 把帧画到停止按钮上；所以这里翻状态后当帧就把开始按钮复位，点击立刻
-            有反馈。状态行只清文案、不收回整行：版本号与行高都留在原地，结束时已有「已停止：…」
-            回填。
-        """
-        if not self.running:
+        """停止当前选中账户（右下停止钮，ADR 0012）：只给这一个账户发信号，其余账户照常备份。"""
+        account_id = self._selected_account_id
+        if account_id is None:
             return
-        self.stop_flag.set()
-        self.stopping = True
+        state = self._states.get(account_id)
+        if state is None or state["run_phase"] not in ACTIVE_PHASES:
+            return
+        self._stop_events.setdefault(account_id, threading.Event()).set()
+        state["run_phase"] = PHASE_STOPPING
         self.stop_btn.configure(state="disabled", image=self.blank_icon)
         self._restore_start_button()
         self._stop_run_spinner()  # 取消挂起的那一帧，立即按新目标重画第 0 帧：点下去当刻就见反馈
         self._run_spinner_tick(0)
         self._set_status("", error=False)
+        self._apply_account_icon(account_id)
+        if self._bar.winfo_ismapped():
+            self._bar.update_idletasks()   # 开始按钮恢复静止后请求宽变化，立即重排避免文本被裁
+
+    def _on_stop_all(self) -> None:
+        """「停止所有」：给每个活动账户发各自的停止信号，按钮自身接手转圈，全部收尾后消失。"""
+        active = self._active_account_ids()
+        if not active:
+            return
+        for account_id in active:
+            self._stop_events.setdefault(account_id, threading.Event()).set()
+            state = self._states[account_id]
+            if state["run_phase"] != PHASE_STOPPING:
+                state["run_phase"] = PHASE_STOPPING
+                self._apply_account_icon(account_id)
+        self._stopping_all = True
+        self.stop_all_btn.configure(state="disabled", image=self.blank_icon)
+        self._update_start_state()                 # 可见账户若在活动，右下停止钮同步进停止态
+        self._stop_run_spinner()
+        self._run_spinner_tick(0)
+        if self._visible_account_active():
+            self._set_status("", error=False)
+
+    def _on_active_set_changed(self) -> None:
+        """活动集合（哪些账户在备份）变化的唯一收口：按钮、spinner、配置锁、托盘统一在这里刷。"""
+        active = self._active_account_ids()
+        self.running = bool(active)
+        # 「停止所有」：有活动才出现；排空时恢复静止外观并隐藏（停止所有转圈也到此结束）
+        if active:
+            if not self.stop_all_btn.winfo_ismapped():
+                # 上 4px 与「备份所选」分隔；下边距由容器统一提供（4px），避免叠成 8px
+                self.stop_all_btn.pack(side="top", fill="x", padx=4, pady=(4, 0),
+                                       after=self.backup_selected_btn)
+            if not self._stopping_all:
+                self.stop_all_btn.configure(state="normal", text=STOP_ALL_BTN_LABEL,
+                                            image=self.stop_icon)
+            self._start_run_spinner()
+        else:
+            self._stopping_all = False
+            self.stop_all_btn.configure(state="normal", text=STOP_ALL_BTN_LABEL, image=self.stop_icon)
+            self.stop_all_btn.pack_forget()
+            self._stop_run_spinner()
+        # 「备份所选」运行中始终可点（预检弹窗的模态 grab 会自然挡住重入），只在没有账户时禁用
+        self.backup_selected_btn.configure(state="normal" if self.accounts else "disabled")
+        self._update_start_state()
+        self._set_config_enabled(not self._visible_account_active())
+        self._sync_tray()  # 图标常驻时窗口可见也挂着：菜单「停止备份」按活动集合可点
 
     # ------------------------------------------------------------ event pump
 
@@ -4148,20 +4411,15 @@ class BackupApp:
             self._on_account_done(*ev[1:])
         elif kind == "account_failed":
             self._on_account_failed(*ev[1:])
-        elif kind == "account_skipped":
-            self._on_account_skipped(ev[1])
-        elif kind == "batch_done":
-            self._on_batch_done(*ev[1:])
         elif kind == "tray_show":
             self._show_window()
         elif kind == "tray_stop":
-            if self.running:
-                self._on_stop()
+            self._on_stop_all()
         elif kind == "tray_quit":
             self._on_tray_quit()
 
     def _on_account_begin(self, account_id: str) -> None:
-        """某账户轮到开跑：清掉它上一轮的行，把状态切到「正在连接」。"""
+        """某账户开跑：清掉它上一轮的行，状态切到「正在连接」（launch 已置 phase，这里幂等）。"""
         state = self._states.get(account_id)
         if state is None:
             return
@@ -4172,6 +4430,9 @@ class BackupApp:
         state["status_text"] = CONNECTING_STATUS_TEXT
         state["status_error"] = False
         state["count_text"] = "正在统计…"
+        if state["run_phase"] != PHASE_STOPPING:
+            state["run_phase"] = PHASE_CONNECTING
+            self._apply_account_icon(account_id)
         if account_id == self._selected_account_id:
             self._render_messages(state)
             self._restore_run_state(state)
@@ -4180,8 +4441,16 @@ class BackupApp:
         state = self._states.get(account_id)
         if state is None:
             return
+        # 停止信号已发：worker 可能还在投文件夹间隙的 phase 事件，不允许把 stopping 降回活动态
+        if state["run_phase"] == PHASE_STOPPING:
+            return
         state["status_text"] = text
         state["status_error"] = False
+        if text.startswith("备份"):
+            state["run_phase"] = PHASE_BACKING
+        else:
+            state["run_phase"] = PHASE_SCANNING
+        self._apply_account_icon(account_id)
         if account_id == self._selected_account_id:
             self._set_status(text, error=False)
 
@@ -4191,6 +4460,9 @@ class BackupApp:
             return
         state["server_total"] = server_total
         state["pending_total"] = pending_total
+        if state["run_phase"] != PHASE_STOPPING and pending_total > 0:
+            state["run_phase"] = PHASE_BACKING
+            self._apply_account_icon(account_id)
         if account_id != self._selected_account_id:
             return
         self.server_total, self.pending_total = server_total, pending_total
@@ -4216,11 +4488,12 @@ class BackupApp:
 
     def _on_account_done(self, account_id: str, backed: int, skipped: int, seconds: float,
                          stopped: bool, pending: int) -> None:
-        """单个账户跑完：写结果文案（停止 / 已是最新 / 完成三态）。"""
+        """单个账户跑完：结果文案（停止 / 已是最新 / 完成三态）+ 行尾终态图标（带 TTL）。"""
         state = self._states.get(account_id)
         if state is None:
             return
-        state["result"] = ("done", backed, skipped, seconds, pending)
+        kind = "stopped" if stopped else "done"
+        state["run_phase"] = PHASE_IDLE
         if stopped:
             state["status_text"] = f"已停止：本次备份 {backed} 封"
         elif pending == 0:
@@ -4233,72 +4506,69 @@ class BackupApp:
         self.log.info("账户 %s 备份结束：备份 %d 封，跳过 %d 封，用时 %s%s",
                       account_display(account) if account else account_id, backed, skipped,
                       _fmt_duration(seconds), "（用户停止）" if stopped else "")
-        if account_id != self._selected_account_id:
-            return
-        if not stopped and pending > 0:
-            self.progress.configure(value=self.progress["maximum"])
-            state["progress"] = (float(self.progress["maximum"]), float(self.progress["maximum"]))
-        self._set_status(state["status_text"], error=False)
+        # 终态图标只挂给仍勾选（仍有备份意愿）的账户：脱钩即意愿移除，不挂结果也不进冷却
+        if account_id in self._checked_accounts:
+            ttl = STOPPED_ICON_TTL_S if stopped else DONE_COOLDOWN_S
+            self._schedule_result_icon(
+                account_id, (kind, backed, skipped, seconds, pending), ttl)
+        else:
+            state["result"] = None
+            state["result_at"] = None
+            self._apply_account_icon(account_id)
+        self._cycle["backed"] += backed
+        self._cycle["skipped"] += skipped
+        self._cycle["stopped"] = self._cycle["stopped"] or stopped
+        if account_id == self._selected_account_id:
+            if not stopped and pending > 0:
+                self.progress.configure(value=self.progress["maximum"])
+                state["progress"] = (float(self.progress["maximum"]), float(self.progress["maximum"]))
+            self._set_status(state["status_text"], error=False)
+        self._after_account_terminal()
 
     def _on_account_failed(self, account_id: str, message: str) -> None:
         state = self._states.get(account_id)
         if state is None:
             return
+        failed_account = self._find_account(account_id)
+        name = account_display(failed_account) if failed_account is not None else account_id
+        state["run_phase"] = PHASE_IDLE
         state["result"] = ("failed", message)
+        state["result_at"] = time.monotonic()
         state["status_text"] = "备份失败，详见运行日志"
         state["status_error"] = True
+        if account_id in self._checked_accounts:
+            self._schedule_result_icon(account_id, ("failed", message), None)  # 红叉常驻到下次启动
+        else:
+            self._apply_account_icon(account_id)
+        self._cycle["failures"].append((name, message))
+        self.log.error("账户 %s 备份失败：%s", name, message)
+        # 前台只在失败账户正被看着时弹一次打断框；其余账户走红叉 + 切过去看状态行
+        if account_id == self._selected_account_id and not self._background_hidden():
+            messagebox.showerror("备份失败", message, parent=self.root)
         if account_id == self._selected_account_id:
             self._set_status(state["status_text"], error=True)
+        self._after_account_terminal()
 
-    def _on_account_skipped(self, account_id: str) -> None:
-        """停止后没轮到的账户：状态退回「已停止」，不动它上一轮的计数与结果。"""
-        state = self._states.get(account_id)
-        if state is None:
+    def _after_account_terminal(self) -> None:
+        """一个账户到终态后的统一收口：刷界面；若活动集合就此排空，记汇总日志/发后台气泡。"""
+        still_active = self._has_active_accounts()
+        self._on_active_set_changed()
+        if still_active or self._preflight_active():
             return
-        state["status_text"] = "已停止（未开始）"
-        state["status_error"] = False
-        if account_id == self._selected_account_id:
-            self._set_status(state["status_text"], error=False)
-
-    def _on_batch_done(self, stopped: bool, failures: list[tuple[str, str]]) -> None:
-        """整个批量结束：复位控件，按后台/前台与成败给一次总结。"""
-        elapsed = time.monotonic() - self._run_t0
-        backed = sum(self._state(aid)["backed"] for aid in self._run_account_ids)
-        skipped = sum(max(self._state(aid)["server_total"] - self._state(aid)["pending_total"], 0)
-                      for aid in self._run_account_ids)
-        hidden = self._background_hidden()
-        self._end_run_controls()
-        self.log.info("备份运行结束：账户 %d 个，备份 %d 封，跳过 %d 封，用时 %s%s",
-                      len(self._run_account_ids), backed, skipped, _fmt_duration(elapsed),
-                      "（用户停止）" if stopped else "")
-        if hidden:
-            if stopped:
+        elapsed = time.monotonic() - self._cycle["t0"]
+        backed, skipped = self._cycle["backed"], self._cycle["skipped"]
+        failures = self._cycle["failures"]
+        self.log.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s",
+                      backed, skipped, _fmt_duration(elapsed),
+                      "（用户停止）" if self._cycle["stopped"] else "")
+        if self._background_hidden():
+            if self._cycle["stopped"]:
                 self._notify_background(TRAY_TITLE_STOPPED, TRAY_BODY_STOPPED)
             elif failures:
                 self._notify_background(TRAY_TITLE_FAILED, TRAY_BODY_FAILED)
             else:
                 self._notify_background(TRAY_TITLE_DONE,
                                         f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {_fmt_duration(elapsed)}")
-            return
-        if failures:
-            detail = failures[0][1] if len(failures) == 1 else f"{len(failures)} 个账户备份失败"
-            messagebox.showerror("备份失败", detail, parent=self.root)
-
-    def _end_run_controls(self) -> None:
-        self.running = False
-        self.stopping = False
-        # 停表先于解锁：转圈 job 必须取消，否则复位后它还会按 running 判定自己退出，白跑一轮
-        self._stop_run_spinner()
-        # 两颗按钮一起复位：停止中收尾时停止按钮上也挂着转圈文案
-        self._restore_start_button()
-        self._restore_stop_button()
-        self._set_config_enabled(True)
-        self.stop_btn.configure(state="disabled")
-        # 开始按钮按当前勾选情况重新判定（不是一律 disabled）：失败路径原先停在禁用态，
-        # 用户想重跑还得先去动一下复选框才解禁
-        self._update_start_state()
-        # 运行结束：常驻托盘图标的 tooltip 与菜单「停止备份」跟着复位（窗口可见时也挂着）
-        self._sync_tray()
 
     def _set_status(self, text: str, error: bool) -> None:
         """写状态行（截断显示），并同步进可见账户的状态字典——切账户后还要原样回来。"""
@@ -4337,11 +4607,16 @@ class BackupApp:
         natural = self.count_label.winfo_reqwidth()
         spare = width - fixed - natural  # 全文显示时进度条能分到的宽度
         if spare >= 220:
-            self.progress.configure(length=220)
+            new_length = 220
         elif spare >= PROGRESS_MIN_WIDTH:
-            self.progress.configure(length=max(spare, 1))  # 缩水阶段：文字照旧全文
+            new_length = max(spare, 1)   # 缩水阶段：文字照旧全文
         else:
-            self.progress.configure(length=PROGRESS_MIN_WIDTH)  # 触底：文字开始截断
+            new_length = PROGRESS_MIN_WIDTH  # 触底：文字开始截断
+        # length 只在真正变化时配：每封邮件都重配几何会让原生进度条填充块错位（显示成满格）
+        if new_length != getattr(self, "_progress_length", None):
+            self.progress.configure(length=new_length)
+            self._progress_length = new_length
+        if spare < PROGRESS_MIN_WIDTH:
             self._shrink_to_fit(self.count_label, self.count_var, self._count_full,
                                 width - fixed - PROGRESS_MIN_WIDTH)
         self._hide_tip()
@@ -4456,17 +4731,32 @@ class BackupApp:
             self._fit_folder_names_for(node)
 
     def _fit_account_names(self) -> None:
-        """账户名按列表宽截断：复选框与行内边距是固定占用，侧边栏拖宽后自动恢复全文。"""
-        budget = self.account_canvas.winfo_width() - 32
+        """账户名按列表宽截断：复选框、行尾状态图标槽与行内边距是固定占用，拖宽后自动恢复全文。"""
+        blank = getattr(self, "row_icon_blank", None)   # 启动期画布 Configure 可能早于图标挂载
+        if blank is None:
+            return
+        icon_slot = blank.width() + 6   # 图标边 + 图标右 2px + 名称右留白 4px
+        budget = self.account_canvas.winfo_width() - 32 - icon_slot
         if budget < 20:
             return
         for row in self._account_rows.values():
             self._fit_name_label(row["label"], row, budget)
 
     def _refresh_counts(self) -> None:
+        # 计数文案的分母（pending_total）与进度条 maximum 同源；value 钳进 [0, maximum]，
+        # 多账户事件流下二者绝不脱节。镜像由可见账户的 totals/message 事件实时同步。
+        maximum = max(self.pending_total, 1)
+        value = max(0, min(self.backed_count, maximum))
         self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ "
                          f"已备份 {self.backed_count} / {self.pending_total}")
-        self.progress.configure(value=self.backed_count)
+        # range 只在真正变化时配（每封邮件都重配 maximum 会让原生进度条在几何抖动时填充错位）
+        if float(self.progress.cget("maximum")) != float(maximum):
+            self.progress.configure(maximum=maximum)
+        self.progress.configure(value=value)
+        # 同步进可见账户状态：切走再切回时进度原样还原（旧实现只在 totals 时记 0，会归零）
+        state = self._visible_state()
+        if state is not None:
+            state["progress"] = (float(value), float(maximum))
 
     def _clear_message_rows(self) -> None:
         """清掉上一轮的邮件行；序号归零，斑马纹从第 1 行重新起算，空态提示重新挂出。"""
@@ -4514,19 +4804,29 @@ class BackupApp:
             把程序卡在后台会让升级/卸载关不掉旧实例。
         """
         action = decide_close(self._close_action(), hidden=self.root.state() == "withdrawn")
+        preference: str | None = None
+        remember = False
         if action == "ask":
             answer = self._ask_close_action()
             if answer is None:
                 return
             preference, remember = answer
-            if remember:
-                self._ui_settings[CLOSE_ACTION_KEY] = preference
-                self.log.info("关闭行为偏好已记住：%s", preference)
             # 对话框说的是偏好口径（tray/exit，勾了记住就直接存），这里换成动作口径
             action = "hide" if preference == CLOSE_ACTION_TRAY else "exit"
         if action == "hide":
             self._hide_to_background()
+            return
+        # 退出：有活动账户先二次确认并优雅停止（拒绝则偏好也不写，什么都不变）
+        if self._has_active_accounts():
+            if not self._confirm_and_quit():
+                return
+            if remember and preference is not None:
+                self._ui_settings[CLOSE_ACTION_KEY] = preference
+                self.log.info("关闭行为偏好已记住：%s", preference)
         else:
+            if remember and preference is not None:
+                self._ui_settings[CLOSE_ACTION_KEY] = preference
+                self.log.info("关闭行为偏好已记住：%s", preference)
             self._save_column_config()
             self._quit()
 
@@ -4619,9 +4919,114 @@ class BackupApp:
         self._tray.notify(title, text)
         self._sync_tray()
 
+    def _ask_quit_while_running(self, n: int) -> bool:
+        """活动账户未收尾时的退出确认（自绘、居中）：确认后弹窗转等待态并启动优雅停止。
+
+        Note:
+            展示与决策分离：测试替换本方法即可绕开真实 Toplevel（与 _ask_close_action 同口径）。
+            [取消 / 退出程序] 等宽居中，默认焦点与 Esc/X 都在安全侧（取消）。确认后弹窗不关：
+            按钮置灰、文案转「正在停止…」，由优雅停止的轮询在收尾后关掉它并真退出。
+        """
+        if self.root.state() == "withdrawn":
+            self._show_window()   # 隐藏时从托盘退出：先把窗口亮回来，用户要做决定
+        dialog = tk.Toplevel(self.root)
+        dialog.title(QUIT_CONFIRM_TITLE)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        answer: list[bool] = []
+        body = tk.Frame(dialog)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        text_label = tk.Label(body, text=QUIT_CONFIRM_TEXT.format(n=n), justify="left", anchor="w")
+        text_label.pack(fill="x")
+        buttons = tk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        cancel_btn, confirm_btn = _make_equal_button_row(
+            buttons, [(CANCEL_BTN_TEXT, lambda: finish(False)),
+                      (QUIT_CONFIRM_BTN, lambda: finish(True))])
+
+        def finish(ok: bool) -> None:
+            answer.append(ok)
+            if not ok:
+                self._quit_wait_win = None
+                dialog.destroy()
+                return
+            # 确认后弹窗转等待态：不可再取消；真正的停止/退出由调用方拿到本窗口后启动
+            cancel_btn.configure(state="disabled")
+            confirm_btn.configure(state="disabled")
+            text_label.configure(text=QUIT_WAITING_TEXT.format(n=n))
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+            dialog.bind("<Escape>", lambda _event: None)
+            self._quit_wait_win = (dialog, text_label)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dialog.bind("<Escape>", lambda _event: finish(False))
+        self._center_on_root(dialog)
+        cancel_btn.focus_set()      # 默认焦点给安全侧：回车不退出
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return bool(answer and answer[0])
+
+    def _confirm_and_quit(self) -> bool:
+        """活动账户在跑时的统一退出路径：自绘确认 → 优雅停止（等待态留在确认窗里）。
+
+        Returns:
+            True＝已启动优雅停止流程；False＝用户取消，什么都不变。
+        """
+        n = len(self._active_account_ids())
+        self._quit_wait_win = None
+        if not self._ask_quit_while_running(n):
+            return False
+        waiting = self._quit_wait_win
+        dialog = waiting[0] if waiting is not None else None
+        label = waiting[1] if waiting is not None else None
+
+        def on_done() -> None:
+            if dialog is not None:
+                with contextlib.suppress(tk.TclError):
+                    dialog.destroy()
+            self._quit()
+
+        self._begin_quit_after_stop(waiting_label=label, on_done=on_done)
+        return True
+
+    def _begin_quit_after_stop(self, waiting_label: tk.Label | None = None,
+                               on_done: Callable[[], None] | None = None) -> None:
+        """确认退出后：停掉全部活动账户，轮询等它们干净收尾（写盘安全），再走 on_done。"""
+        self._on_stop_all()
+        if waiting_label is not None:
+            waiting_label.configure(text=QUIT_WAITING_TEXT.format(n=len(self._active_account_ids())))
+        self._quit_deadline = time.monotonic() + QUIT_STOP_TIMEOUT_S
+
+        def poll() -> None:
+            if self._quit_after_stop_step(time.monotonic()):
+                self._finish_quit_after_stop(
+                    on_done, forced=self._has_active_accounts())
+            else:
+                if waiting_label is not None:
+                    waiting_label.configure(text=QUIT_WAITING_TEXT.format(
+                        n=len(self._active_account_ids())))
+                self.root.after(100, poll)
+
+        self.root.after(100, poll)
+
+    def _quit_after_stop_step(self, now: float) -> bool:
+        """优雅退出轮询的一步：活动账户排空（干净退）或超过等待上限（强退）才放行。"""
+        return (not self._has_active_accounts()) or now > self._quit_deadline
+
+    def _finish_quit_after_stop(self, on_done: Callable[[], None] | None, forced: bool) -> None:
+        """收尾完成（或超时）：落盘后退出。on_done 给弹窗路径（含关窗），直接路径落盘+_quit。"""
+        if forced:
+            self.log.warning("等待备份账户干净收尾超过 %s 秒，强制退出", QUIT_STOP_TIMEOUT_S)
+        self._save_column_config()
+        if on_done is not None:
+            on_done()
+        else:
+            self._quit()
+
     def _on_tray_quit(self) -> None:
-        """托盘菜单「退出」：备份运行中先确认（退出会中断本次备份）。"""
-        if self.running and not messagebox.askokcancel(QUIT_CONFIRM_TITLE, QUIT_CONFIRM_TEXT, parent=self.root):
+        """托盘菜单「退出」：有活动账户先二次确认并优雅停止，空闲则直接退出。"""
+        if self._has_active_accounts():
+            self._confirm_and_quit()
             return
         self._save_column_config()
         self._quit()

@@ -119,6 +119,26 @@ def app(tmp_path_factory):
         patch.undo()
 
 
+def reset_run_state(app) -> None:
+    """把每账户的备份阶段全部收回空闲，复位「停止所有」与停止信号（ADR 0012）。"""
+    for state in app._states.values():
+        state["run_phase"] = g.PHASE_IDLE
+    app._stopping_all = False
+    app._stop_events = {}
+    app._on_active_set_changed()
+
+
+def begin_account_run(app, account_id="acc", backed=0, skipped=0, failures=None, stopped=False,
+                      elapsed=0.0) -> None:
+    """把一个账户置为备份中并初始化周期记账（不起线程、不联网）。"""
+    if not app._find_account(account_id):
+        app.accounts.append({"id": account_id, "name": "甲", "user": "a@x.com", "server": "s"})
+    app._state(account_id)["run_phase"] = g.PHASE_BACKING
+    app._cycle = {"t0": time.monotonic() - elapsed, "backed": backed, "skipped": skipped,
+                  "failures": failures or [], "stopped": stopped, "ids": {account_id}}
+    app._on_active_set_changed()
+
+
 @pytest.fixture
 def tray(app):
     """每个用例复位共享实例：可见窗口、空闲状态、默认偏好、一枚全新的假托盘。
@@ -126,9 +146,11 @@ def tray(app):
     用例自己把 app._tray 换成 None / 换 show 结果时不需要还原——下一个用例会装上新的。
     """
     app._tray = FakeTray()
-    app.running = False
-    app.stopping = False
-    app.stop_flag.clear()
+    reset_run_state(app)
+    app.accounts[:] = []
+    app._states.clear()
+    app._selected_account_id = None
+    app._ui_settings["selected_account"] = None
     app._ui_settings[g.CLOSE_ACTION_KEY] = g.CLOSE_ACTION_ASK
     app._settings_action_var.set(g.CLOSE_ACTION_ASK)
     _normalize_window(app)
@@ -268,24 +290,23 @@ def test_tray_show_event_restores_the_window(app, tray):
     assert ("set_tooltip", g.TRAY_TOOLTIP_IDLE) in tray.calls
 
 
-def test_tray_stop_event_only_stops_a_running_backup(app):
+def test_tray_stop_event_only_stops_a_running_backup(app, tray):
+    """托盘「停止备份」＝停止所有活动账户：空闲时无效果，活动时每账户的信号都置位。"""
     app._handle_event(("tray_stop",))
-    assert (app.running, app.stopping) == (False, False)
-    app.running = True
+    assert app._stopping_all is False
+
+    begin_account_run(app, "acc")
     app._handle_event(("tray_stop",))
-    assert app.stop_flag.is_set() and app.stopping is True
+    assert app._stopping_all is True
+    assert app._stop_events["acc"].is_set()
+    assert app._state("acc")["run_phase"] == g.PHASE_STOPPING
 
 
 def test_run_finished_in_background_only_sends_a_balloon(app, tray):
     """后台隐藏期间备份结束：窗口保持隐藏，只弹托盘气泡。"""
-    state = app._state("acc")
-    state.update({"backed": 3, "server_total": 10, "pending_total": 3})
-    app._run_account_ids = ["acc"]
-    app._run_t0 = time.monotonic() - 61.1   # 留点余量：_fmt_duration 取整后仍是 1:01
+    begin_account_run(app, "acc", elapsed=61.1)
     app.root.withdraw()
-    app.running = True
     app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 3))
-    app._handle_event(("batch_done", False, []))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_DONE,
             f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.1)}") in tray.calls
@@ -294,12 +315,9 @@ def test_run_finished_in_background_only_sends_a_balloon(app, tray):
 
 
 def test_stopped_run_in_background_sends_the_stopped_balloon(app, tray):
+    begin_account_run(app, "acc", stopped=True, elapsed=3.0)
     app.root.withdraw()
-    app.running = True
-    app._run_account_ids = ["acc"]
-    app._run_t0 = time.monotonic() - 3.0
     app._handle_event(("account_done", "acc", 0, 0, 3.0, True, 5))
-    app._handle_event(("batch_done", True, []))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_STOPPED, g.TRAY_BODY_STOPPED) in tray.calls
 
@@ -307,22 +325,19 @@ def test_stopped_run_in_background_sends_the_stopped_balloon(app, tray):
 def test_failed_run_in_background_does_not_pop_a_dialog(app, tray, monkeypatch):
     """后台失败也只发气泡：不在隐藏窗口背后弹阻断式错误框。"""
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: pytest.fail("后台不该弹错误框"))
+    begin_account_run(app, "acc", failures=[("甲", "boom")])
     app.root.withdraw()
-    app.running = True
-    app._run_account_ids = ["acc"]
     app._handle_event(("account_failed", "acc", "boom"))
-    app._handle_event(("batch_done", False, [("主账户", "boom")]))
     assert ("notify", g.TRAY_TITLE_FAILED, g.TRAY_BODY_FAILED) in tray.calls
 
 
-def test_visible_run_finished_keeps_the_dialog_path(app, monkeypatch):
-    """窗口可见时行为不变：失败仍走原来的错误框。"""
+def test_visible_failure_of_the_selected_account_pops_a_dialog(app, monkeypatch):
+    """窗口可见且失败账户正被看着：弹一次错误框；别的账户失败只走红叉。"""
     shown = []
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: shown.append(a))
-    app.running = True
-    app._run_account_ids = ["acc"]
+    begin_account_run(app, "acc")
+    app._selected_account_id = "acc"
     app._handle_event(("account_failed", "acc", "boom"))
-    app._handle_event(("batch_done", False, [("主账户", "boom")]))
     assert shown
 
 
@@ -333,15 +348,60 @@ def test_tray_quit_confirms_only_while_running(app, tray, monkeypatch):
     assert destroyed == [True]  # 空闲：直接退出
 
     destroyed.clear()
+    begin_account_run(app, "acc")
     asked = []
-    monkeypatch.setattr(g.messagebox, "askokcancel", lambda *a, **k: asked.append(a) or False)
-    app.running = True
+    monkeypatch.setattr(app, "_ask_quit_while_running", lambda n: asked.append(n) or False)
     app._handle_event(("tray_quit",))
-    assert asked and destroyed == []  # 运行中且用户拒绝：留在后台
+    assert asked == [1] and destroyed == []  # 活动中且用户拒绝：不退出
 
-    monkeypatch.setattr(g.messagebox, "askokcancel", lambda *a, **k: True)
+    started = []
+    monkeypatch.setattr(app, "_ask_quit_while_running", lambda n: True)
+    monkeypatch.setattr(app, "_begin_quit_after_stop", lambda *a, **k: started.append(1))
     app._handle_event(("tray_quit",))
-    assert destroyed == [True]
+    assert started == [1]                    # 确认后进入优雅停止流程
+
+
+def test_hiding_while_active_never_asks(app, tray, monkeypatch):
+    """「隐藏到后台」不是退出：活动账户在跑也不拦截（备份本就该在后台继续）。"""
+    monkeypatch.setattr(app, "_save_column_config", lambda: None)
+    monkeypatch.setattr(app, "_ask_quit_while_running",
+                        lambda n: pytest.fail("隐藏到后台不该走退出确认"))
+    app._ui_settings[g.CLOSE_ACTION_KEY] = g.CLOSE_ACTION_TRAY
+    begin_account_run(app, "acc")
+    app._on_close()
+    assert app.root.state() == "withdrawn"
+    assert app.running and app._state("acc")["run_phase"] == g.PHASE_BACKING
+
+
+def test_graceful_quit_polls_until_accounts_settle(app, monkeypatch):
+    """确认退出：等活动账户收尾后落盘退出；超时也强退。"""
+    begin_account_run(app, "acc")
+    quits = []
+    monkeypatch.setattr(app, "_quit", lambda: quits.append(1))
+    monkeypatch.setattr(app, "_save_column_config", lambda: None)
+
+    future = time.monotonic() + 100
+    app._quit_deadline = time.monotonic() + 1
+    assert app._quit_after_stop_step(future) is True   # 超过等待上限：放行（强退）
+
+    app._quit_deadline = time.monotonic() + 100
+    assert app._quit_after_stop_step(time.monotonic()) is False  # 还在跑且未超时：继续等
+
+    app._state("acc")["run_phase"] = g.PHASE_IDLE
+    assert app._quit_after_stop_step(time.monotonic()) is True   # 活动集合排空：干净放行
+    done = []
+
+    def on_done():   # 真实 on_done 关等待窗后调 _quit，这里一并模拟
+        done.append(1)
+        app._quit()
+
+    app._finish_quit_after_stop(on_done, forced=False)
+    assert quits == [1] and done == [1]
+
+    # 超时强退：记 warning 后落盘退出
+    quits.clear()
+    app._finish_quit_after_stop(None, forced=True)
+    assert quits == [1]
 
 
 # ------------------------------------------------------------------ 窗口状态记忆
