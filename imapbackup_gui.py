@@ -1463,7 +1463,7 @@ class BackupApp:
         self.folder_canvas = tk.Canvas(group, highlightthickness=0, height=1)
         self.folder_canvas.grid(row=1, column=0, sticky="nsew", padx=(CARD_PAD, 0), pady=(4, CARD_PAD))
         # 滚条紧贴面板内沿（右边不留白），与下方"邮件列表/运行日志"页签里的滚条贴边方式一致
-        folder_scroll = ttk.Scrollbar(group, orient="vertical", command=self.folder_canvas.yview)
+        folder_scroll = ttk.Scrollbar(group, orient="vertical", command=self._folder_scroll_command)
         folder_scroll.grid(row=1, column=1, sticky="ns", pady=(4, CARD_PAD))
         self.folder_scroll = folder_scroll
         self.folder_canvas.configure(yscrollcommand=folder_scroll.set)
@@ -2278,15 +2278,19 @@ class BackupApp:
             state["open_keys"] = {key for key, node in self._folder_nodes.items() if node["open"]}
         self._render_folder_checks()
         self._wheel_accum = 0   # 换了棵树，上一棵树没攒满一格的滚轮余量作废
-        # 行距的同步挂在前面的 folder_inner <Configure> 上：此刻新建控件的几何还没结算，
-        # 只有布局铺完那次 Configure 量到的行距才是真的（重建时量到的是 Tk 占位值）。空树
-        # 不会再触发那个事件，所以这里显式归零——不然上次的行距会留在没内容的树上。
+        # 空树不会触发 folder_inner 的 <Configure>（只有增长触发），请求高度也不会自行重算，
+        # 范围与行距在这里显式归零——不然上一棵树的区域和单位会留在没内容的树上
         if not self.folder_rows:
-            self._sync_folder_row_increment()
+            self._sync_folder_scroll()
         # 重建会铺满树区，空态提示得跟着收掉；一个文件夹都没解析出来时重新挂回（提示文还原成默认，
         # 上一轮失败提示的文案不留到下棵树上）
         self.folder_ph.configure(text=FOLDER_PLACEHOLDER_TEXT)
         self._toggle_hint(self.folder_ph, not self.folder_rows)
+        # 换了一棵树：旧树的滚动位置对新树没有意义，视图放回顶部（仍溢出时长树也从第一行开始，
+        # 只重写滚动范围的话 Tk 会把原点钳到新底部）。滚动范围与行距随后由 after_idle 同步按
+        # 新树重写——变矮不送达 <Configure>，旧树的滚动范围会一直留着；与 _refresh_account_list 同宗
+        self.folder_canvas.yview_moveto(0)
+        self.folder_canvas.after_idle(self._sync_folder_scroll)
 
     def _make_folder_node(self, key: tuple[str, ...], rows: list[dict] | None,
                           with_kids: set[tuple], open_keys: set[tuple] | None,
@@ -2411,6 +2415,13 @@ class BackupApp:
         node = self._folder_nodes[key]
         node["open"] = not node["open"]
         self._pack_kids(node)
+        # 折叠是唯一的原地变矮路径：folder_inner 变矮不送达 <Configure>，滚动范围得按内容重写，
+        # Tk 随重写把越界的原点钳回内容内（仍溢出钳到新底部、装得下回顶）。画布内嵌窗口的高度
+        # 要等空闲布局逐轮跟上 pack_forget，当场量 bbox 还是旧高度，所以先 update_idletasks
+        # 把传播排空再同步（同开始按钮恢复静止文案那处先重排的口径）。展开是增长，随后那次
+        # <Configure> 也会同步一遍，两路都幂等。
+        self.folder_canvas.update_idletasks()
+        self._sync_folder_scroll()
         node["arrow"].configure(text=ARROW_OPEN if node["open"] else ARROW_CLOSED)
         state = self._visible_state()
         if state is not None:
@@ -2454,7 +2465,22 @@ class BackupApp:
 
     def _on_folder_inner_configure(self, _event=None) -> None:
         """树区内容重排后（首次铺满、加载完文件夹、窗口缩放）同步滚动范围与行距。"""
-        self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all"))
+        self._sync_folder_scroll()
+
+    def _sync_folder_scroll(self) -> None:
+        """文件夹树的滚动范围与行距按当前内容重写。
+
+        Note:
+            增长由 folder_inner 的 <Configure> 驱动，但 Tk 不在内容变矮时送达该事件
+            （实测换账户重画、折叠分支都是 0 次）；整棵树销毁后 folder_inner 的请求高度
+            也不会自行重算（实测还是旧树的高度），按 bbox 量到的还是旧范围。所以变矮与
+            清空的路径都显式调到这里：空树直接写零范围，非空树按 bbox("all") 量。
+            scrollregion 改小时 Tk 会把越界的视图原点钳回内容内，无需另行复位。
+        """
+        if self.folder_rows:
+            self.folder_canvas.configure(scrollregion=self.folder_canvas.bbox("all"))
+        else:
+            self.folder_canvas.configure(scrollregion=(0, 0, self.folder_canvas.winfo_width(), 0))
         self._sync_folder_row_increment()
 
     def _on_folder_canvas_configure(self, event) -> None:
@@ -2466,21 +2492,23 @@ class BackupApp:
         """量文件夹树的行距(px)。
 
         Returns:
-            任取一对相邻行容器的真实间距（含 pady、随 DPI 与字体走）；量不到时为 0。
+            任取一对相邻行容器量到的行距（行高 + 上下各一份 pady，随 DPI 与字体走）；量不到时为 0。
 
         Note:
             行容器是 folder_inner 的顶层节点框，也是各节点 kids 框里的子节点框——先看主宿主，
-            只有一个顶层节点时（都挂在那一个父节点下面）退到它的 kids 框里量。新建控件的请求
-            尺寸与位置要等布局铺完才可信，重建那一刻量到的是 Tk 的占位值，这时就量不到。
+            只有一个顶层节点时（都挂在那一个父节点下面）退到它的 kids 框里量。按**请求高度**量
+            而不是相邻行的 winfo_rooty：请求尺寸建完控件就有，rooty 要等布局铺完——重建后早到的
+            <Configure>（换账户时 yview_moveto 冲刷出来的那串）量到的是占位值（实测 4 而不是 26），
+            一格的步长会一直留错。行距恒等于「首行请求高 + 2×FOLDER_ROW_PAD_Y」，与结算后的
+            rooty 间距一致。折叠节点的 kids 框没上屏，里头的控件留着折叠前的位置，不能拿来量。
         """
         hosts = [self.folder_inner] + [n["kids"] for n in self._folder_nodes.values()]
         for host in hosts:
             frames = host.winfo_children()
-            # 折叠节点的 kids 框没上屏，里头的控件还留着折叠前的位置，不能拿来量
             if len(frames) > 1 and (host is self.folder_inner or host.winfo_ismapped()):
-                pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
-                if pitch > 0:
-                    return pitch
+                height = frames[0].winfo_reqheight()
+                if height > 0:
+                    return height + 2 * FOLDER_ROW_PAD_Y
         return 0
 
     def _sync_folder_row_increment(self) -> None:
@@ -2714,7 +2742,9 @@ class BackupApp:
             self.folder_rows, self._folder_nodes, self._folder_clickables = [], {}, []
             for child in self.folder_inner.winfo_children():
                 child.destroy()
-            self._sync_folder_row_increment()
+            # 行全销毁了：滚动范围与视图都得按空树收口，别把上一个账户的深度和陈旧的滚动范围留着
+            self._sync_folder_scroll()
+            self.folder_canvas.yview_moveto(0)
             self.folder_ph.configure(text=FOLDER_PLACEHOLDER_TEXT)
             self._toggle_hint(self.folder_ph, True)
             self._render_messages(None)
@@ -3169,17 +3199,61 @@ class BackupApp:
         Note:
             返回 "break" 才是真的中断（Tkinter 拿回调返回值与 "break" 比较）——面板内的滚条正是
             靠它压掉 TScrollbar 的类绑定；反过来 break 也会挡掉 root 上这条，所以滚条必须绑到
-            这个函数、由它自己完成滚动。
+            这个函数、由它自己完成滚动。内容装得下（scrollregion 不高于可视区）时滚轮空转：
+            那种状态下 Tk 不把视图原点钳在 0，硬滚会把内容推出负坐标（账户列表复现：行被推
+            下去、上方露一片对话框灰，而 yview 始终报 (0.0, 1.0)，看不出这里不该滚）。
         """
         canvas = self._wheel_canvas(event.widget)
         if canvas is None:
             return None  # 邮件列表 / 运行日志 / 设置页的滚轮节奏一字不动
+        if not self._canvas_overflows(canvas):
+            return "break"  # 装得下就没有滚动这回事：不攒余量、也不滚
         self._wheel_accum += event.delta
         notches = int(self._wheel_accum / WHEEL_DELTA)  # 向零取整：正反两个方向都不吃掉余量
         if notches:
             self._wheel_accum -= notches * WHEEL_DELTA
             canvas.yview_scroll(-notches * FOLDER_WHEEL_ROWS, "units")
         return "break"  # 不满一格也到此为止，别漏给面板内滚条的原生步长
+
+    def _canvas_overflows(self, canvas: tk.Canvas) -> bool:
+        """画布内容是否高出可视区：scrollregion 比视口高才谈得上滚动。
+
+        Args:
+            canvas: 账户列表或邮箱文件夹的画布。
+
+        Returns:
+            内容高出可视区（此时 yview_scroll 会被 Tk 正常钳在两端）时为 True。
+
+        Note:
+            按 scrollregion 判而不是 bbox("all")：树缩小后 Tk 不送达 folder_inner 的
+            <Configure>，两者会不一致（实测 bbox 78 而 scrollregion 还是旧树的 1170），
+            而 scrollregion 才是 yview_scroll 真正参照的那一份——按它判，不会把用户困在
+            一个已经漂移的视图里连滚回去的余地都没有。
+        """
+        return self._canvas_region_height(canvas) > canvas.winfo_height()
+
+    def _canvas_region_height(self, canvas: tk.Canvas) -> float:
+        """画布 scrollregion 的内容高度(px)；没设过区域（或写坏了）时为 0。"""
+        region = canvas.cget("scrollregion")
+        parts = region.split() if region else []
+        if len(parts) != 4:
+            return 0.0
+        return float(parts[3]) - float(parts[1])
+
+    def _folder_scroll_command(self, *args) -> None:
+        """文件夹滚条的命令入口（-command）：内容装得下时箭头/滑轨/拖动全部空转。
+
+        Args:
+            *args: TScrollbar 传来的指令：scroll N units / moveto fraction。
+
+        Note:
+            邮箱文件夹的滚条常驻（不按内容显隐），树装得下时 Tk 不把画布原点钳在 0——
+            箭头与拖动走的 canvas.yview 命令和滚轮是同一条会漂移的路径，这里同一口径挡掉。
+            账户列表的滚条装得下时已 grid_remove，事件到不了，无需包这一层。
+        """
+        if not self._canvas_overflows(self.folder_canvas):
+            return
+        self.folder_canvas.yview(*args)
 
     def _wheel_canvas(self, widget) -> tk.Canvas | None:
         """事件落在哪个可滚列表里：返回对应画布（邮箱文件夹 / 账户列表），其余返回 None。"""

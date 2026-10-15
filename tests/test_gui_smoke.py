@@ -141,6 +141,25 @@ def clear_folders(app):
     app._render_folder_tree(state)
 
 
+# 三行平铺：一屏装得下的文件夹树（滚动类用例的「装得下」基准）
+SHORT_FOLDERS = [("INBOX", "INBOX.mbox", "INBOX", "INBOX"),
+                 ("Drafts", "Drafts.mbox", "Drafts", "Drafts"),
+                 ("Junk", "Junk.mbox", "Junk", "Junk")]
+
+
+def flat_folder_names(count):
+    """count 个同名平铺文件夹（Box00…）：把文件夹树撑出可视区用。"""
+    return [(f"Box{i:02d}", f"Box{i:02d}.mbox", f"Box{i:02d}", f"Box{i:02d}")
+            for i in range(count)]
+
+
+def folder_scroll_state(canvas):
+    """文件夹画布的 (scrollregion 高, 内容 bbox 高)；两者不一致说明滚动范围还留着旧高度。"""
+    box = canvas.bbox("all")
+    region = tuple(map(float, canvas.cget("scrollregion").split()))
+    return region[3] - region[1], box[3] - box[1]
+
+
 def pump(instance, n=3):
     for _ in range(n):
         instance._pump()
@@ -1108,6 +1127,262 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
     clear_folders(app)
     app.root.update()
     assert int(canvas.cget("yscrollincrement")) == 0
+
+
+def test_wheel_does_nothing_when_the_panel_content_fits(app):
+    """内容装得下时滚轮无感：账户列表与邮箱文件夹两块画布都不滚，行停在原地。
+
+    回归自：滚轮入口不判断内容是否高出可视区，而 scrollregion 比视口小时 Tk 不把视图
+    原点钳在 0——每格往上跑一个行距，两行账户被推下去、上方露一片对话框灰，yview 却始终
+    报 (0.0, 1.0)、滚条也照旧隐藏，用户完全看不出「这里不该滚」（用户截图：账户列表
+    可以向上滚）。邮箱文件夹是同一条入口，树短时一样中招。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+
+    def wheel(canvas, target, delta=-g.WHEEL_DELTA):
+        before = canvas.canvasy(0)
+        target.event_generate("<MouseWheel>", delta=delta, x=5, y=5)
+        app.root.update()
+        return canvas.canvasy(0) - before
+
+    def row_visible(canvas, row_frame):
+        top = canvas.winfo_rooty()
+        return (top <= row_frame.winfo_rooty()
+                and row_frame.winfo_rooty() + row_frame.winfo_height() <= top + canvas.winfo_height())
+
+    # 账户列表：一个账户一行，一屏装得下，滚轮上下都不该动
+    canvas = app.account_canvas
+    assert not app.account_scroll.winfo_ismapped(), "装得下就不该挂滚条"
+    row = app._account_rows[current_account(app)["id"]]
+    for delta in (-g.WHEEL_DELTA, g.WHEEL_DELTA):
+        assert wheel(canvas, row["label"], delta) == 0
+        assert wheel(canvas, canvas, delta) == 0
+    assert canvas.canvasy(0) == 0 and canvas.yview() == (0.0, 1.0)
+    assert row_visible(canvas, row["frame"]), "行还老老实实在第一行"
+
+    # 邮箱文件夹：三行装得下，滚轮落在行名、行容器、画布、常驻滚条上都该空转
+    load_folders(app, SHORT_FOLDERS)
+    app.root.update()
+    folder_canvas = app.folder_canvas
+    box = folder_canvas.bbox("all")
+    assert box[3] - box[1] <= folder_canvas.winfo_height(), "三行要装得下"
+    folder_row = app._folder_nodes[("INBOX",)]["frame"]
+    for delta in (-g.WHEEL_DELTA, g.WHEEL_DELTA):
+        for target in (app.folder_rows[0]["check_btn"], app.folder_inner,
+                       folder_canvas, app.folder_scroll):
+            assert wheel(folder_canvas, target, delta) == 0, target
+    assert folder_canvas.canvasy(0) == 0 and folder_canvas.yview() == (0.0, 1.0)
+    assert row_visible(folder_canvas, folder_row), "第一行还在可视区里"
+
+    clear_folders(app)
+    app.root.update()
+
+
+def test_folder_view_starts_at_the_top_after_switching_accounts(app):
+    """换账户（或重拉清单）后文件夹树从顶部开始：旧树的深度与陈旧的滚动范围都不带过来。
+
+    回归自：账户 A 的长树滚到底后切到账户 B 的短树，视图原点按像素留在旧深度、
+    scrollregion 还留着旧树的高度（Tk 不在 folder_inner 变矮时送达 <Configure>，
+    实测换账户 0 次）——B 的第一行在视口上方两百多像素，滚条滑块挂在 phantom 区域
+    底部，向上要滚三十多格才见到内容，事后拖窗口也不自愈。
+    """
+    keep = list(app.accounts)
+    first = current_account(app)
+    long_names = flat_folder_names(30)
+    short_names = SHORT_FOLDERS
+    second = g.new_account()
+    second.update({"name": "另一个", "user": "other@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    try:
+        app.root.geometry("960x736")
+        app.root.update()
+        canvas = app.folder_canvas
+
+        load_folders(app, long_names)                  # 可见账户（first）挂长树
+        app.root.update()
+        region_h, box_h = folder_scroll_state(canvas)
+        assert box_h > canvas.winfo_height(), "长树要装不下"
+        assert region_h == box_h, (region_h, box_h)
+        canvas.yview_moveto(1)                         # 用户滚到底
+        app._wheel_accum = 0
+        app.root.update()
+        assert canvas.canvasy(0) > 0, "先确认真的滚到底了"
+
+        # 切到短树账户：树从顶部开始，滚动范围就是新树的真实高度（不陈旧），行距仍是实测值
+        app._switch_account(second["id"])
+        load_folders(app, short_names, account_id=second["id"])
+        app.root.update()
+        assert canvas.canvasy(0) == 0, canvas.canvasy(0)
+        region_h, box_h = folder_scroll_state(canvas)
+        assert region_h == box_h, (region_h, box_h)
+        assert box_h <= canvas.winfo_height(), "短树装得下"
+        frames = app.folder_inner.winfo_children()
+        pitch = frames[1].winfo_rooty() - frames[0].winfo_rooty()
+        assert pitch > 0 and int(canvas.cget("yscrollincrement")) == pitch, (
+            int(canvas.cget("yscrollincrement")), pitch)
+        first_row = app._folder_nodes[("INBOX",)]["frame"]
+        top = canvas.winfo_rooty()
+        assert top <= first_row.winfo_rooty() < top + canvas.winfo_height(), "第一行要在可视区里"
+
+        # 切回长树账户：同样从顶部开始（旧树的深度对另一个账户的树没有意义）
+        app._switch_account(first["id"])
+        app.root.update()
+        assert canvas.canvasy(0) == 0, canvas.canvasy(0)
+        assert canvas.bbox("all")[3] > canvas.winfo_height(), "切回来还是那棵长树"
+
+        # 同一个账户重拉清单（手动刷新走同一条路）：深处也回顶部
+        canvas.yview_moveto(1)
+        app.root.update()
+        load_folders(app, long_names)
+        app.root.update()
+        assert canvas.canvasy(0) == 0, canvas.canvasy(0)
+    finally:
+        app.accounts[:] = keep
+        app._states = {k: v for k, v in app._states.items() if k in {a["id"] for a in keep}}
+        app._selected_account_id = first["id"]
+        app._ui_settings["selected_account"] = first["id"]
+        app._refresh_account_list()
+        app._render_account_detail()
+        clear_folders(app)
+        app.root.update()
+
+
+def test_folder_scrollbar_cannot_scroll_a_tree_that_fits(app):
+    """邮箱文件夹的滚条常驻：树装得下时箭头/滑轨/拖动全部空转，和滚轮同一口径。
+
+    回归自：滚条命令直画布 yview，内容装得下时 Tk 不把视图原点钳在 0——点一下箭头树就
+    顺着漂出一片空白。账户列表的滚条装得下时已 grid_remove、事件到不了，只有常驻的
+    邮箱文件夹滚条需要这道守卫。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+    canvas = app.folder_canvas
+    load_folders(app, SHORT_FOLDERS)
+    app.root.update()
+    box = canvas.bbox("all")
+    assert box[3] - box[1] <= canvas.winfo_height(), "三行要装得下"
+    # 走滚条真正的 -command 接线（不直接调方法）：箭头/滑轨/拖动就是这么进来的
+    command = app.folder_scroll.cget("command")
+    for args in (("scroll", "1", "units"), ("scroll", "-1", "units"), ("moveto", "0.5")):
+        app.root.tk.call(command, *args)
+        app.root.update()
+        assert canvas.canvasy(0) == 0, args
+
+    # 装不下时命令照常转发：滚条还能用
+    load_folders(app, flat_folder_names(30))
+    app.root.update()
+    assert canvas.bbox("all")[3] > canvas.winfo_height(), "三十行装不下"
+    app.root.tk.call(command, "scroll", "1", "units")
+    app.root.update()
+    assert canvas.canvasy(0) > 0
+
+    clear_folders(app)
+    app.root.update()
+
+
+def test_deleting_the_last_account_leaves_no_stale_folder_scroll(app):
+    """删掉最后一个账户：文件夹树清空后滚动范围归零、视图回顶，滚条不挂在旧高度上。
+
+    回归自：_render_account_detail 的空分支（_on_account_delete 删掉最后一个账户时走到）
+    当场量 bbox 还是旧树的高度——和折叠同一个传播时差，scrollregion 停留在旧长树的高度、
+    原点留在旧深度：空树上滚轮还滚得动，滚条滑块还挂在很深的位置。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+    keep = list(app.accounts)
+    first = current_account(app)
+    try:
+        load_folders(app, flat_folder_names(30))
+        app.root.update()
+        canvas = app.folder_canvas
+        assert canvas.bbox("all")[3] > canvas.winfo_height(), "长树要装不下"
+        canvas.yview_moveto(1)
+        app.root.update()
+        assert canvas.canvasy(0) > 0, "先确认真的滚到底了"
+
+        # 与 _on_account_delete 收尾同一序列：删最后一个账户 → 选中清空 → 重画详情
+        app.accounts.remove(first)
+        app._states.pop(first["id"], None)
+        app._selected_account_id = None
+        app._ui_settings["selected_account"] = None
+        app._render_account_detail()
+        app.root.update()
+        # 空树的滚动范围直接写零（销毁后内嵌窗口的高度不会自行重算，bbox 仍是旧值，不看它）
+        region_h, _box_h = folder_scroll_state(canvas)
+        assert region_h == 0, region_h
+        assert canvas.canvasy(0) == 0, canvas.canvasy(0)
+        # 空树上滚轮与滚条命令都空转——守卫的前提（滚动范围归零）在这里也成立
+        app._folder_scroll_command("scroll", 1, "units")
+        canvas.event_generate("<MouseWheel>", delta=-g.WHEEL_DELTA, x=5, y=5)
+        app.root.update()
+        assert canvas.canvasy(0) == 0
+    finally:
+        app.accounts[:] = keep
+        app._selected_account_id = first["id"]
+        app._ui_settings["selected_account"] = first["id"]
+        app._refresh_account_list()
+        app._render_account_detail()
+        clear_folders(app)
+        app.root.update()
+
+
+def test_collapsing_a_branch_keeps_the_folder_view_in_range(app):
+    """折叠大分支后视图被钳回内容内：不会留在变矮前的深度对着空白。
+
+    回归自：滚到底后折叠一个几十个子文件夹的父节点，folder_inner 变矮不送达 <Configure>，
+    scrollregion 停留在旧高度、原点按像素留在旧深度——内容只剩几十像素而原点差着近千像素，
+    整棵树都在视口上方，要向上滚三十多格才回来。滚动范围在折叠后按内容重写，Tk 随重写把
+    越界的原点钳回内容内：仍溢出时钳到新底部（贴着尾部），装得下时回顶。
+    """
+    app.root.geometry("960x736")
+    app.root.update()
+    canvas = app.folder_canvas
+    names = [("INBOX", "INBOX.mbox", "INBOX", "INBOX")]
+    names += [(f"ZGroup/Leaf{i:02d}", f"ZGroup.Leaf{i:02d}.mbox",
+               f"ZGroup/Leaf{i:02d}", f"ZGroup/Leaf{i:02d}") for i in range(30)]
+    names += [(f"WGroup/Leaf{i:02d}", f"WGroup.Leaf{i:02d}.mbox",
+               f"WGroup/Leaf{i:02d}", f"WGroup/Leaf{i:02d}") for i in range(30)]
+    load_folders(app, names)
+    app.root.update()
+    # 重载保留展开态是既有口径（open_keys 不再是 None），这里自设成首次加载的口径全部展开，
+    # 免得用例结果取决于前面谁加载过什么树
+    state = app._visible_state()
+    state["open_keys"] = None
+    app._render_folder_tree(state)
+    app.root.update()
+    assert canvas.bbox("all")[3] > canvas.winfo_height(), "全展开要装不下"
+
+    # 折掉一组、另一组还撑着：滚动范围跟着变矮，视图贴着新底部（首行滚出视口、末行还在）
+    canvas.yview_moveto(1)
+    app.root.update()
+    assert canvas.canvasy(0) > 0, "先确认真的滚到底了"
+    app._toggle_folder_open(("ZGroup",))
+    app.root.update()
+    region_h, box_h = folder_scroll_state(canvas)
+    assert region_h == box_h, (region_h, box_h)
+    assert box_h > canvas.winfo_height(), "还剩一组，装不下"
+    assert canvas.canvasy(0) > 0, "还贴着尾部，没跳回顶部"
+    first_row = app._folder_nodes[("INBOX",)]["frame"]
+    assert first_row.winfo_rooty() < canvas.winfo_rooty(), "首行已滚出视口"
+    last_row = app._folder_nodes[("WGroup", "Leaf29")]["frame"]
+    assert (last_row.winfo_rooty() + last_row.winfo_height()
+            <= canvas.winfo_rooty() + canvas.winfo_height()), "最后一行要在可视区里"
+
+    # 再折掉另一组：内容装得下，视图回顶
+    app._toggle_folder_open(("WGroup",))
+    app.root.update()
+    region_h, box_h = folder_scroll_state(canvas)
+    assert region_h == box_h, (region_h, box_h)
+    assert box_h <= canvas.winfo_height(), "只剩 INBOX 和两个父行，装得下"
+    assert canvas.canvasy(0) == 0, canvas.canvasy(0)
+    first_row = app._folder_nodes[("INBOX",)]["frame"]
+    top = canvas.winfo_rooty()
+    assert top <= first_row.winfo_rooty() < top + canvas.winfo_height(), "第一行要在可视区里"
+
+    clear_folders(app)
+    app.root.update()
 
 
 def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
