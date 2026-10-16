@@ -3137,10 +3137,14 @@ def test_refresh_button_reloads_folders(app, monkeypatch):
     assert state["snapshot"] is None
     assert state["password_prompted"] is None
     app._loading_folder_ids.clear()
+    app._interactive_folder_loads.clear()
+    # 还原快照：后续用例切回该账户时按快照去重，不会原地起一次多余的重拉
+    state["snapshot"] = app._account_snapshot(account)
 
 
 def test_folder_load_failure_shows_hint_and_prompts_password(app, monkeypatch):
-    """加载失败：面板提示可刷新重试；认证失败弹密码补录、补完自动重拉；同快照不重复弹。"""
+    """加载失败：面板提示可刷新重试；密码补录窗只挂显式动作——被动拉取的认证失败只留提示，
+    手动刷新（唯一的交互式拉取入口）发起的失败才弹补录；同快照不重复弹；补完自动重拉。"""
     account = current_account(app)
     state = app._state(account["id"])
     prompts: list[str] = []
@@ -3150,19 +3154,34 @@ def test_folder_load_failure_shows_hint_and_prompts_password(app, monkeypatch):
     monkeypatch.setattr(app, "_folder_worker", lambda *a: loads.append(a[0]))
     monkeypatch.setattr(app, "_ask_password", lambda aid: prompts.append(aid) or answers.pop(0))
     app._loading_folder_ids.clear()
+    app._interactive_folder_loads.clear()
     state["folder_rows"] = []
     app.folder_rows = []      # 树上没内容才显示提示（失败提示不叠在已加载的树上）
 
-    # 认证失败：文件夹区提示 + 弹补录窗；同快照不重复弹（消息前缀与 core 的口径一致）
+    # 被动拉取的认证失败：只提示不弹窗（补录窗只跟显式动作；消息前缀与 core 的口径一致）
     app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
     assert app.folder_ph.winfo_manager() == "grid"
     assert str(app.folder_ph.cget("text")).startswith("文件夹清单加载失败")
+    app.root.update()
+    assert prompts == []
+
+    # 手动刷新发起的交互式拉取认证失败：弹补录（无密码的平台上弹窗在刷新当刻、有密码的平台
+    # 在失败当刻，殊途同归弹一次）；同快照不重复弹
     answers.append(None)
+    app._on_refresh_folders()
+    app._loading_folder_ids.clear()
+    app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
     app.root.update()
     assert prompts == [account["id"]]
+    app._interactive_folder_loads.add(account["id"])   # 模拟同一轮交互拉取的再次失败
     app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
     app.root.update()
     assert prompts == [account["id"]], "同快照只弹一次"
+
+    # 非认证失败：只提示不弹窗
+    app._on_folder_load_failed(account["id"], "OSError: network is unreachable")
+    app.root.update()
+    assert len(prompts) == 1
 
     # 手动刷新清掉记忆：失败后又弹
     answers.append(None)
@@ -3171,11 +3190,6 @@ def test_folder_load_failure_shows_hint_and_prompts_password(app, monkeypatch):
     app._on_folder_load_failed(account["id"], "IMAP authentication failed: bad credentials")
     app.root.update()
     assert prompts == [account["id"], account["id"]]
-
-    # 非认证失败：只提示不弹窗
-    app._on_folder_load_failed(account["id"], "OSError: network is unreachable")
-    app.root.update()
-    assert len(prompts) == 2
 
     # 补录拿到密码 → 自动强制重拉（勾了保存就落密文）
     answers.append(("new-pass", True))
@@ -3187,20 +3201,27 @@ def test_folder_load_failure_shows_hint_and_prompts_password(app, monkeypatch):
         assert current_account(app)["password_dpapi"]
     assert state["password_prompted"] is None
 
-    # 缺密码的账户：提示 + 补录入口（_maybe_load_folders 的早退分支）
+    # 缺密码的账户：被动拉取只提示不弹窗；手动刷新（显式动作）才弹补录
     prompts.clear()
     answers.append(None)
     cipher = current_account(app).pop("password_dpapi", None)
     app._run_passwords.pop(account["id"], None)
     app._loading_folder_ids.clear()
+    app._interactive_folder_loads.clear()
     state["snapshot"] = None
     state["password_prompted"] = None
     app._maybe_load_folders(account["id"])
     assert str(app.folder_ph.cget("text")) == g.FOLDER_LOAD_NO_PASSWORD_HINT
     app.root.update()
-    assert prompts == [account["id"]]
+    assert prompts == [], "被动拉取不弹补录窗"
+    app._on_refresh_folders()
+    app.root.update()
+    assert prompts == [account["id"]], "手动刷新才弹补录窗"
     if cipher:
         current_account(app)["password_dpapi"] = cipher
+    app._interactive_folder_loads.clear()
+    # 还原快照：后续用例切回该账户时按快照去重，不会原地起一次多余的重拉
+    state["snapshot"] = app._account_snapshot(account)
     app._render_account_detail()
 
 
@@ -3758,3 +3779,49 @@ def test_all_ttk_buttons_use_flexible_width(app):
             if width > 0:
                 offenders.append((str(w.cget("text")), raw))
     assert offenders == [], offenders
+
+
+def test_switching_accounts_triggers_a_silent_load(app, monkeypatch):
+    """切账户即静默加载（GLOSSARY「静默加载」口径）：目标账户没清单就拉；快照命中的不重拉。"""
+    first = current_account(app)
+    calls: list[str] = []
+    monkeypatch.setattr(g.threading, "Thread", sync_thread)
+    monkeypatch.setattr(app, "_folder_worker", lambda *a: calls.append(a[0]))
+    app._loading_folder_ids.clear()
+
+    second = g.new_account()
+    second.update({"name": "惰性账户", "user": "lazy@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._run_passwords[second["id"]] = "p"   # 会话内临时密码口径，免依赖本机 DPAPI
+    app._refresh_account_list()
+    try:
+        app._switch_account(second["id"])    # 从未拉过 → 触发一次静默加载
+        assert calls == [second["id"]], calls
+
+        app._state(first["id"])["snapshot"] = app._account_snapshot(first)
+        app._switch_account(first["id"])     # 快照命中 → 不重复起线程
+        assert calls == [second["id"]], calls
+    finally:
+        app._loading_folder_ids.clear()
+        app._interactive_folder_loads.discard(second["id"])
+        app._run_passwords.pop(second["id"], None)
+        app.accounts.remove(second)
+        app._states.pop(second["id"], None)
+        app._refresh_account_list()
+        app._render_account_detail()
+
+
+def test_folder_toolbar_buttons_follow_list_content(app):
+    """全选/清空/仅收件箱 只在清单非空时可点（空清单点了也是空转）；⟳ 刷新永远可用——
+    它是加载失败后唯一的重试入口。"""
+    set_phase(app, current_account(app)["id"], g.PHASE_IDLE)   # 前序用例把主账户留在 BACKING：先收口
+    load_folders(app, SHORT_FOLDERS)
+    assert all(not is_disabled(b) for b in app._folder_tool_btns)
+    assert not is_disabled(app.reload_btn)
+
+    clear_folders(app)
+    assert all(is_disabled(b) for b in app._folder_tool_btns)
+    assert not is_disabled(app.reload_btn)
+
+    load_folders(app, SHORT_FOLDERS)   # 还原有清单的状态
+    assert all(not is_disabled(b) for b in app._folder_tool_btns)

@@ -888,6 +888,9 @@ class BackupApp:
         self._folder_clickables: list[tuple[tk.Label, str]] = []
         self._run_spinner_job: str | None = None  # root.after id，备份运行中开始按钮的转圈帧链
         self._loading_folder_ids: set[str] = set()  # 静默拉文件夹清单的去重：同一账户不重复起线程
+        # 交互式拉取（手动刷新）的账户集合：认证失败只有它们才弹密码补录，被动拉取一律只提示
+        self._interactive_folder_loads: set[str] = set()
+        self._config_enabled = True   # 配置区当前启停；_set_config_enabled 维护，供文件夹工具按钮裁决
         self._sash_grips: dict[str, tk.Frame] = {}   # 侧边栏拖拽手柄（backup/settings/account 三处）
         self._sash_layout: dict[str, tuple[tk.Widget, int, int]] = {}   # kind -> (宿主, 空隙带宽, 带左缘偏移)
         self._run_passwords: dict[str, str] = {}  # 本次运行的临时密码（预检补录但未保存时只在本次生效）
@@ -1441,10 +1444,17 @@ class BackupApp:
         self._folder_toolbar = toolbar   # 拖拽钳制按它的实测请求宽反推右栏最小宽（见 _backup_detail_min_width）
         # width=-7＝文本槽下限 7 字符（约 59px）：三颗取同一下限保持等宽整齐，「仅收件箱」
         # 更长也不会被裁；负号让槽只做下限、不做上限（正数是固定槽，长文案必被裁）。
-        self._register(ttk.Button(toolbar, text="全选", width=-7, command=lambda: self._set_all_folders(True))).pack(side="left")
-        self._register(ttk.Button(toolbar, text="清空", width=-7,
-                                  command=lambda: self._set_all_folders(False))).pack(side="left", padx=(BTN_GAP, 0))
-        self._register(ttk.Button(toolbar, text="仅收件箱", width=-7, command=self._set_inbox_only)).pack(side="left", padx=(BTN_GAP, 0))
+        select_all_btn = self._register(ttk.Button(toolbar, text="全选", width=-7,
+                                                   command=lambda: self._set_all_folders(True)))
+        select_all_btn.pack(side="left")
+        clear_btn = self._register(ttk.Button(toolbar, text="清空", width=-7,
+                                              command=lambda: self._set_all_folders(False)))
+        clear_btn.pack(side="left", padx=(BTN_GAP, 0))
+        inbox_btn = self._register(ttk.Button(toolbar, text="仅收件箱", width=-7,
+                                              command=self._set_inbox_only))
+        inbox_btn.pack(side="left", padx=(BTN_GAP, 0))
+        # 空清单时三颗工具按钮禁用（_sync_folder_toolbar）；⟳ 不在此列——它是唯一的重试入口
+        self._folder_tool_btns = (select_all_btn, clear_btn, inbox_btn)
         # 刷新入口（icon-only）：静默加载失败后唯一的手动重试入口，右对齐与文件夹工具同排。
         # 正方形（用户选定）完全靠 _make_square_button 的 padding 像素精调；width=0 让按钮
         # 先按 ⟳ 单字形取自然请求宽，padding 再补成精确正方形（实测误差 0px）。
@@ -2045,13 +2055,14 @@ class BackupApp:
                 "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)), "port": port,
                 "mbox": bool(account.get("mbox", False)), "eml": bool(account.get("eml", True))}
 
-    def _maybe_load_folders(self, account_id: str | None) -> None:
-        """按需静默拉某账户的文件夹清单（启动 / 切账户 / 保存账户后触发）。
+    def _maybe_load_folders(self, account_id: str | None, *, interactive: bool = False) -> None:
+        """按需静默拉某账户的文件夹清单（启动 / 切账户 / 保存账户后被动触发，手动刷新为交互触发）。
 
         Note:
             不是用户可见的连接动作：无按钮、无状态图标。账户没有清单、或连接参数变过
-            （快照口径）才拉；同一账户进行中不重复起线程。失败在文件夹区提示可刷新重试，
-            密码类失败再弹密码补录窗（补完自动重拉，见 ADR 0011 的连接口径）。
+            （快照口径）才拉；同一账户进行中不重复起线程。失败在文件夹区提示可刷新重试。
+            密码补录窗只挂显式动作：interactive=True（手动刷新）才弹，被动拉取只留提示
+            （见 ADR 0011 的连接口径——切换/启动时弹模态窗会打断浏览）。
         """
         if account_id is None:
             return
@@ -2067,11 +2078,16 @@ class BackupApp:
         if v is None:
             if not self._account_password(account):
                 self._show_folder_hint(account_id, FOLDER_LOAD_NO_PASSWORD_HINT)
-                self._maybe_prompt_folder_password(account_id)
+                if interactive:
+                    self._maybe_prompt_folder_password(account_id)
             else:
                 self._show_folder_hint(account_id, FOLDER_LOAD_INCOMPLETE_HINT)
             return
         self._loading_folder_ids.add(account_id)
+        if interactive:
+            self._interactive_folder_loads.add(account_id)
+        else:
+            self._interactive_folder_loads.discard(account_id)
         threading.Thread(target=self._folder_worker,
                          args=(account_id, v, self._account_snapshot(account)), daemon=True).start()
         self._sync_folder_loading_view()   # 加载态立即显示（Q3）：可见账户才盖动画层
@@ -2081,6 +2097,7 @@ class BackupApp:
 
         Note:
             「同快照只弹一次」的记忆一并清掉——手动刷新就是要再问一次密码。
+            这是唯一交互式（interactive=True）的拉取入口：补录弹窗只跟着它走。
         """
         account_id = self._selected_account_id
         if account_id is None or self._visible_account_active():
@@ -2088,7 +2105,7 @@ class BackupApp:
         state = self._state(account_id)
         state["snapshot"] = None
         state["password_prompted"] = None
-        self._maybe_load_folders(account_id)
+        self._maybe_load_folders(account_id, interactive=True)
 
     def _show_folder_hint(self, account_id: str, text: str) -> None:
         """文件夹区的提示行：只对可见账户显示；树上已有内容时不打扰（提示叠在树上没意义）。"""
@@ -2201,6 +2218,7 @@ class BackupApp:
     def _on_folders_loaded(self, account_id: str, names: list[tuple], snapshot: tuple[str, str, str]) -> None:
         """静默拉到清单：为该账户建文件夹行、记下快照，可见时才动界面。"""
         self._loading_folder_ids.discard(account_id)
+        self._interactive_folder_loads.discard(account_id)
         account = self._find_account(account_id)
         if account is None:
             return
@@ -2216,15 +2234,17 @@ class BackupApp:
         self._sync_folder_loading_view()   # 收动画层；后台账户完成不打断可见账户的显示（Q8）
 
     def _on_folder_load_failed(self, account_id: str, message: str) -> None:
-        """静默拉清单失败：写日志 + 文件夹区提示可刷新重试；密码类失败再弹补录窗。"""
+        """静默拉清单失败：写日志 + 文件夹区提示可刷新重试；密码类失败仅交互式拉取才弹补录窗。"""
         self._loading_folder_ids.discard(account_id)
+        interactive = account_id in self._interactive_folder_loads
+        self._interactive_folder_loads.discard(account_id)
         account = self._find_account(account_id)
         name = account_display(account) if account else account_id
         self.log.warning("账户 %s：文件夹清单加载失败（%s）", name, message)
         reason = message if len(message) <= FOLDER_FAIL_REASON_MAX else message[:FOLDER_FAIL_REASON_MAX] + ELLIPSIS
         self._show_folder_hint(account_id, FOLDER_LOAD_FAIL_HINT.format(reason=reason))
         self._sync_folder_loading_view()   # 失败即退出加载态（Q4），旧树/提示恢复显示
-        if _is_auth_failure(message):
+        if _is_auth_failure(message) and interactive:
             self._maybe_prompt_folder_password(account_id)
 
     def _fill_folder_rows(self, state: dict, account: dict, names: list[tuple]) -> None:
@@ -2291,6 +2311,7 @@ class BackupApp:
         # 新树重写——变矮不送达 <Configure>，旧树的滚动范围会一直留着；与 _refresh_account_list 同宗
         self.folder_canvas.yview_moveto(0)
         self.folder_canvas.after_idle(self._sync_folder_scroll)
+        self._sync_folder_toolbar()   # 清单有无变化直接决定工具按钮启停
 
     def _make_folder_node(self, key: tuple[str, ...], rows: list[dict] | None,
                           with_kids: set[tuple], open_keys: set[tuple] | None,
@@ -2721,6 +2742,9 @@ class BackupApp:
             self.log.info("切换到账户 %s", account_display(account))
         self._render_account_detail()
         self._render_account_rows()
+        # 切账户即静默加载（GLOSSARY「静默加载」口径）：目标账户没清单或参数变过才真拉，
+        # 被动触发不弹密码补录——缺密码只在文件夹区留提示，等用户点 ⟳
+        self._maybe_load_folders(account_id)
 
     def _save_visible_state(self) -> None:
         """把可见账户的进度条值收进状态字典（计数与状态文案在各自写入点已同步）。"""
@@ -3889,6 +3913,7 @@ class BackupApp:
             image=self.stop_icon if widget_state(self.stop_btn) != "disabled" else self.stop_icon_off)
 
     def _set_config_enabled(self, enabled: bool) -> None:
+        self._config_enabled = enabled
         for widget, default_state in self._config_widgets:
             # Misc.__setitem__ 等价 configure({key: value})：存根把 configure 的 state 形参
             # 收成 Literal，而这里要存回的默认 state 是运行期 str，走按 Any 校验的下标路径
@@ -3900,6 +3925,18 @@ class BackupApp:
         for w, default_fg in self._folder_clickables:
             w.configure(foreground=default_fg if enabled else "gray",
                         cursor="hand2" if enabled else "arrow")
+        # 配置锁只认默认值，会把空清单的工具按钮错误放回 normal；空清单裁决走在锁之后
+        self._sync_folder_toolbar()
+
+    def _sync_folder_toolbar(self) -> None:
+        """全选/清空/仅收件箱 的启停：配置区启用且清单非空才可点（空清单点了也是空转）。
+
+        Note:
+            ⟳ 刷新不在此列——它是加载失败后的唯一重试入口，必须永远可用。
+        """
+        enabled = self._config_enabled and bool(self.folder_rows)
+        for btn in self._folder_tool_btns:
+            btn.configure(state="normal" if enabled else "disabled")
 
     def _ensure_status_rows(self) -> None:
         """首次开始备份时放出进度条和第二行状态条；放出后不再收回。

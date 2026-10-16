@@ -133,10 +133,11 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 **Connection folded into the backup run**
 
-* There is no separate "connect" button any more. Folder lists load silently in the background (on startup, on switching accounts, and after saving an account), so the folder tree simply fills in on its own; a failure only writes to the run log.
+* There is no separate "connect" button any more. Folder lists load silently in the background (on startup, on switching accounts, and after saving an account), so the folder tree simply fills in on its own; a failure leaves a hint in the folder pane and writes to the run log, and the ⟳ button is the retry entry.
 * While a folder list is loading (including a manual reload from the ⟳ button in the pane's top-right corner), the folder pane shows an in-panel loading spinner instead of the tree and disables that button; the spinner follows the selected account only, and a failure brings back the old tree or hint as before.
+* In the folder pane, the 全选/清空/仅收件箱 buttons are enabled only while the folder list is non-empty — with nothing loaded there is nothing to select; the ⟳ reload button stays always available as the only retry entry.
 * Starting a backup first opens a connection-check dialog that probes each account in turn (sign in, list folders, sign out) and shows per-account status. Only after every account checks out does the dialog close on its own and the accounts sync **concurrently** — each with its own IMAP connection.
-* A wrong (or missing) password opens a password prompt: type the right one and retry that account, or skip it and carry on with the rest. A "save password" checkbox (checked by default) stores it encrypted; leaving it unchecked uses the password only for this run. Closing the check dialog cancels the whole backup.
+* A wrong (or missing) password opens a password prompt, but only on explicit actions — starting a backup or clicking ⟳; silent background loads never pop it, they just leave the pane hint. Type the right password and retry that account, or skip it and carry on with the rest. A "save password" checkbox (checked by default) stores it encrypted; leaving it unchecked uses the password only for this run. Closing the check dialog cancels the whole backup.
 * Run log lines from concurrent accounts carry an account-name prefix so interleaved output stays readable; the mail list shows only the selected account's messages and switches with the selection.
 
 **Resizable sidebars and capped layout**
