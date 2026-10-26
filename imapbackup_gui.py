@@ -4361,7 +4361,7 @@ class BackupApp:
                 foldername, filename, eml_relpath, display = n
                 eq.put(("phase", account_id, f"扫描 {i}/{len(selected)}：{display}"))
                 try:
-                    remote = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
+                    scan = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
                 except core.SkipFolderException as e:
                     self.log.warning("%s：跳过（%s）", display, e)
                     continue
@@ -4374,8 +4374,8 @@ class BackupApp:
                 if eml_root is not None:
                     local_eml = core.scan_eml_dir(eml_root / account_dir / eml_relpath, False, True,
                                                   quiet=False, log=log)
-                new = core.pending_messages(remote, local_mbox, local_eml)
-                server_total += len(remote)
+                new = core.pending_messages(scan.messages, local_mbox, local_eml)
+                server_total += len(scan.messages)
                 pending_total += len(new)
                 plans.append((n, new, local_mbox, local_eml))
             eq.put(("totals", account_id, server_total, pending_total))
@@ -4398,11 +4398,15 @@ class BackupApp:
                         continue
                     label = f"{account_dir}/{filename}" if basedir is not None else f"{account_dir}/{eml_relpath}"
                     eml_folder_dir = eml_root / account_dir / eml_relpath if eml_root is not None else None
-                    core.download_messages(server, label, new, False, True, False,
-                                           basedir, False, quiet=False, log=log,
-                                           eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
-                                           foldername=display,
-                                           report=report, should_stop=stop_event.is_set)
+                    try:
+                        core.download_messages(server, label, new, False, True, False,
+                                               basedir, False, quiet=False, log=log,
+                                               eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
+                                               foldername=display,
+                                               report=report, should_stop=stop_event.is_set)
+                    except core.FolderFetchError as e:
+                        self.log.warning("%s：取信失败（%s）", display, e)
+                        continue
         finally:
             with contextlib.suppress(Exception):
                 server.logout()

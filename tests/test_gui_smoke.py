@@ -2613,7 +2613,8 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: FakeServer())
     monkeypatch.setattr(g.core, "get_names",
                         lambda *a, **k: [("INBOX", "INBOX.mbox", "INBOX", "INBOX")])
-    monkeypatch.setattr(g.core, "scan_folder", lambda *a, **k: {"<m@x>": 1})
+    monkeypatch.setattr(g.core, "scan_folder",
+                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, None))
 
     def fake_scan_file(label, *_a, **_k):
         scanned["label"] = label
@@ -2631,6 +2632,41 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     assert scanned["dir"] == "a@example.com", scanned
     assert scanned["label"] == "a@example.com/INBOX.mbox", scanned
     assert "工作邮箱" not in str(scanned)
+
+
+def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch, tmp_path):
+    """FolderFetchError 只算一个文件夹失败（规格 §5.3），不能升级为账户失败。"""
+    account = {"id": "acc-fetch", "name": "工作邮箱", "user": "a@example.com", "server": "imap.example.com",
+               "ssl": True, "port": "993", "password": "p", "folders": ["INBOX", "ZZ"],
+               "mbox": True, "eml": False}
+    calls: list[str] = []
+
+    class FakeServer:
+        def select(self, *_args, **_kwargs):
+            return "OK", b""
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: FakeServer())
+    monkeypatch.setattr(g.core, "get_names", lambda *a, **k: [
+        ("INBOX", "INBOX.mbox", "INBOX", "INBOX"), ("ZZ", "ZZ.mbox", "ZZ", "ZZ")])
+    monkeypatch.setattr(g.core, "scan_folder",
+                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, None))
+    monkeypatch.setattr(g.core, "scan_file", lambda *a, **k: {})
+    monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
+    monkeypatch.setattr(g.core, "create_folder_structure", lambda *a, **k: None)
+
+    def fake_download(_server, label, *_a, **_k):
+        calls.append(label)
+        if label.endswith("INBOX.mbox"):
+            raise g.core.FolderFetchError("every UID in a FETCH batch was rejected by the server")
+
+    monkeypatch.setattr(g.core, "download_messages", fake_download)
+
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
+                        g.threading.Event())
+    assert calls == ["a@example.com/INBOX.mbox", "a@example.com/ZZ.mbox"], calls
 
 
 def test_entry_context_menu_has_three_actions(app, monkeypatch):

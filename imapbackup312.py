@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from functools import cache
 from pathlib import Path
+from typing import IO
 
 # Daily run log shared with the Tkinter GUI: both entry points append to one
 # file per day under the app data directory, which the uninstaller deletes whole.
@@ -90,6 +91,52 @@ def make_log_file_handler() -> logging.FileHandler | None:
 
 class SkipFolderException(Exception):
     """Indicates aborting processing of current folder, continue with next folder."""
+
+
+class FolderFetchError(Exception):
+    """A whole body-fetch batch was rejected per UID: one folder failure, not an account failure."""
+
+
+class BackupWriteError(Exception):
+    """Local output write failed; never retried as a connection error.
+
+    Deliberately not an OSError subclass: reconnect classification treats OSError as
+    a connection-level failure, and a disk error must not look like a dropped link.
+    """
+
+
+@dataclass
+class FolderScan:
+    """One folder's message scan: Message-Id -> (UID, RFC822.SIZE)."""
+
+    messages: dict[str, tuple[int, int]]
+    uidvalidity: int | None
+
+
+@dataclass(frozen=True)
+class BatchStats:
+    """One completed body-fetch batch, for progress/UI/diagnostics."""
+
+    msgs: int
+    bytes: int
+    fetch_ms: float
+    backed: int
+    fetch_failed: int
+
+
+@dataclass
+class DownloadProgress:
+    """Mutable per-folder accumulator; a reconnect keeps adding to the same instance."""
+
+    backed: int = 0
+    fetch_failed: int = 0
+    fetch_failed_missing: int = 0
+    fetch_failed_no_bad: int = 0
+    fetch_failed_malformed: int = 0
+    done_bytes: int = 0
+    batches: int = 0
+    last_batch: BatchStats | None = None
+    stopped: bool = False
 
 
 def _has_console() -> bool:
@@ -215,6 +262,15 @@ IMAP_MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
 BAR_FILL = "█"
 BAR_EMPTY = "░"
 FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate per char
+
+SCAN_PAGE_UIDS = 500
+FETCH_BATCH_MAX_MESSAGES = 8
+FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
+SCAN_MSGID_FETCH_ITEMS = "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+SCAN_FALLBACK_FETCH_ITEMS = "(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])"
+BODY_FETCH_ITEMS = "(UID INTERNALDATE BODY.PEEK[])"
+UID_RE = re.compile(rb"\bUID (\d+)\b")
+FETCH_SIZE_RE = re.compile(rb"\bRFC822\.SIZE (\d+)\b")
 
 
 def string_from_file(value: str) -> str:
@@ -442,104 +498,339 @@ def report_message(foldername: str, idx: int, total: int, timestamp: datetime,
         sys.stdout.flush()
 
 
-def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, int],
+def _parse_uid_response(data: list[object]) -> tuple[dict[int, tuple[bytes, bytes | None]], int, set[int]]:
+    """Parse a flat UID FETCH response into uid -> (metadata, literal).
+
+    Non-tuple items (the trailing b")") are ignored. A tuple whose UID cannot be
+    read is counted as unattributed; a tuple with a UID but no bytes literal keeps
+    the UID so the caller can retry that message alone. A repeated UID keeps the
+    first response and is reported separately for a WARNING.
+    """
+    parsed: dict[int, tuple[bytes, bytes | None]] = {}
+    unattributed = 0
+    duplicates: set[int] = set()
+    for item in data:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        meta, literal = item[0], item[1]
+        if not isinstance(meta, bytes):
+            unattributed += 1
+            continue
+        match = UID_RE.search(meta)
+        if match is None:
+            unattributed += 1
+            continue
+        uid = int(match.group(1))
+        if uid not in parsed:
+            parsed[uid] = (meta, literal if isinstance(literal, bytes) else None)
+        else:
+            duplicates.add(uid)
+    return parsed, unattributed, duplicates
+
+
+def _parse_fetch_size(meta: bytes) -> int:
+    match = FETCH_SIZE_RE.search(meta)
+    return int(match.group(1)) if match else 0
+
+
+def _fetch_one(server: imaplib.IMAP4, uid: int, items: str) -> tuple[str, tuple[bytes, bytes] | None]:
+    """Single-UID FETCH classification: ok / missing / malformed / no_bad."""
+    typ, data = server.uid("FETCH", str(uid), items)
+    if typ != "OK":
+        return "no_bad", None
+    parsed, unattributed, _ = _parse_uid_response(data)
+    entry = parsed.get(uid)
+    if entry is None:
+        return ("malformed" if unattributed else "missing"), None
+    if entry[1] is None:
+        return "malformed", None
+    return "ok", (entry[0], entry[1])
+
+
+def _plan_batches(items: list[tuple[str, int, int]]) -> list[list[tuple[str, int, int]]]:
+    """Split UID-sorted (Message-Id, UID, size) into <=8 messages / <=8 MiB batches.
+
+    Unknown (size <= 0) and oversized messages take a batch of their own, so a
+    single huge message never drags neighbours over the byte cap.
+    """
+    batches: list[list[tuple[str, int, int]]] = []
+    current: list[tuple[str, int, int]] = []
+    current_bytes = 0
+    for item in items:
+        size = item[2]
+        if size <= 0 or size > FETCH_BATCH_MAX_BYTES:
+            if current:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            batches.append([item])
+            continue
+        if len(current) == FETCH_BATCH_MAX_MESSAGES or current_bytes + size > FETCH_BATCH_MAX_BYTES:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _body_fetch_attempt(server: imaplib.IMAP4, uids: list[int]) -> tuple[dict[int, tuple[bytes, bytes | None]], int, set[int], str | None]:
+    typ, data = server.uid("FETCH", ",".join(str(uid) for uid in uids), BODY_FETCH_ITEMS)
+    if typ != "OK":
+        return {}, 0, set(), str(data)
+    parsed, unattributed, duplicates = _parse_uid_response(data)
+    return parsed, unattributed, duplicates, None
+
+
+def _isolate_body(server: imaplib.IMAP4, uids: list[int], log: logging.Logger,
+                  display: str) -> tuple[dict[int, tuple[bytes, bytes]], dict[int, str]]:
+    """Retry every UID of a rejected batch one by one; all NO/BAD is a folder failure."""
+    fetched: dict[int, tuple[bytes, bytes]] = {}
+    failures: dict[int, str] = {}
+    for uid in uids:
+        status, entry = _fetch_one(server, uid, BODY_FETCH_ITEMS)
+        if status == "ok" and entry is not None:
+            fetched[uid] = entry
+        else:
+            failures[uid] = status if status != "ok" else "malformed"
+    if failures and len(failures) == len(uids) and all(bucket == "no_bad" for bucket in failures.values()):
+        raise FolderFetchError("every UID in a FETCH batch was rejected by the server")
+    log.info("%s: isolated batch → %d fetched, %d failed", display, len(fetched), len(failures))
+    return fetched, failures
+
+
+def _fetch_batch(server: imaplib.IMAP4, batch: list[tuple[str, int, int]], log: logging.Logger,
+                 display: str) -> tuple[dict[int, tuple[bytes, bytes]], dict[int, str]]:
+    """Fetch one batch and classify per-UID failures without writing anything."""
+    uids = [uid for _, uid, _ in batch]
+    parsed, unattributed, duplicates, error = _body_fetch_attempt(server, uids)
+    if error is not None:
+        log.warning("%s: FETCH rejected, retrying batch", display)
+        parsed, unattributed, duplicates, error = _body_fetch_attempt(server, uids)
+        if error is not None:
+            log.warning("%s: FETCH rejected after retry, isolating UIDs", display)
+            return _isolate_body(server, uids, log, display)
+    if unattributed:
+        log.warning("%s: %d FETCH response(s) had no UID", display, unattributed)
+    if duplicates:
+        log.warning("%s: duplicate UID(s) in FETCH response, keeping the first: %s",
+                    display, sorted(duplicates))
+    unknown = set(parsed) - set(uids)
+    if unknown:
+        log.warning("%s: FETCH returned unrequested UIDs %s", display, sorted(unknown))
+    fetched: dict[int, tuple[bytes, bytes]] = {}
+    failures: dict[int, str] = {}
+    for uid in uids:
+        entry = parsed.get(uid)
+        if entry is not None and entry[1] is not None:
+            fetched[uid] = (entry[0], entry[1])
+            continue
+        status, retry = _fetch_one(server, uid, BODY_FETCH_ITEMS)
+        if status == "ok" and retry is not None:
+            fetched[uid] = retry
+        else:
+            failures[uid] = status if status != "ok" else "malformed"
+    return fetched, failures
+
+
+@dataclass(frozen=True)
+class _MessageOutput:
+    timestamp: datetime
+    from_value: str
+    subject_value: str
+    size: int
+    wrote: bool
+
+
+def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
+                   mbox: IO[bytes] | None, eml_dir: Path | None,
+                   skip_mbox: Container[str], skip_eml: Container[str],
+                   thunderbird: bool, filename: str) -> _MessageOutput:
+    timestamp = message_timestamp(meta_text, raw_bytes)
+    head = raw_bytes[:8192]
+    from_value = folded_header(head, "From")
+    subject_value = folded_header(head, "Subject")
+    size = 0
+    wrote = False
+    try:
+        if mbox is not None and msg_id not in skip_mbox:
+            buf = f"From nobody {time.ctime()}\n"
+            if UUID in msg_id:
+                buf += f"Message-Id: {msg_id}\n"
+            mbox.write(buf.encode("utf-8"))
+            text_bytes = raw_bytes.strip().replace(b"\r", b"")
+            text_bytes = (text_bytes.replace(b"\nFrom ", b"\n From ") if thunderbird
+                          else re.sub(br"\n(>*)From ", b"\n>\\1From ", text_bytes))
+            mbox.write(text_bytes + b"\n\n")
+            size = len(text_bytes)
+            wrote = True
+        if eml_dir is not None and msg_id not in skip_eml:
+            payload = raw_bytes.strip() + b"\r\n"
+            if UUID in msg_id and b"message-id:" not in head.lower():
+                payload = f"Message-Id: {msg_id}\r\n".encode() + payload
+            bucket_dir = eml_dir / timestamp.strftime("%Y-%m")
+            target = unique_eml_path(build_eml_target(bucket_dir, timestamp, msg_id, decode_mime_words(subject_value)))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+            size = max(size, len(payload))
+            wrote = True
+    except OSError as exc:
+        raise BackupWriteError(f"Failed writing message {msg_id} to {filename}: {exc}") from exc
+    return _MessageOutput(timestamp, from_value, subject_value, size, wrote)
+
+
+def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, tuple[int, int]],
                       overwrite: bool, nospinner: bool, thunderbird: bool,
                       basedir: Path | None, icloud: bool, quiet: bool, log: logging.Logger,
                       eml_dir: Path | None = None, skip_mbox: Container[str] | None = None,
                       skip_eml: Container[str] | None = None, foldername: str = "",
                       verbose: int = 0, compact: bool = False,
                       report: Callable[[dict], None] | None = None,
-                      should_stop: Callable[[], bool] | None = None) -> None:
-    """Download `messages` (Message-Id -> seq) once each, writing to whichever sinks are
-    selected. skip_mbox/skip_eml hold Message-Ids already present in that sink, so a
-    message missing from only one format is fetched once and written only to the sink
-    that lacks it. `messages` must not contain an id present in BOTH skip sets."""
+                      should_stop: Callable[[], bool] | None = None,
+                      *, written: set[str] | None = None,
+                      progress: DownloadProgress | None = None,
+                      on_batch: Callable[[BatchStats], None] | None = None) -> DownloadProgress:
+    """Fetch pending messages in UID batches, writing only the formats each one lacks.
+
+    Messages are fetched once each as `(UID, RFC822.SIZE)` pairs; a batch is fully
+    parsed before any byte is written, failed UIDs are counted per bucket and never
+    counted as backed, and a stop discards the rest of the in-flight batch.
+    """
     if skip_mbox is None:
         skip_mbox = frozenset()
     if skip_eml is None:
         skip_eml = frozenset()
+    if progress is None:
+        progress = DownloadProgress()
+    if written is None:
+        written = set()
+    display = foldername or filename
     if basedir is not None:
         fullname = basedir / filename
         if overwrite and fullname.exists():
             if not quiet:
                 log.info("Deleting mbox %s at %s", filename, fullname)
-            fullname.unlink()
+            try:
+                fullname.unlink()
+            except OSError as exc:
+                raise BackupWriteError(f"Failed deleting {fullname}: {exc}") from exc
     if eml_dir is not None and overwrite and eml_dir.exists():
         if not quiet:
             log.info("Deleting eml folder %s", eml_dir)
-        shutil.rmtree(eml_dir)
+        try:
+            shutil.rmtree(eml_dir)
+        except OSError as exc:
+            raise BackupWriteError(f"Failed deleting {eml_dir}: {exc}") from exc
     if not messages:
         if not quiet:
             log.info("%s: New messages: 0", filename)
-        return
-    if basedir is not None:
-        (basedir / filename).parent.mkdir(parents=True, exist_ok=True)
+        return progress
+
     count = len(messages)
-    display = foldername or filename
+    ordered = sorted(((msg_id, uid, size) for msg_id, (uid, size) in messages.items()),
+                     key=lambda item: item[1])
+    index_of = {msg_id: idx for idx, msg_id in enumerate(messages, start=1)}
+    batches = _plan_batches(ordered)
     spinner = Spinner(f"Downloading {count} new messages to {display}", nospinner, quiet=quiet)
     biggest = 0
-    done_bytes = 0
+    output_bytes = 0
     t0 = time.monotonic()
-    from_re = re.compile(br"\n(>*)From ")
-    mbox = (basedir / filename).open("ab") if basedir is not None else None
+    mbox: IO[bytes] | None = None
     try:
-        for idx, (msg_id, seq) in enumerate(messages.items(), start=1):
+        if basedir is not None:
+            try:
+                (basedir / filename).parent.mkdir(parents=True, exist_ok=True)
+                mbox = (basedir / filename).open("ab")
+            except OSError as exc:
+                raise BackupWriteError(f"Failed opening {basedir / filename}: {exc}") from exc
+        for batch in batches:
             if should_stop is not None and should_stop():
+                progress.stopped = True
                 if not quiet:
-                    log.info("%s: stopped by request after %d/%d messages", display, idx - 1, count)
+                    log.info("%s: stopped by request before next batch", display)
                 break
-            fetch_cmd = "(INTERNALDATE BODY.PEEK[])"
-            typ, data = server.fetch(str(seq), fetch_cmd)
-            if typ != 'OK':
-                raise RuntimeError(f"FETCH failed for UID {seq}: {data}")
-            if not data or not isinstance(data[0], tuple):
-                raise RuntimeError(f"Malformed FETCH response for UID {seq}: {data}")
-            fetch_meta = str(data[0][0], 'utf-8', 'replace')
-            raw_bytes = data[0][1]
-            timestamp = message_timestamp(fetch_meta, raw_bytes)
-            head = raw_bytes[:8192]
-            from_value = folded_header(head, "From")
-            subject_value = folded_header(head, "Subject")
-            size = 0
-            if mbox is not None and msg_id not in skip_mbox:
-                buf = f"From nobody {time.ctime()}\n"
-                if UUID in msg_id:
-                    buf += f"Message-Id: {msg_id}\n"
-                mbox.write(buf.encode("utf-8"))
-                text_bytes = raw_bytes.strip().replace(b"\r", b"")
-                text_bytes = (text_bytes.replace(b"\nFrom ", b"\n From ") if thunderbird
-                              else from_re.sub(b"\n>\\1From ", text_bytes))
-                mbox.write(text_bytes + b"\n\n")
-                size = len(text_bytes)
-            if eml_dir is not None and msg_id not in skip_eml:
-                payload = raw_bytes.strip() + b"\r\n"
-                if UUID in msg_id and b"message-id:" not in head.lower():
-                    payload = f"Message-Id: {msg_id}\r\n".encode() + payload
-                bucket_dir = eml_dir / timestamp.strftime("%Y-%m")
-                target = unique_eml_path(build_eml_target(bucket_dir, timestamp, msg_id, decode_mime_words(subject_value)))
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(payload)
-                size = max(size, len(payload))
-            if size > biggest:
-                biggest = size
-            if not compact:
-                report_message(display, idx, count, timestamp, from_value, subject_value, size,
-                               msg_id, quiet, verbose, report, erase=spinner.erase)
-            done_bytes += size
-            elapsed = time.monotonic() - t0
-            rate = f" · {pretty_byte_count(int(done_bytes / elapsed))}/s" if elapsed >= 1.0 and done_bytes else ""
-            status_text = (f"Downloading {display} [{progress_bar(idx, count)}] "
-                           f"{idx}/{count} · {pretty_byte_count(done_bytes)}{rate}")
-            if compact:
-                status_text += f" | {_subject_label(subject_value, 40)}"
-            spinner.status(status_text)
-            spinner.spin()
+            batch_t0 = time.monotonic()
+            fetched, failures = _fetch_batch(server, batch, log, display)
+            fetch_ms = (time.monotonic() - batch_t0) * 1000.0
+            if should_stop is not None and should_stop():
+                progress.stopped = True
+                if not quiet:
+                    log.info("%s: stopped by request; discarding fetched batch", display)
+                break
+            backed_before = progress.backed
+            failed_before = progress.fetch_failed
+            for msg_id, uid, size in batch:
+                if msg_id in written:
+                    continue
+                failure = failures.get(uid)
+                if failure is not None:
+                    progress.fetch_failed += 1
+                    if failure == "missing":
+                        progress.fetch_failed_missing += 1
+                    elif failure == "no_bad":
+                        progress.fetch_failed_no_bad += 1
+                    else:
+                        progress.fetch_failed_malformed += 1
+                    log.debug("%s: could not fetch %s (%s)", display, msg_id, failure)
+                    continue
+                entry = fetched.get(uid)
+                if entry is None:
+                    continue
+                meta, raw_bytes = entry
+                output = _write_message(raw_bytes, str(meta, "utf-8", "replace"), msg_id,
+                                        mbox=mbox, eml_dir=eml_dir, skip_mbox=skip_mbox,
+                                        skip_eml=skip_eml, thunderbird=thunderbird, filename=filename)
+                if not output.wrote:
+                    continue
+                written.add(msg_id)
+                progress.backed += 1
+                progress.done_bytes += size
+                output_bytes += output.size
+                if output.size > biggest:
+                    biggest = output.size
+                if not compact:
+                    report_message(display, index_of[msg_id], count, output.timestamp,
+                                   output.from_value, output.subject_value, output.size, msg_id,
+                                   quiet, verbose, report, erase=spinner.erase)
+                elapsed = time.monotonic() - t0
+                rate = f" · {pretty_byte_count(int(output_bytes / elapsed))}/s" if elapsed >= 1.0 and output_bytes else ""
+                idx = index_of[msg_id]
+                status_text = (f"Downloading {display} [{progress_bar(idx, count)}] "
+                               f"{idx}/{count} · {pretty_byte_count(output_bytes)}{rate}")
+                if compact:
+                    status_text += f" | {_subject_label(output.subject_value, 40)}"
+                spinner.status(status_text)
+                spinner.spin()
+                if should_stop is not None and should_stop():
+                    progress.stopped = True
+                    if not quiet:
+                        log.info("%s: stopped by request after %d/%d messages", display, idx, count)
+                    break
+            stats = BatchStats(msgs=len(batch), bytes=sum(size for _, _, size in batch),
+                               fetch_ms=fetch_ms,
+                               backed=progress.backed - backed_before,
+                               fetch_failed=progress.fetch_failed - failed_before)
+            progress.batches += 1
+            progress.last_batch = stats
+            if on_batch is not None:
+                on_batch(stats)
+            if progress.stopped:
+                break
     finally:
         if mbox is not None:
-            mbox.close()
-    spinner.stop()
+            try:
+                mbox.close()
+            except OSError as exc:
+                if sys.exc_info()[0] is None:
+                    raise BackupWriteError(f"Failed closing {filename}: {exc}") from exc
+        spinner.stop()
     if not quiet:
-        log.info("%s: %s total, %s largest", filename, pretty_byte_count(done_bytes), pretty_byte_count(biggest))
+        log.info("%s: %s total, %s largest", filename, pretty_byte_count(output_bytes), pretty_byte_count(biggest))
+        if progress.fetch_failed:
+            log.warning("%s: %d message(s) could not be fetched", display, progress.fetch_failed)
+    return progress
 
 
 def scan_file(filename: str, overwrite: bool, nospinner: bool, basedir: Path, quiet: bool, log: logging.Logger) -> dict[str, str]:
@@ -612,7 +903,7 @@ def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool
     return messages
 
 
-def pending_messages(remote: dict[str, int], *scans: dict[str, str] | None) -> dict[str, int]:
+def pending_messages[T](remote: dict[str, T], *scans: dict[str, str] | None) -> dict[str, T]:
     """Server messages that still need downloading, for the selected output formats.
 
     Each entry in `scans` is one selected format's local scan result (scan_file /
@@ -624,48 +915,123 @@ def pending_messages(remote: dict[str, int], *scans: dict[str, str] | None) -> d
     return {mid: remote[mid] for mid in remote if any(mid not in scan for scan in selected)}
 
 
+def _read_uidvalidity(server: imaplib.IMAP4, display: str, log: logging.Logger) -> int | None:
+    raw = server.untagged_responses.get("UIDVALIDITY")
+    if not raw:
+        log.warning("%s: server did not report UIDVALIDITY", display)
+        return None
+    try:
+        value = raw[0]
+        if isinstance(value, tuple):
+            raise TypeError(value)
+        return int(value)
+    except (TypeError, ValueError):
+        log.warning("%s: malformed UIDVALIDITY response", display)
+        return None
+
+
+def _parse_search_uids(data: list[object]) -> list[int] | None:
+    tokens = b" ".join(item for item in data if isinstance(item, bytes)).split()
+    try:
+        return sorted({int(token) for token in tokens})
+    except ValueError:
+        return None
+
+
+def _fetch_header_page(server: imaplib.IMAP4, uids: list[int], items: str,
+                       display: str, log: logging.Logger) -> dict[int, tuple[bytes, bytes]]:
+    """One page of header FETCHes, retried as a page; a bad UID alone is retried once."""
+    requested = list(uids)
+    wanted = set(requested)
+    for attempt in (1, 2):
+        typ, data = server.uid("FETCH", ",".join(str(uid) for uid in requested), items)
+        if typ != "OK":
+            if attempt == 1:
+                log.warning("%s: header FETCH failed, retrying page", display)
+                continue
+            raise SkipFolderException(f"HEADER FETCH failed: {data}")
+        parsed, unattributed, _ = _parse_uid_response(data)
+        unknown = set(parsed) - wanted
+        if unattributed or unknown:
+            if attempt == 1:
+                log.warning("%s: malformed header response, retrying page", display)
+                continue
+            raise SkipFolderException(f"Malformed HEADER FETCH response: {data!r}")
+        resolved: dict[int, tuple[bytes, bytes]] = {}
+        for uid in requested:
+            entry = parsed.get(uid)
+            if entry is not None and entry[1] is not None:
+                resolved[uid] = (entry[0], entry[1])
+                continue
+            status, retry = _fetch_one(server, uid, items)
+            if status != "ok" or retry is None:
+                raise SkipFolderException(f"HEADER FETCH for UID {uid} failed ({status})")
+            resolved[uid] = retry
+        return resolved
+    raise SkipFolderException("HEADER FETCH failed")
+
+
+def _store_remote_message(messages: dict[str, tuple[int, int]], msg_id: str, uid: int, size: int,
+                          display: str, log: logging.Logger) -> None:
+    if msg_id in messages:
+        log.warning("%s: duplicate Message-Id %s; using UID %d", display, msg_id, uid)
+    messages[msg_id] = (uid, size)
+
+
 def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: bool, log: logging.Logger,
-                display: str | None = None) -> dict[str, int]:
-    messages: dict[str, int] = {}
+                display: str | None = None) -> FolderScan:
+    """Take one complete UID snapshot of a folder: SEARCH ALL plus 500-UID header pages.
+
+    A page that cannot be parsed is retried once, then the whole folder is skipped;
+    a partial snapshot is never returned, because a missing entry would turn into a
+    skipped message. Connection errors propagate to the caller for reconnect.
+    """
+    messages: dict[str, tuple[int, int]] = {}
     shown = display or foldername
     quoted = f'"{foldername}"'
     spinner = Spinner(f'Folder "{shown}"', nospinner, quiet=quiet)
     try:
         typ, data = server.select(quoted, readonly=True)
-        if typ != 'OK':
+        if typ != "OK":
             raise SkipFolderException(f"SELECT failed: {data}")
-        first = data[0] if data else None
-        try:
-            num_msgs = int(first) if isinstance(first, bytes) else 0
-        except ValueError:
-            num_msgs = 0
-        if num_msgs > 0:
-            typ, data = server.fetch(f"1:{num_msgs}", '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
-            if typ != 'OK':
-                raise SkipFolderException(f"FETCH failed: {data}")
-            pairs = [t for t in data if isinstance(t, tuple)]
-            for idx, tup in enumerate(pairs):
-                normalized = BLANKS_RE.sub(' ', str(tup[1], 'utf-8', 'replace').strip())
+        uidvalidity = _read_uidvalidity(server, shown, log)
+        typ, data = server.uid("SEARCH", "ALL")
+        if typ != "OK":
+            log.warning("%s: UID SEARCH failed, retrying", shown)
+            typ, data = server.uid("SEARCH", "ALL")
+            if typ != "OK":
+                raise SkipFolderException(f"UID SEARCH failed: {data}")
+        uids = _parse_search_uids(data)
+        if uids is None:
+            raise SkipFolderException(f"Malformed UID SEARCH response: {data!r}")
+        sizes: dict[int, int] = {}
+        fallback: list[int] = []
+        for start in range(0, len(uids), SCAN_PAGE_UIDS):
+            page = uids[start:start + SCAN_PAGE_UIDS]
+            fetched = _fetch_header_page(server, page, SCAN_MSGID_FETCH_ITEMS, shown, log)
+            for uid in page:
+                meta, literal = fetched[uid]
+                sizes[uid] = _parse_fetch_size(meta)
+                normalized = BLANKS_RE.sub(" ", str(literal, "utf-8", "replace").strip())
                 match = MSGID_RE.match(normalized)
-                seq = idx + 1
-                if match:
-                    messages.setdefault(match.group(1), seq)
-                else:
-                    msg_typ, msg_data = server.fetch(str(seq), '(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])')
-                    if msg_typ != 'OK':
-                        raise SkipFolderException(f"HEADER FETCH {seq} failed: {msg_data}")
-                    entry = msg_data[0] if msg_data else None
-                    if not isinstance(entry, tuple) or not isinstance(entry[1], bytes):
-                        raise SkipFolderException(f"Malformed HEADER FETCH {seq}: {msg_data}")
-                    hdr_bytes = entry[1].replace(b'\r\n', b'\t')
-                    synthetic = '<' + UUID + '.' + hashlib.sha1(hdr_bytes).hexdigest() + '>'
-                    messages.setdefault(synthetic, seq)
-                spinner.spin()
+                if match is None:
+                    fallback.append(uid)
+                    continue
+                _store_remote_message(messages, match.group(1), uid, sizes[uid], shown, log)
+            spinner.spin()
+        for start in range(0, len(fallback), SCAN_PAGE_UIDS):
+            page = fallback[start:start + SCAN_PAGE_UIDS]
+            fetched = _fetch_header_page(server, page, SCAN_FALLBACK_FETCH_ITEMS, shown, log)
+            for uid in page:
+                _, literal = fetched[uid]
+                synthetic = "<" + UUID + "." + hashlib.sha1(literal.replace(b"\r\n", b"\t")).hexdigest() + ">"
+                _store_remote_message(messages, synthetic, uid, sizes[uid], shown, log)
+            spinner.spin()
     finally:
         spinner.stop()
     if not quiet:
         log.info("%s: %d messages", shown, len(messages))
-    return messages
+    return FolderScan(messages, uidvalidity)
 
 
 type ParenItem = str | list[ParenItem]
@@ -990,11 +1356,16 @@ def main(argv: list[str] | None = None) -> int:
             ensure_basedir(cfg.basedir)
             create_folder_structure(names, cfg.basedir, account)
         total_folders = len(names)
+        total_backed = total_skipped = total_fetch_failed = folder_failures = 0
+        run_t0 = time.monotonic()
         for folder_idx, (foldername, filename, eml_relpath, display_name) in enumerate(names, start=1):
             if not cfg.quiet:
                 folder_separator(folder_idx, total_folders, display_name)
+            progress = DownloadProgress()
+            remote: FolderScan | None = None
+            new_messages: dict[str, tuple[int, int]] = {}
             try:
-                remote_msgs = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
+                remote = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
                 # per-format incremental: pending iff any selected format lacks the message;
                 # download_messages then writes only the sinks that still lack it
                 local_mbox: dict[str, str] | None = None
@@ -1006,16 +1377,32 @@ def main(argv: list[str] | None = None) -> int:
                 if cfg.eml_dir is not None:
                     eml_folder_dir = cfg.eml_dir / account / eml_relpath
                     local_eml = scan_eml_dir(eml_folder_dir, cfg.overwrite, cfg.nospinner, quiet=cfg.quiet, log=log)
-                new_messages = pending_messages(remote_msgs, local_mbox, local_eml)
+                new_messages = pending_messages(remote.messages, local_mbox, local_eml)
                 label = f"{account}/{filename}" if cfg.basedir is not None else f"{account}/{eml_relpath}"
                 download_messages(server, label, new_messages, cfg.overwrite, cfg.nospinner,
                                   cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
                                   eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
-                                  foldername=display_name, verbose=cfg.verbose, compact=cfg.compact)
+                                  foldername=display_name, verbose=cfg.verbose, compact=cfg.compact,
+                                  progress=progress)
             except SkipFolderException as e:
+                folder_failures += 1
                 if not cfg.quiet:
-                    log.warning("%s", e)
+                    log.warning("%s: folder failed (scan): %s", display_name, e)
                 continue
+            except FolderFetchError as e:
+                folder_failures += 1
+                if not cfg.quiet:
+                    log.warning("%s: folder failed (fetch): %s", display_name, e)
+                continue
+            finally:
+                total_backed += progress.backed
+                total_fetch_failed += progress.fetch_failed
+                if remote is not None:
+                    total_skipped += len(remote.messages) - len(new_messages)
+        elapsed = int(time.monotonic() - run_t0)
+        log.info("Account %s: %d backed, %d skipped, %d fetch failed, %d folder failure(s), elapsed %d:%02d",
+                 account, total_backed, total_skipped, total_fetch_failed, folder_failures,
+                 elapsed // 60, elapsed % 60)
         if not cfg.quiet:
             log.info("Disconnecting")
         with contextlib.suppress(imaplib.IMAP4.error):

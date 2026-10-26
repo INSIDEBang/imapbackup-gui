@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import imapbackup312 as m
-from fakes import FetchServer, HeaderServer, ListServer, NullLog, recording_spinner
+from fakes import ListServer, NullLog, UidFetchServer, recording_spinner
 
 TS = datetime(2024, 5, 12, 10, 15, 30)
 DATE_HEADER_INSTANT = datetime(2024, 5, 12, 2, 15, 30, tzinfo=UTC)
@@ -21,10 +21,12 @@ DATE_HEADER_INSTANT = datetime(2024, 5, 12, 2, 15, 30, tzinfo=UTC)
 SYNTHETIC = "<" + m.UUID + "." + uuid.uuid4().hex[:12] + ">"
 RAW1 = (b"From: Alice <a@b.com>\r\nSubject: Re: =?utf-8?B?5L2g5aW9?=\r\nMessage-Id: <aaa@x>\r\n"
         b"\r\nline1\r\nFrom nobody secret\r\nline2\r\n")
-RESP1 = (b'1 (INTERNALDATE "12-May-2024 10:15:30 +0800" RFC822 {120}', RAW1)
 RAW2 = b"Date: Sun, 12 May 2024 02:15:30 +0000\r\nFrom: b@x\r\n\r\nno msgid here\r\n"
-RESP2 = (b'2 (RFC822 {50}', RAW2)
-MSGS = {"<aaa@x>": 1, SYNTHETIC: 2}
+MSGS = {"<aaa@x>": (1, 120), SYNTHETIC: (2, 50)}
+
+
+def new_server():
+    return UidFetchServer({1: RAW1, 2: RAW2}, sizes={1: 120, 2: 50})
 
 
 def test_sanitize_segment():
@@ -191,14 +193,13 @@ def test_config_combinations():
 
 
 def test_synthetic_id_fallback_fetch_is_read_only():
-    """只读不变量：兜底 header 抓取也必须走 BODY.PEEK。"""
-    src = inspect.getsource(m.scan_folder)
-    assert "BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)]" in src
-    assert "(BODY[HEADER.FIELDS" not in src
-
-    fetch_src = inspect.getsource(m.download_messages)
-    assert "(INTERNALDATE BODY.PEEK[])" in fetch_src
-    assert "(INTERNALDATE RFC822)" not in fetch_src
+    """只读不变量：扫描、兜底 header 与正文抓取都必须走 BODY.PEEK。"""
+    assert m.SCAN_MSGID_FETCH_ITEMS == "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+    assert m.SCAN_FALLBACK_FETCH_ITEMS == "(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])"
+    assert m.BODY_FETCH_ITEMS == "(UID INTERNALDATE BODY.PEEK[])"
+    src = inspect.getsource(m)
+    assert "BODY[HEADER.FIELDS" not in src.replace("BODY.PEEK[HEADER.FIELDS", "")
+    assert "(INTERNALDATE RFC822)" not in src and "partial(" not in src
 
 
 def test_log_level_names_are_not_abbreviated():
@@ -207,12 +208,13 @@ def test_log_level_names_are_not_abbreviated():
 
 
 def test_download_messages_writes_both_formats(tmp_path):
-    server = FetchServer({1: RESP1, 2: RESP2})
+    server = new_server()
     m.download_messages(server, "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX", verbose=0)
 
-    assert all(items == "(INTERNALDATE BODY.PEEK[])" for _, items in server.fetches), server.fetches
+    assert all(items == m.BODY_FETCH_ITEMS for _, items in server.fetches), server.fetches
+    assert server.body_fetches == [[1, 2]], server.body_fetches
 
     mbox_bytes = (tmp_path / "mbox" / "INBOX.mbox").read_bytes()
     assert b"From nobody " in mbox_bytes
@@ -235,7 +237,7 @@ def test_download_messages_writes_both_formats(tmp_path):
 
 def test_download_messages_reports_structured_records(tmp_path):
     recs = []
-    m.download_messages(FetchServer({1: RESP1, 2: RESP2}), "INBOX.mbox", MSGS, False, True, False,
+    m.download_messages(new_server(), "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox", False, False, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX", verbose=1,
                         report=recs.append)
@@ -246,14 +248,14 @@ def test_download_messages_reports_structured_records(tmp_path):
 
 
 def test_overwrite_wipes_both_sinks_then_redownloads(tmp_path):
-    m.download_messages(FetchServer({1: RESP1}), "INBOX.mbox", {"<aaa@x>": 1}, False, True, False,
+    m.download_messages(new_server(), "INBOX.mbox", {"<aaa@x>": (1, 120)}, False, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX")
     junk = tmp_path / "eml" / "INBOX" / "2024-04"
     junk.mkdir(parents=True)
     (junk / "junk.eml").write_bytes(b"Message-Id: <junk@x>\r\n")
 
-    m.download_messages(FetchServer({1: RESP1}), "INBOX.mbox", {"<aaa@x>": 1}, True, True, False,
+    m.download_messages(new_server(), "INBOX.mbox", {"<aaa@x>": (1, 120)}, True, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX")
     assert (tmp_path / "mbox" / "INBOX.mbox").exists()
@@ -262,15 +264,15 @@ def test_overwrite_wipes_both_sinks_then_redownloads(tmp_path):
 
 def test_download_uses_body_peek_fetch_items_for_all_servers(tmp_path):
     for icloud in (False, True):
-        server = FetchServer({1: RESP1})
-        m.download_messages(server, "INBOX.mbox", {"<aaa@x>": 1}, False, True, False,
+        server = new_server()
+        m.download_messages(server, "INBOX.mbox", {"<aaa@x>": (1, 120)}, False, True, False,
                             tmp_path / f"mbox-{icloud}", icloud, True, NullLog(),
                             eml_dir=tmp_path / f"eml-{icloud}" / "INBOX", foldername="INBOX")
-        assert server.fetches[0][1] == "(INTERNALDATE BODY.PEEK[])", server.fetches
+        assert server.fetches[0][1] == m.BODY_FETCH_ITEMS, server.fetches
 
 
 def test_zero_new_messages_creates_no_directories(tmp_path):
-    m.download_messages(FetchServer({}), "INBOX.mbox", {}, False, True, False,
+    m.download_messages(UidFetchServer({}), "INBOX.mbox", {}, False, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX")
     assert not (tmp_path / "mbox").exists() and not (tmp_path / "eml").exists()
@@ -279,21 +281,21 @@ def test_zero_new_messages_creates_no_directories(tmp_path):
 def test_should_stop_cancels_mid_folder(tmp_path):
     """ADR 0003：协作式取消，停下的那一刻已下载的部分仍然落盘。"""
     seen = []
-    server = FetchServer({1: RESP1, 2: RESP2})
+    server = new_server()
     m.download_messages(server, "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox", False, False, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX",
                         report=seen.append, should_stop=lambda: len(seen) >= 1)
-    assert len(server.fetches) == 1, server.fetches
+    assert server.body_fetches == [[1, 2]], server.fetches
     assert len(seen) == 1, seen
     assert (tmp_path / "mbox" / "INBOX.mbox").exists()
     assert len(list((tmp_path / "eml" / "INBOX").rglob("*.eml"))) == 1
 
-    server2 = FetchServer({1: RESP1, 2: RESP2})
+    server2 = new_server()
     m.download_messages(server2, "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox2", False, True, NullLog(),
                         eml_dir=tmp_path / "eml2" / "INBOX", foldername="INBOX", should_stop=lambda: True)
-    assert server2.fetches == [], server2.fetches
+    assert server2.body_fetches == [], server2.fetches
 
 
 def test_imap_utf7_decode():
@@ -352,8 +354,11 @@ def test_folder_matching_accepts_raw_or_decoded_name():
 
 
 def test_scan_folder_returns_ids_under_the_remote_name():
-    remote = m.scan_folder(HeaderServer(), "&UXZO1mWHTvZZOQ-", True, True, NullLog(), display="其他文件夹")
-    assert remote == {"<r1@x>": 1}, remote
+    raw = b"Message-Id: <r1@x>\r\n\r\nbody\r\n"
+    remote = m.scan_folder(UidFetchServer({1: raw}), "&UXZO1mWHTvZZOQ-", True, True, NullLog(),
+                           display="其他文件夹")
+    assert remote.messages == {"<r1@x>": (1, len(raw))}, remote
+    assert remote.uidvalidity == 777
 
 
 def test_spinner_status_line_rendering(capsys):
@@ -383,7 +388,7 @@ def test_download_messages_compact_status_line_wiring(monkeypatch, tmp_path):
     events = []
     recs = []
     monkeypatch.setattr(m, "Spinner", recording_spinner(events))
-    m.download_messages(FetchServer({1: RESP1, 2: RESP2}), "INBOX.mbox", MSGS, False, True, False,
+    m.download_messages(new_server(), "INBOX.mbox", MSGS, False, True, False,
                         tmp_path / "mbox", False, True, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="其他文件夹",
                         verbose=0, compact=True, report=recs.append)
@@ -399,7 +404,7 @@ def test_download_messages_compact_status_line_wiring(monkeypatch, tmp_path):
 def test_download_messages_non_compact_status_line_wiring(monkeypatch, tmp_path):
     events = []
     monkeypatch.setattr(m, "Spinner", recording_spinner(events))
-    m.download_messages(FetchServer({1: RESP1}), "INBOX.mbox", {"<aaa@x>": 1}, False, True, False,
+    m.download_messages(new_server(), "INBOX.mbox", {"<aaa@x>": (1, 120)}, False, True, False,
                         tmp_path / "mbox", False, False, NullLog(),
                         eml_dir=tmp_path / "eml" / "INBOX", foldername="INBOX", verbose=0, compact=False)
     assert [e[0] for e in events] == ["init", "erase", "status", "spin", "stop"], events

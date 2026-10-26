@@ -98,6 +98,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * Added per-message progress lines with RFC 2047-decoded senders and subjects.
 * The progress lines no longer clobber the spinner: a status line with a count progress bar, downloaded bytes and transfer rate stays pinned at the bottom of the terminal; `--compact` hides the scrolling lines and shows the latest subject in the status line.
 * Each folder's sync starts with a full-width separator (e.g. `── [3/8] Sent Messages ──`) so it is easy to see where one folder ends and the next begins.
+* Each account's run ends with a summary line counting backed and skipped messages, fetch failures, folder failures and elapsed time; failed messages are left for the next run.
 * Log level names are spelled out (`INFO` instead of `I`).
 * Each run opens with a version banner (`imapbackup v1.6.0 starting`) so the version is visible before the first network attempt. `--quiet` keeps it out of the terminal but not out of the run log.
 

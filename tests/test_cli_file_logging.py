@@ -271,3 +271,58 @@ def test_version_answers_without_starting_a_run(tmp_path, monkeypatch, console_c
     assert console_capture.getvalue() == "", repr(console_capture.getvalue())
     assert not log_dir.exists()
     assert "--version" in core.build_arg_parser().format_help()
+
+
+def test_cli_runs_uid_scan_and_batch_fetch_end_to_end(run_main):
+    """WP-1：CLI 一次备份走 UID 扫描 + 单批正文取信，逐封报告与账户汇总保持不变。"""
+    server = MainServer(messages=3)
+    res = run_main(connect_like(server), "--folders", "INBOX")
+    parsed = records(log_lines(res.log_dir))
+
+    assert res.outcome == "returned" and res.code == 0, f"{res.outcome} {res.code}"
+    assert [call for call in server.uid_calls if call[0] == "SEARCH"] == [("SEARCH", ["ALL"])]
+    assert server.body_fetches == [[1, 2, 3]], server.body_fetches
+    assert [call for call in server.fetches if "BODY.PEEK[]" in call[1]] == [
+        ("1,2,3", core.BODY_FETCH_ITEMS)], server.fetches
+
+    summary = [p for p in parsed if p["msg"].startswith("Account ")]
+    assert len(summary) == 1 and summary[0]["level"] == "INFO", summary
+    assert "3 backed, 0 skipped, 0 fetch failed, 0 folder failure(s)" in summary[0]["msg"], summary
+    assert "elapsed" in summary[0]["msg"], summary
+
+    report_lines = [line for line in res.stdout.splitlines() if line.startswith("[INBOX ")]
+    assert [line.split("]")[0] for line in report_lines] == ["[INBOX 1/3", "[INBOX 2/3", "[INBOX 3/3"]
+    mbox = (res.mbox_dir / "x@y.com" / "INBOX.mbox").read_bytes()
+    assert mbox.count(b"From nobody ") == 3, mbox
+
+
+def test_cli_continues_after_a_folder_select_failure(run_main):
+    """K 组：单个文件夹失败记 WARNING、继续下一个文件夹，退出码仍为 0。"""
+    server = MainServer(messages=2, folders=("Archive", "INBOX"), select_fail_folders={"Archive"})
+    res = run_main(connect_like(server), "--folders", "Archive,INBOX")
+    parsed = records(log_lines(res.log_dir))
+
+    assert res.outcome == "returned" and res.code == 0, f"{res.outcome} {res.code}"
+    summary = [p for p in parsed if p["msg"].startswith("Account ")]
+    assert len(summary) == 1, summary
+    assert "2 backed, 0 skipped, 0 fetch failed, 1 folder failure(s)" in summary[0]["msg"], summary
+    assert any(p["level"] == "WARNING" and "Archive: folder failed (scan): SELECT failed" in p["msg"]
+               for p in parsed), parsed
+    mbox = (res.mbox_dir / "x@y.com" / "INBOX.mbox").read_bytes()
+    assert mbox.count(b"From nobody ") == 2, mbox
+
+
+def test_cli_continues_after_a_whole_folder_body_rejection(run_main):
+    """C 组：整批逐封 NO/BAD 升级为文件夹失败，CLI 记录后继续下一个文件夹。"""
+    server = MainServer(messages=1, folders=("INBOX", "ZZ_Ok"), no_bad_folders={"INBOX"})
+    res = run_main(connect_like(server), "--folders", "INBOX,ZZ_Ok")
+    parsed = records(log_lines(res.log_dir))
+
+    assert res.outcome == "returned" and res.code == 0, f"{res.outcome} {res.code}"
+    summary = [p for p in parsed if p["msg"].startswith("Account ")]
+    assert len(summary) == 1, summary
+    assert "1 backed, 0 skipped, 0 fetch failed, 1 folder failure(s)" in summary[0]["msg"], summary
+    assert any(p["level"] == "WARNING" and "INBOX: folder failed (fetch): "
+               "every UID in a FETCH batch was rejected" in p["msg"] for p in parsed), parsed
+    mbox = (res.mbox_dir / "x@y.com" / "ZZ_Ok.mbox").read_bytes()
+    assert mbox.count(b"From nobody ") == 1, mbox
