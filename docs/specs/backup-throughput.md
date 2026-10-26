@@ -163,7 +163,7 @@ CLI 的「扫描→下载」在同一 SELECT 上完成，不需要二次比较 U
 @dataclass
 class FolderScan:
     messages: dict[str, tuple[int, int]]  # Message-Id -> (UID, RFC822.SIZE)
-    uidvalidity: int | None
+    uidvalidity: int
 
 @dataclass
 class DownloadProgress:
@@ -209,7 +209,7 @@ SCAN_PAGE_UIDS = 500
 #### 5.1.2 步骤
 
 1. `server.select(f'"{foldername}"', readonly=True)`；`typ != "OK"` → `SkipFolderException`。
-2. 从 `server.untagged_responses` 读取 `UIDVALIDITY`；缺失记 WARNING，`uidvalidity=None`。
+2. 从 `server.untagged_responses` 读取 `UIDVALIDITY`；缺失或畸形 → `SkipFolderException`，并且不运行 SEARCH。RFC 3501 要求 SELECT 响应必带 UIDVALIDITY；缺失说明选中态不可信——QQ「其他文件夹」这类分组容器接受 SELECT 却不切换邮箱，SEARCH 会返回上一个邮箱的 UID。
 3. `typ, data = server.uid("SEARCH", "ALL")`；`typ != "OK"` → `SkipFolderException`。空结果返回 `FolderScan({}, uidvalidity)`。
 4. 把 UID 列表按 500 切片，逐页请求：
 
@@ -236,6 +236,7 @@ SCAN_PAGE_UIDS = 500
 | 情况 | 处理 |
 |---|---|
 | SELECT NO/BAD | `SkipFolderException` |
+| SELECT OK 但缺失/畸形 UIDVALIDITY | `SkipFolderException`；不运行 `UID SEARCH ALL`（选中态不可信） |
 | `UID SEARCH ALL` NO/BAD | 单次重试；仍失败 → `SkipFolderException` |
 | 某页头部 FETCH NO/BAD | 该页单次重试；仍失败 → `SkipFolderException`（整文件夹失败） |
 | 某条响应畸形/缺 UID/缺字面量 | 该 UID 单封重试一次；仍畸形 → `SkipFolderException`（整文件夹失败，避免静默漏信） |
@@ -378,10 +379,10 @@ def download_messages(
 
 ### 5.4 UIDVALIDITY
 
-- `FolderScan.uidvalidity` 来自 SELECT 后的 `untagged_responses["UIDVALIDITY"]`。
-- 缺失时记 WARNING，值为 `None`。`None` 不能用于相等比较；同一连接与重连后的规则不同：
-  - GUI pass 2 在**同一连接**上重新 SELECT：双方都是非 `None` 且相同 → 继续；双方非 `None` 但不同 → 重扫一次；任一方为 `None` → 记 WARNING，继续用 pass 1 的 UID（同一连接上不做额外重扫）。
-  - 重连后的**新连接**：任一方为 `None` 或双方不同 → 按 5.7.6 重扫一次；不能盲目复用旧 UID。
+- `FolderScan.uidvalidity` 来自 SELECT 后的 `untagged_responses["UIDVALIDITY"]`，始终是整数：缺失或畸形时 `scan_folder` 抛 `SkipFolderException`，该文件夹按失败跳过，不跑 SEARCH（理由见 5.1.2 第 2 步）。
+- `get_names` 不把 LIST 里带 `\Noselect` 的邮箱列为备份目标；其子文件夹照常列出。分组容器本身没有邮件，SELECT 也无法可靠切换。
+- GUI pass 2 在**同一连接**上重新 SELECT：UIDVALIDITY 相同 → 继续；不同 → 重扫一次。两侧都不再出现 `None`。
+- 重连后的**新连接**：SELECT 后重新取得 UIDVALIDITY，与旧值比较；不同 → 按 5.7.6 重扫一次，不能盲目复用旧 UID。新连接取不到可用的 UIDVALIDITY 时，按 `scan_folder` 的规则整文件夹失败。
 - GUI pass 2 发现不同后：丢弃旧 UID，重跑该文件夹 `scan_folder`，复用本地快照，从新 pending 中减去 `written`；这次重扫记一次 `uidvalidity_changes`。
 - 同一次文件夹运行中第二次需要因 UIDVALIDITY 重扫：`FolderFetchError`，文件夹失败，不再无限重扫（用 `state.uidvalidity_checked` 记录）。
 - CLI 在同一 SELECT 上扫描后立即下载，不需要二次比较；重连后的比较由 5.7 负责。
@@ -629,9 +630,9 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
 `operation(new_server)`：
 
 1. `SELECT` 当前文件夹（readonly）；失败 → 抛 `SkipFolderException`（文件夹失败），不重连。
-2. 读新连接的 UIDVALIDITY：
-   - 双方都是非 `None` 且相同：继续用 `state.messages`。
-   - 否则（不同，或任一方为 `None`）：
+2. 读新连接的 UIDVALIDITY（`scan_folder` 保证可用值，缺失即该文件夹失败）：
+   - 相同：继续用 `state.messages`。
+   - 不同：
      - `state.uidvalidity_checked` 为假：重跑 `scan_folder`；`uidvalidity_changes += 1`；用新 `FolderScan` 重算 pending（复用本地快照），再减去 `written`；把新结果存回 `state`，设 `uidvalidity_checked=True`。
      - `state.uidvalidity_checked` 已为真：抛 `FolderFetchError`，不再重扫。
    - 重扫导致该文件夹的 `server_total` / `pending_total` / `pending_bytes` 变化时，GUI 重发 `totals` 事件并更新 `AccountStats`；已备份计数不清零。
@@ -1107,7 +1108,7 @@ basedpyright imapbackup312.py imapbackup_gui.py
 
 | 组 | 断言 |
 |---|---|
-| A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回 |
+| A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
 | B 批量 | 8 封/8 MiB 边界；第 9 封新批；单封 8 MiB+ 独占；size 0 独占；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
 | C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试 |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
@@ -1389,7 +1390,7 @@ WP-9（全量验收/现场数据包，依赖全部）
 8. **索引是缓存**：删除/损坏/禁用只会变慢，不会影响正确性；索引崩溃窗口靠指纹失效恢复。
 9. **诊断仅 GUI**：CLI 用户没有 JSONL；需要现场数据时用 GUI 运行。
 10. **诊断不含邮件内容**：无法从诊断还原具体哪封失败；只能看到计数与类别。
-11. **UIDVALIDITY 缺失**：服务器不提供时无法比较，重连按保守重扫处理。
+11. **UIDVALIDITY 缺失**：服务器不提供时无法确认选中态，该文件夹按失败跳过；不再尝试重扫。
 12. **首次连接不重连**：初始 DNS/连接/认证失败沿用现有失败路径，不进入 5 次预算。
 13. **大附件内存**：8 MiB 批量 + 单封超限整封读取；多账户同时遇到超大邮件时内存可能上升，v1 不引入流式 `partial()`。
 

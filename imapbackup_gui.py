@@ -99,6 +99,7 @@ SPINNER_INTERVAL_MS = 150
 # 就会被系统灰覆盖。不引图片资产：PhotoImage 运行时生成，打包零成本、没有图标路径问题。
 PLAY_ICON_COLOR = "#1f9d55"     # 开始：绿色
 STOP_ICON_COLOR = "#d13438"     # 停止：红色
+WARN_ICON_COLOR = "#d97706"     # 部分完成：琥珀色警告
 ICON_MIN_SIZE = 9               # 图标边长下限(px)
 ICON_LINESPACE_GAP = 5          # 图标边长 = 默认字体行高 − 这个值：行高变大图标同比例变大，不设上限
 STOP_ICON_INSET_RATIO = 0.125   # 红方块相对外接框的内缩比例：方块视觉比同框三角重，缩一圈才平衡
@@ -281,6 +282,7 @@ RUN_LOG_ACCOUNT_PREFIX = "[{name}] "   # 并发同步时日志行的账户前缀
 TRAY_TOOLTIP_IDLE = "IMAP Backup GUI"
 TRAY_TOOLTIP_RUNNING = "IMAP Backup GUI — 备份运行中"
 TRAY_TITLE_DONE = "备份完成"
+TRAY_TITLE_PARTIAL = "备份部分完成"
 TRAY_TITLE_STOPPED = "备份已停止"
 TRAY_TITLE_FAILED = "备份失败"
 TRAY_BODY_STOPPED = "备份已停止，可随时重新开始"
@@ -752,6 +754,28 @@ def _check_icon(color: str, size: int) -> tk.PhotoImage:
     return img
 
 
+def _warning_icon(color: str, size: int) -> tk.PhotoImage:
+    """警告三角（部分完成）：空心三角 + 感叹号，与完成/失败图标同外接框。"""
+    img = tk.PhotoImage(width=size, height=size)
+    stroke = max(1, round(size * 0.12))
+    inset = max(1, round(size * 0.08))
+    mid = (size - 1) / 2
+    top_y, base_y = inset, size - inset
+    half_base = (size - 1) / 2 - inset
+    for y in range(top_y, base_y):
+        half = max(0.5, half_base * (y - top_y) / max(1, base_y - top_y))
+        _put(img, color, round(mid - half), y, round(mid - half) + stroke, y + 1)
+        _put(img, color, round(mid + half) - stroke, y, round(mid + half), y + 1)
+    _put(img, color, inset, base_y - stroke, size - inset, base_y)
+    bar_top, bar_bottom = round(size * 0.38), round(size * 0.64)
+    _put(img, color, round(mid) - stroke // 2, bar_top,
+         round(mid) - stroke // 2 + stroke, bar_bottom)
+    dot_y = round(size * 0.72)
+    _put(img, color, round(mid) - stroke // 2, dot_y,
+         round(mid) - stroke // 2 + stroke, dot_y + stroke)
+    return img
+
+
 def _blank_icon(height: int) -> tk.PhotoImage:
     """生成高与彩色图标相同、宽 1px 的全透明位图（一个像素都不画）。
 
@@ -874,7 +898,8 @@ class BackupApp:
         self._stop_events: dict[str, threading.Event] = {}
         self._stopping_all = False              # 「停止所有」进行中：按钮转圈画在它自己身上
         # 本周期（活动集合「空→非空」到再次排空）的汇总记账，供结束日志与后台气泡
-        self._cycle = {"t0": 0.0, "backed": 0, "skipped": 0, "failures": [], "stopped": False, "ids": set()}
+        self._cycle = {"t0": 0.0, "backed": 0, "skipped": 0, "fetch_failed": 0,
+                       "folder_failures": 0, "failures": [], "stopped": False, "ids": set()}
         # 左栏勾选（「备份所选」跑哪些账户）：纯界面态，不落盘；新建/读入的账户默认勾上
         self._checked_accounts: set[str] = {account["id"] for account in self.accounts}
         self._account_rows: dict[str, dict] = {}
@@ -1973,6 +1998,7 @@ class BackupApp:
         self.row_scan_icon = _scan_icon(SCAN_ICON_COLOR, size)
         self.row_download_icon = _download_icon(PLAY_ICON_COLOR, size)
         self.row_done_icon = _check_icon(PLAY_ICON_COLOR, size)
+        self.row_partial_icon = _warning_icon(WARN_ICON_COLOR, size)
         self.row_stopped_icon = _stop_icon(ICON_DISABLED_COLOR, size)
         self.row_fail_icon = _cross_icon(STOP_ICON_COLOR, size)
         self.row_stop_icon = _stop_icon(STOP_ICON_COLOR, size)
@@ -2667,6 +2693,8 @@ class BackupApp:
             image = self.row_fail_icon
         elif isinstance(result, tuple) and result[0] == "stopped":
             image = self.row_stopped_icon
+        elif isinstance(result, tuple) and result[0] == "partial":
+            image = self.row_partial_icon
         elif isinstance(result, tuple) and result[0] == "done":
             image = self.row_done_icon
         else:
@@ -3969,12 +3997,12 @@ class BackupApp:
         self._begin_preflight([account["id"]])
 
     def _in_done_cooldown(self, account: dict) -> bool:
-        """该账户是否处于完成冷却窗（绿勾显示期）：批量入口此时跳过它，单账户入口可绕过。"""
+        """该账户是否处于完成冷却窗（完成/部分完成）：批量入口此时跳过它，单账户入口可绕过。"""
         state = self._states.get(account["id"])
         if state is None or state.get("result_at") is None:
             return False
         result = state["result"]
-        if not (isinstance(result, tuple) and result[0] == "done"):
+        if not (isinstance(result, tuple) and result[0] in ("done", "partial")):
             return False
         return time.monotonic() - state["result_at"] < DONE_COOLDOWN_S
 
@@ -4028,11 +4056,21 @@ class BackupApp:
         Note:
             `wm geometry` 的 +x+y 落在**外框**，`winfo_rootx` 量的是**客户区**，中间差着一圈装饰
             （真机实测 8px 边框 + 31px 标题栏）——直接套「root 中心 - 弹窗一半」的公式会整体偏右下
-            一截。这里先 withdraw 着摆一次 +0+0 量出装饰偏移，再按客户区中心反推外框坐标，
-            实测落点误差 0px；弹窗全程未显示过，不会闪。调用时机在弹窗内容建完之后、grab/wait 之前。
+            一截。未显示的弹窗先 withdraw 着摆一次 +0+0 量出装饰偏移，再按客户区中心反推外框坐标，
+            实测落点误差 0px；弹窗全程未显示过，不会闪。已经显示的弹窗（退出确认转等待文案后
+            窗口会缩）直接按当前外框/客户区的差值重摆，不 withdraw，避免闪一下。
+            调用时机在弹窗内容建完之后、grab/wait 之前，或内容尺寸变化之后。
             系统 messagebox/filedialog 走原生居中、不保证落在主窗口内，本助手只管自绘弹窗
             （删除确认已并入自绘家族）；悬停气泡跟随鼠标，也不走这里。
         """
+        win.update_idletasks()
+        if win.winfo_viewable():
+            deco_x = win.winfo_rootx() - win.winfo_x()
+            deco_y = win.winfo_rooty() - win.winfo_y()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 2
+            win.geometry(f"+{max(x - deco_x, 0)}+{max(y - deco_y, 0)}")
+            return
         win.withdraw()
         win.update_idletasks()
         win.geometry("+0+0")
@@ -4249,6 +4287,7 @@ class BackupApp:
         snapshots = self._account_snapshots(account_ids)
         if not self._has_active_accounts():
             self._cycle = {"t0": time.monotonic(), "backed": 0, "skipped": 0,
+                           "fetch_failed": 0, "folder_failures": 0,
                            "failures": [], "stopped": False, "ids": set()}
             self.log.info("开始备份运行：输出 %s", outdir)
         for account_id in account_ids:
@@ -4325,6 +4364,8 @@ class BackupApp:
         account_id = account["id"]
         t0 = time.monotonic()
         backed = 0
+        folder_failures = 0
+        progress = core.DownloadProgress()
         wanted = {name for name in account.get("folders", []) if isinstance(name, str) and name} or {"INBOX"}
 
         def report(d: dict) -> None:
@@ -4363,6 +4404,7 @@ class BackupApp:
                 try:
                     scan = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
                 except core.SkipFolderException as e:
+                    folder_failures += 1
                     self.log.warning("%s：跳过（%s）", display, e)
                     continue
                 # 两种格式各自判重：任一已选格式缺这封就算待备份，写盘时只补缺的那一份。
@@ -4380,7 +4422,7 @@ class BackupApp:
                 plans.append((n, new, local_mbox, local_eml))
             eq.put(("totals", account_id, server_total, pending_total))
 
-            # pass 2: download; folders were re-selectable because scan_folder moved the selection each time
+            # pass 2: re-select every folder with pending messages; pass 1 left the last one selected
             if pending_total > 0 and not stop_event.is_set():
                 if basedir is not None:
                     core.ensure_basedir(basedir)
@@ -4394,6 +4436,7 @@ class BackupApp:
                     eq.put(("phase", account_id, f"备份 {display}（{len(new)} 封）"))
                     typ, data = server.select(f'"{foldername}"', readonly=True)
                     if typ != "OK":
+                        folder_failures += 1
                         self.log.warning("%s：SELECT 失败 %s", display, data)
                         continue
                     label = f"{account_dir}/{filename}" if basedir is not None else f"{account_dir}/{eml_relpath}"
@@ -4403,8 +4446,10 @@ class BackupApp:
                                                basedir, False, quiet=False, log=log,
                                                eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                                foldername=display,
-                                               report=report, should_stop=stop_event.is_set)
+                                               report=report, should_stop=stop_event.is_set,
+                                               progress=progress)
                     except core.FolderFetchError as e:
+                        folder_failures += 1
                         self.log.warning("%s：取信失败（%s）", display, e)
                         continue
         finally:
@@ -4412,7 +4457,9 @@ class BackupApp:
                 server.logout()
         seconds = time.monotonic() - t0
         eq.put(("account_done", account_id, backed, server_total - pending_total, seconds,
-                stop_event.is_set(), pending_total))
+                stop_event.is_set(), pending_total, progress.fetch_failed,
+                progress.fetch_failed_missing, progress.fetch_failed_no_bad,
+                progress.fetch_failed_malformed, folder_failures))
 
     def _is_account_active(self, account_id: str | None) -> bool:
         """该账户是否处于备份活动态（连接/统计/下载/停止中）。"""
@@ -4602,15 +4649,29 @@ class BackupApp:
         self._refresh_counts()
 
     def _on_account_done(self, account_id: str, backed: int, skipped: int, seconds: float,
-                         stopped: bool, pending: int) -> None:
-        """单个账户跑完：结果文案（停止 / 已是最新 / 完成三态）+ 行尾终态图标（带 TTL）。"""
+                         stopped: bool, pending: int, fetch_failed: int,
+                         fetch_failed_missing: int, fetch_failed_no_bad: int,
+                         fetch_failed_malformed: int, folder_failures: int) -> None:
+        """单个账户跑完：结果文案（停止/已是最新/部分完成/完成）+ 行尾终态图标。"""
         state = self._states.get(account_id)
         if state is None:
             return
-        kind = "stopped" if stopped else "done"
+        failure_parts = []
+        if fetch_failed:
+            failure_parts.append(f"取信失败 {fetch_failed} 封")
+        if folder_failures:
+            failure_parts.append(f"文件夹失败 {folder_failures} 个")
+        failure_text = "，".join(failure_parts)
+        partial = not stopped and bool(failure_text)
+        kind = "stopped" if stopped else "partial" if partial else "done"
         state["run_phase"] = PHASE_IDLE
         if stopped:
             state["status_text"] = f"已停止：本次备份 {backed} 封"
+            if failure_text:
+                state["status_text"] += f"，{failure_text}"
+        elif partial:
+            state["status_text"] = (f"部分完成：本次备份 {backed} 封，跳过 {skipped} 封（本地已存在），"
+                                    f"{failure_text}，用时 {_fmt_duration(seconds)}")
         elif pending == 0:
             state["status_text"] = UPTODATE_STATUS
         else:
@@ -4618,25 +4679,36 @@ class BackupApp:
                                     f"用时 {_fmt_duration(seconds)}")
         state["status_error"] = False
         account = self._find_account(account_id)
-        self.log.info("账户 %s 备份结束：备份 %d 封，跳过 %d 封，用时 %s%s",
-                      account_display(account) if account else account_id, backed, skipped,
+        summary = f"备份 {backed} 封，跳过 {skipped} 封"
+        if failure_text:
+            summary += f"，{failure_text}"
+        self.log.info("账户 %s 备份结束：%s，用时 %s%s",
+                      account_display(account) if account else account_id, summary,
                       _fmt_duration(seconds), "（用户停止）" if stopped else "")
+        if fetch_failed:
+            self.log.debug("账户 %s 取信失败明细：缺失 %d，NO/BAD %d，畸形 %d",
+                           account_display(account) if account else account_id,
+                           fetch_failed_missing, fetch_failed_no_bad, fetch_failed_malformed)
         # 终态图标只挂给仍勾选（仍有备份意愿）的账户：脱钩即意愿移除，不挂结果也不进冷却
         if account_id in self._checked_accounts:
-            ttl = STOPPED_ICON_TTL_S if stopped else DONE_COOLDOWN_S
+            if stopped:
+                ttl = STOPPED_ICON_TTL_S
+            elif partial:
+                ttl = None      # 黄色警告常驻到下次启动/重跑/取消勾选
+            else:
+                ttl = DONE_COOLDOWN_S
             self._schedule_result_icon(
-                account_id, (kind, backed, skipped, seconds, pending), ttl)
+                account_id, (kind, backed, skipped, seconds, pending, fetch_failed, folder_failures), ttl)
         else:
             state["result"] = None
             state["result_at"] = None
             self._apply_account_icon(account_id)
         self._cycle["backed"] += backed
         self._cycle["skipped"] += skipped
+        self._cycle["fetch_failed"] += fetch_failed
+        self._cycle["folder_failures"] += folder_failures
         self._cycle["stopped"] = self._cycle["stopped"] or stopped
         if account_id == self._selected_account_id:
-            if not stopped and pending > 0:
-                self.progress.configure(value=self.progress["maximum"])
-                state["progress"] = (float(self.progress["maximum"]), float(self.progress["maximum"]))
             self._set_status(state["status_text"], error=False)
         self._after_account_terminal()
 
@@ -4673,14 +4745,28 @@ class BackupApp:
         elapsed = time.monotonic() - self._cycle["t0"]
         backed, skipped = self._cycle["backed"], self._cycle["skipped"]
         failures = self._cycle["failures"]
-        self.log.info("备份运行结束：备份 %d 封，跳过 %d 封，用时 %s%s",
-                      backed, skipped, _fmt_duration(elapsed),
-                      "（用户停止）" if self._cycle["stopped"] else "")
+        fetch_failed = self._cycle["fetch_failed"]
+        folder_failures = self._cycle["folder_failures"]
+        failure_parts = []
+        if fetch_failed:
+            failure_parts.append(f"取信失败 {fetch_failed} 封")
+        if folder_failures:
+            failure_parts.append(f"文件夹失败 {folder_failures} 个")
+        failure_text = "，".join(failure_parts)
+        partial = not self._cycle["stopped"] and not failures and bool(failure_text)
+        self.log.info("备份运行结束：备份 %d 封，跳过 %d 封%s，用时 %s%s",
+                      backed, skipped, f"，{failure_text}" if failure_text else "",
+                      _fmt_duration(elapsed), "（用户停止）" if self._cycle["stopped"] else "")
         if self._background_hidden():
             if self._cycle["stopped"]:
                 self._notify_background(TRAY_TITLE_STOPPED, TRAY_BODY_STOPPED)
             elif failures:
                 self._notify_background(TRAY_TITLE_FAILED, TRAY_BODY_FAILED)
+            elif partial:
+                failed = f"，{failure_text}" if failure_text else ""
+                self._notify_background(
+                    TRAY_TITLE_PARTIAL,
+                    f"本次备份 {backed} 封，跳过 {skipped} 封{failed}，用时 {_fmt_duration(elapsed)}")
             else:
                 self._notify_background(TRAY_TITLE_DONE,
                                         f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {_fmt_duration(elapsed)}")
@@ -5035,12 +5121,14 @@ class BackupApp:
         self._sync_tray()
 
     def _ask_quit_while_running(self, n: int) -> bool:
-        """活动账户未收尾时的退出确认（自绘、居中）：确认后弹窗转等待态并启动优雅停止。
+        """活动账户未收尾时的退出确认（自绘、居中）：确认后弹窗转等待态并交回调用方。
 
         Note:
             展示与决策分离：测试替换本方法即可绕开真实 Toplevel（与 _ask_close_action 同口径）。
             [取消 / 退出程序] 等宽居中，默认焦点与 Esc/X 都在安全侧（取消）。确认后弹窗不关：
             按钮置灰、文案转「正在停止…」，由优雅停止的轮询在收尾后关掉它并真退出。
+            因此这里等的是「用户做了选择」而不是「窗口销毁」：wait_window 要等窗口关掉才返回，
+            而等待窗恰恰要等停止完成才关，会把启动优雅停止的调用方永远堵死。
         """
         if self.root.state() == "withdrawn":
             self._show_window()   # 隐藏时从托盘退出：先把窗口亮回来，用户要做决定
@@ -5049,6 +5137,7 @@ class BackupApp:
         dialog.transient(self.root)
         dialog.resizable(False, False)
         answer: list[bool] = []
+        decided = tk.BooleanVar(master=dialog, value=False)
         body = tk.Frame(dialog)
         body.pack(fill="both", expand=True, padx=14, pady=12)
         text_label = tk.Label(body, text=QUIT_CONFIRM_TEXT.format(n=n), justify="left", anchor="w")
@@ -5063,6 +5152,7 @@ class BackupApp:
             answer.append(ok)
             if not ok:
                 self._quit_wait_win = None
+                decided.set(False)
                 dialog.destroy()
                 return
             # 确认后弹窗转等待态：不可再取消；真正的停止/退出由调用方拿到本窗口后启动
@@ -5072,13 +5162,15 @@ class BackupApp:
             dialog.protocol("WM_DELETE_WINDOW", lambda: None)
             dialog.bind("<Escape>", lambda _event: None)
             self._quit_wait_win = (dialog, text_label)
+            self._center_on_root(dialog)   # 文案变短会把窗口缩向一侧：保持在主窗口正中
+            decided.set(True)
 
         dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
         dialog.bind("<Escape>", lambda _event: finish(False))
         self._center_on_root(dialog)
         cancel_btn.focus_set()      # 默认焦点给安全侧：回车不退出
         dialog.grab_set()
-        self.root.wait_window(dialog)
+        dialog.wait_variable(decided)
         return bool(answer and answer[0])
 
     def _confirm_and_quit(self) -> bool:

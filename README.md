@@ -91,6 +91,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * Backups now live under `<backup-root>/<account>/…` for both output formats — see the one-time migration notes below.
 * IMAP modified UTF-7 folder names are decoded (e.g. `&UXZO1mWHTvZZOQ-` → `其他文件夹`) for display, mbox filenames, eml directories, and `--folders` / `--exclude-folders` matching.
 * `--folders` and `--exclude-folders` match on a delimiter-aware segment boundary, so `系统文件夹` selects that folder and its whole subtree while `Archived` is not caught by the prefix `Archive`. Previously only an exact full path matched, which made a Chinese leaf name silently select nothing; a selection that still matches nothing now exits non-zero and prints the folder list.
+* Mailboxes listed with `\Noselect` (QQ Mail's 其他文件夹 is one) are no longer backup targets; their children still are. QQ Mail accepts `SELECT` on that container without actually switching mailboxes, so the old code scanned the previously selected folder's messages under the container's name and left them pending forever. A folder whose `SELECT` response has no usable `UIDVALIDITY` is now skipped instead of scanned — RFC 3501 requires it, and without it the client cannot tell which mailbox was selected.
 
 **Terminal output**
 
@@ -130,6 +131,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * The account list scrolls on its own once the accounts no longer fit the pane; the scrollbar only appears then, and the mouse wheel moves it one row per notch.
 * Each account keeps its own folder selection (defaults to INBOX for a new account), message list, counts, progress and status; switching accounts does not interrupt a connection or a run in progress.
 * "备份所选" backs up every checked account; each row carries a checkbox and 全选/反选/清空 switch the whole set; a new or restored account starts checked, and the set is UI state that is not written to the settings file. A failing account is logged and reported without stopping the rest; Stop finishes the current message and stops all accounts.
+* An account that ends with fetch failures or folder failures is reported as “部分完成” instead of “完成”: the progress bar stays at the number of messages actually backed up, the status line lists 取信失败/文件夹失败, and the account row keeps a yellow warning icon. Failed messages stay pending for the next run.
 * The account name is a display-only label: renaming it never moves existing backups or causes messages to be downloaded again.
 
 **Connection folded into the backup run**

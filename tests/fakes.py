@@ -227,19 +227,24 @@ class UidFetchServer(imaplib.IMAP4):
 
 
 class ListServer(UidFetchServer):
-    """只有 LIST 的服务器：枚举文件夹用的最小替身。
+    r"""只有 LIST 的服务器：枚举文件夹用的最小替身。
 
     display_names 是已解码的显示名，list() 会编码回 modified UTF-7 再返回，
     和真实服务器一致。delim 控制层级分隔符（"." 用于 Outlook 风格账号）。
-    文件夹都是空的，所以 UID SEARCH 回空列表、不会发任何 FETCH。
+    noselect 里的名字带 \Noselect 属性（分组容器）。文件夹都是空的，所以
+    UID SEARCH 回空列表、不会发任何 FETCH。
     """
-    def __init__(self, display_names, delim="/"):
+    def __init__(self, display_names, delim="/", noselect=()):
         super().__init__({})
         self.display_names = list(display_names)
         self.delim = delim
+        self.noselect = set(noselect)
 
     def list(self, directory='""', pattern="*") -> tuple[str, _list]:
-        rows = [f'(\\HasNoChildren) "{self.delim}" "{imap_utf7_encode(n)}"' for n in self.display_names]
+        rows = []
+        for name in self.display_names:
+            attrs = "\\Noselect" if name in self.noselect else "\\HasNoChildren"
+            rows.append(f'({attrs}) "{self.delim}" "{imap_utf7_encode(name)}"')
         return "OK", [r.encode("utf-8") for r in rows]
 
 

@@ -110,7 +110,7 @@ class FolderScan:
     """One folder's message scan: Message-Id -> (UID, RFC822.SIZE)."""
 
     messages: dict[str, tuple[int, int]]
-    uidvalidity: int | None
+    uidvalidity: int
 
 
 @dataclass(frozen=True)
@@ -829,7 +829,9 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     if not quiet:
         log.info("%s: %s total, %s largest", filename, pretty_byte_count(output_bytes), pretty_byte_count(biggest))
         if progress.fetch_failed:
-            log.warning("%s: %d message(s) could not be fetched", display, progress.fetch_failed)
+            log.warning("%s: %d message(s) could not be fetched (missing=%d, no_bad=%d, malformed=%d)",
+                        display, progress.fetch_failed, progress.fetch_failed_missing,
+                        progress.fetch_failed_no_bad, progress.fetch_failed_malformed)
     return progress
 
 
@@ -995,6 +997,11 @@ def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: 
         if typ != "OK":
             raise SkipFolderException(f"SELECT failed: {data}")
         uidvalidity = _read_uidvalidity(server, shown, log)
+        if uidvalidity is None:
+            # 没有 UIDVALIDITY 就无法确认 SEARCH 落在了刚选的邮箱上：QQ「其他文件夹」
+            # 这类分组容器接受 SELECT 却不切换选中态，SEARCH 会返回上一个邮箱的 UID。
+            # 宁可跳过，也不把别的文件夹的信记到这个文件夹名下。
+            raise SkipFolderException("server did not report a usable UIDVALIDITY")
         typ, data = server.uid("SEARCH", "ALL")
         if typ != "OK":
             log.warning("%s: UID SEARCH failed, retrying", shown)
@@ -1137,6 +1144,12 @@ def get_names(server: imaplib.IMAP4, thunderbird: bool, nospinner: bool, quiet: 
         if not isinstance(delim, str) or not isinstance(foldername, str):
             continue
         display_name = imap_utf7_decode(foldername)
+        attrs = lst[0]
+        if isinstance(attrs, list) and any(
+                isinstance(attr, str) and attr.lower() == "\\noselect" for attr in attrs):
+            # 分组容器（QQ「其他文件夹」）：本身没有邮件，不能 SELECT 备份
+            log.info("Skipping non-selectable folder %s", display_name)
+            continue
         if thunderbird:
             filename = '.sbd/'.join(display_name.split(delim))
             if filename.startswith("INBOX"):

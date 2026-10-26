@@ -345,6 +345,14 @@ def test_get_names_decodes_utf7_folder_names():
     assert names[0][1] == "INBOX.mbox" and names[0][3] == "INBOX"
 
 
+def test_get_names_skips_noselect_container_and_keeps_children():
+    r"""\Noselect 容器不是备份目标；它的子文件夹照常列出（QQ「其他文件夹」）。"""
+    server = ListServer(["INBOX", "其他文件夹", "其他文件夹/QQ邮件订阅"],
+                        noselect=["其他文件夹"])
+    names = m.get_names(server, False, True, True, NullLog())
+    assert [n[3] for n in names] == ["INBOX", "其他文件夹/QQ邮件订阅"], names
+
+
 def test_folder_matching_accepts_raw_or_decoded_name():
     names = m.get_names(ListServer(["其他文件夹"]), False, True, True, NullLog())
     decoded = [n for n in names if n[0] in {"其他文件夹"} or n[3] in {"其他文件夹"}]

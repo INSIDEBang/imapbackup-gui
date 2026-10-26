@@ -27,6 +27,7 @@ import tkinter.font as tkfont
 import tkinter.ttk as ttk
 
 import imapbackup_gui as g
+from fakes import UidFetchServer, imap_utf7_encode
 
 pytestmark = pytest.mark.gui
 
@@ -200,6 +201,7 @@ def set_phase(instance, account_id, phase):
     instance._state(account_id)["run_phase"] = phase
     if phase != g.PHASE_IDLE:
         instance._cycle = {"t0": time.monotonic(), "backed": 0, "skipped": 0,
+                           "fetch_failed": 0, "folder_failures": 0,
                            "failures": [], "stopped": False, "ids": {account_id}}
     instance._on_active_set_changed()
     instance.root.update_idletasks()   # 让「停止所有」的 pack/forget 落到映射状态
@@ -648,7 +650,7 @@ def test_run_done_summaries(app):
     """单账户跑完：完成 / 已是最新 / 已停止三种状态文案（账户各自独立，无批量结束事件）。"""
     aid = app._selected_account_id
     app.events.put(("log", "2026-09-11 10:00:00 | INFO    | gui        | _launch_accounts:1 | 测试日志行"))
-    app.events.put(("account_done", aid, 1, 12322, 65.0, False, 23))
+    app.events.put(("account_done", aid, 1, 12322, 65.0, False, 23, 0, 0, 0, 0, 0))
     pump(app)
     assert "测试日志行" in app.log_text.get("1.0", "end")
     assert "完成：本次备份 1 封" in app.status_var.get() and "用时 1:05" in app.status_var.get(), (
@@ -656,13 +658,55 @@ def test_run_done_summaries(app):
     assert not is_disabled(app.start_btn)
 
     app.events.put(("totals", aid, 100, 0))
-    app.events.put(("account_done", aid, 0, 100, 3.0, False, 0))
+    app.events.put(("account_done", aid, 0, 100, 3.0, False, 0, 0, 0, 0, 0, 0))
     pump(app)
     assert app.status_var.get() == "已是最新，无待备份邮件", app.status_var.get()
 
-    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
+    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20, 0, 0, 0, 0, 0))
     pump(app)
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
+
+
+def test_account_done_reports_partial_and_does_not_fill_progress(app):
+    """账户结束时只备了 10/46：进度条停在 10，状态行写明 36 封取信失败。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("totals", aid, 163, 46))
+    for i in range(10):
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<{i}@y>")))
+    app.events.put(("account_done", aid, 10, 117, 16.0, False, 46, 36, 36, 0, 0, 0))
+    pump(app)
+    assert float(app.progress["maximum"]) == 46.0
+    assert float(app.progress["value"]) == 10.0, app.progress["value"]
+    status = app.status_var.get()
+    assert status.startswith("部分完成：本次备份 10 封"), status
+    assert "取信失败 36 封" in status, status
+    state = app._state(aid)
+    assert state["result"][0] == "partial", state["result"]
+    assert image_name(app._account_rows[aid]["icon"]) == str(app.row_partial_icon)
+    assert app._in_done_cooldown(app._find_account(aid))
+
+    app._clear_message_rows()
+    app._state(aid).update({"result": None, "result_at": None, "run_phase": g.PHASE_IDLE})
+    app._apply_account_icon(aid)
+
+
+def test_partial_folder_failure_overrides_up_to_date(app):
+    """文件夹失败优先于「已是最新」：即使没有待备份邮件，也不能显示绿勾或已是最新。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("totals", aid, 100, 0))
+    app.events.put(("account_done", aid, 0, 100, 3.0, False, 0, 0, 0, 0, 0, 1))
+    pump(app)
+    status = app.status_var.get()
+    assert status.startswith("部分完成"), status
+    assert "文件夹失败 1 个" in status, status
+    state = app._state(aid)
+    assert state["result"][0] == "partial", state["result"]
+    assert image_name(app._account_rows[aid]["icon"]) == str(app.row_partial_icon)
+
+    app._state(aid).update({"result": None, "result_at": None, "run_phase": g.PHASE_IDLE})
+    app._apply_account_icon(aid)
 
 
 def test_config_is_locked_during_a_run(app):
@@ -1423,7 +1467,7 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
         assert_start_button_idle(app)
 
     # 运行真正结束：按钮、状态行全部回位，不残留「正在停止…」
-    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20))
+    app.events.put(("account_done", aid, 5, 100, 9.0, True, 20, 0, 0, 0, 0, 0))
     pump(app)
     assert app.running is False
     assert app.status_var.get() == "已停止：本次备份 5 封", app.status_var.get()
@@ -2523,7 +2567,7 @@ def test_launch_runs_accounts_concurrently_and_isolates_failures(app, monkeypatc
         calls.append(account["id"])
         if account["id"] == second["id"]:
             raise RuntimeError("boom")
-        eq.put(("account_done", account["id"], 1, 0, 0.5, False, 1))
+        eq.put(("account_done", account["id"], 1, 0, 0.5, False, 1, 0, 0, 0, 0, 0))
 
     monkeypatch.setattr(g.threading, "Thread", lambda *a, **k: sync_thread(*a, **k))
     monkeypatch.setattr(app, "_backup_account", fake_backup)
@@ -2614,7 +2658,7 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     monkeypatch.setattr(g.core, "get_names",
                         lambda *a, **k: [("INBOX", "INBOX.mbox", "INBOX", "INBOX")])
     monkeypatch.setattr(g.core, "scan_folder",
-                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, None))
+                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, 777))
 
     def fake_scan_file(label, *_a, **_k):
         scanned["label"] = label
@@ -2636,6 +2680,8 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
 
 def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch, tmp_path):
     """FolderFetchError 只算一个文件夹失败（规格 §5.3），不能升级为账户失败。"""
+    while not app.events.empty():
+        app.events.get_nowait()
     account = {"id": "acc-fetch", "name": "工作邮箱", "user": "a@example.com", "server": "imap.example.com",
                "ssl": True, "port": "993", "password": "p", "folders": ["INBOX", "ZZ"],
                "mbox": True, "eml": False}
@@ -2652,7 +2698,7 @@ def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch,
     monkeypatch.setattr(g.core, "get_names", lambda *a, **k: [
         ("INBOX", "INBOX.mbox", "INBOX", "INBOX"), ("ZZ", "ZZ.mbox", "ZZ", "ZZ")])
     monkeypatch.setattr(g.core, "scan_folder",
-                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, None))
+                        lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, 777))
     monkeypatch.setattr(g.core, "scan_file", lambda *a, **k: {})
     monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
     monkeypatch.setattr(g.core, "create_folder_structure", lambda *a, **k: None)
@@ -2667,6 +2713,139 @@ def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch,
     app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
                         g.threading.Event())
     assert calls == ["a@example.com/INBOX.mbox", "a@example.com/ZZ.mbox"], calls
+    events = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    done = [e for e in events if e[0] == "account_done"][-1]
+    assert done[7:12] == (0, 0, 0, 0, 1), done
+
+
+def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path):
+    """Worker 把三桶取信失败和文件夹失败一起送进 account_done（规格 §5.3.1）。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    account = {"id": "acc-buckets", "name": "工作邮箱", "user": "b@example.com", "server": "imap.example.com",
+               "ssl": True, "port": "993", "password": "p", "folders": ["INBOX", "ZZ"],
+               "mbox": True, "eml": False}
+
+    class FakeServer:
+        def select(self, *_args, **_kwargs):
+            return "OK", b""
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: FakeServer())
+    monkeypatch.setattr(g.core, "get_names", lambda *a, **k: [
+        ("INBOX", "INBOX.mbox", "INBOX", "INBOX"), ("ZZ", "ZZ.mbox", "ZZ", "ZZ")])
+    scan_calls: list[str] = []
+
+    def fake_scan(_server, foldername, *_a, **_k):
+        scan_calls.append(foldername)
+        return g.core.FolderScan({f"<{foldername}@x>": (1, 10)}, 777)
+
+    monkeypatch.setattr(g.core, "scan_folder", fake_scan)
+    monkeypatch.setattr(g.core, "scan_file", lambda *a, **k: {})
+    monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
+    monkeypatch.setattr(g.core, "create_folder_structure", lambda *a, **k: None)
+
+    def fake_download(_server, label, _messages, *_a, **_k):
+        progress = _k["progress"]
+        if label.endswith("INBOX.mbox"):
+            progress.fetch_failed += 2
+            progress.fetch_failed_no_bad += 2
+        else:
+            progress.fetch_failed += 1
+            progress.fetch_failed_malformed += 1
+            raise g.core.FolderFetchError("every UID in a FETCH batch was rejected by the server")
+
+    monkeypatch.setattr(g.core, "download_messages", fake_download)
+
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
+                        g.threading.Event())
+    events = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    done = [e for e in events if e[0] == "account_done"][-1]
+    assert done[2:7] == (0, 0, done[4], False, 2), done
+    assert done[7:12] == (3, 0, 2, 1, 1), done
+    assert scan_calls == ["INBOX", "ZZ"], scan_calls
+
+
+class ContainerFolderServer(UidFetchServer):
+    r"""QQ「其他文件夹」现场：LIST 标 \Noselect，SELECT 回 OK 却不换邮箱、也不报 UIDVALIDITY。
+
+    容器的 SELECT 被接受后，SEARCH 落在上一个选中的邮箱上。第一遍扫描时上一个是
+    Sent Messages，所以容器报出和 Sent 一样的封数；下载前重扫时上一个是空文件夹，
+    于是重扫报 0 封。
+    """
+
+    def __init__(self, mailboxes: dict[str, dict[int, bytes]], container: str):
+        super().__init__({})
+        self.mailboxes = mailboxes
+        self.container = container
+        self.names = [*mailboxes, container]
+        self.raws = {}
+
+    def list(self, directory='""', pattern="*") -> tuple[str, list]:
+        rows = []
+        for name in self.names:
+            attrs = "\\Noselect" if name == self.container else "\\HasNoChildren"
+            rows.append(f'({attrs}) "/" "{name}"')
+        return "OK", [row.encode("utf-8") for row in rows]
+
+    def select(self, mailbox="INBOX", readonly=False) -> tuple[str, list]:
+        self.selects.append(mailbox)
+        target = mailbox.strip('"')
+        self.untagged_responses = {}
+        if target == self.container:
+            return "OK", [b"0"]
+        self.current_mailbox = target
+        self.raws = self.mailboxes[target]
+        self.untagged_responses["UIDVALIDITY"] = [b"777"]
+        return "OK", [str(len(self.raws)).encode()]
+
+
+def _fake_mailbox(prefix: str, count: int) -> tuple[dict[int, bytes], dict[str, str]]:
+    raws = {uid: (f"From: {prefix}{uid}@example.com\r\nSubject: {prefix} {uid}\r\n"
+                  f"Message-Id: <{prefix}{uid}@x>\r\n\r\nbody {uid}\r\n").encode()
+            for uid in range(1, count + 1)}
+    return raws, {f"<{prefix}{uid}@x>": "seen" for uid in range(1, count + 1)}
+
+
+def test_backup_account_skips_a_non_selectable_container(app, monkeypatch, tmp_path):
+    """分组容器不是备份目标：不能把上一个文件夹的 UID 记到它名下（QQ「其他文件夹」）。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    sent_raws, sent_local = _fake_mailbox("sent", 3)
+    inbox_raws, inbox_local = _fake_mailbox("inbox", 2)
+    raw_names = {name: imap_utf7_encode(name)
+                 for name in ["INBOX", "Sent Messages", "草稿"]}
+    container = imap_utf7_encode("其他文件夹")
+    child = imap_utf7_encode("其他文件夹/QQ邮件订阅")
+    mailboxes = {raw_names["INBOX"]: inbox_raws, raw_names["Sent Messages"]: sent_raws,
+                 raw_names["草稿"]: {}, child: {}}
+    server = ContainerFolderServer(mailboxes, container)
+    account = {"id": "acc-container", "name": "QQ", "user": "u@qq.com", "server": "imap.example.com",
+               "ssl": True, "port": "993", "password": "p",
+               "folders": [*mailboxes, container], "mbox": True, "eml": False}
+    monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: server)
+    local = {"u@qq.com/INBOX.mbox": inbox_local,
+             "u@qq.com/Sent Messages.mbox": sent_local}
+    monkeypatch.setattr(g.core, "scan_file", lambda label, *_a, **_k: local.get(label, {}))
+
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
+                        g.threading.Event())
+    events = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    totals = [e for e in events if e[0] == "totals"][-1]
+    assert totals[2:] == (5, 0), totals
+    done = [e for e in events if e[0] == "account_done"][-1]
+    assert done[2:4] == (0, 5), done
+    assert done[6] == 0, done
+    assert done[7:12] == (0, 0, 0, 0, 0), done
+    assert container not in server.selects, server.selects
 
 
 def test_entry_context_menu_has_three_actions(app, monkeypatch):
@@ -3557,7 +3736,7 @@ def test_account_row_status_icons_follow_phases_and_ttl(app, monkeypatch):
     assert state["run_phase"] == g.PHASE_STOPPING and icon_is(app.row_stop_icon)
 
     # 已停止：灰方块 + 5s TTL；到期回调把图标清回空白
-    app._on_account_done(aid, 5, 100, 9.0, True, 20)
+    app._on_account_done(aid, 5, 100, 9.0, True, 20, 0, 0, 0, 0, 0)
     assert icon_is(app.row_stopped_icon) and state["result"][0] == "stopped"
     stamp = state["result_at"]
     app._clear_result_icon(aid, stamp)
@@ -3565,7 +3744,7 @@ def test_account_row_status_icons_follow_phases_and_ttl(app, monkeypatch):
 
     # 正常完成：绿勾 + 60s 冷却窗（同一常量）；到期清回空白
     state["run_phase"] = g.PHASE_BACKING
-    app._on_account_done(aid, 3, 0, 2.0, False, 3)
+    app._on_account_done(aid, 3, 0, 2.0, False, 3, 0, 0, 0, 0, 0)
     assert icon_is(app.row_done_icon) and state["result"][0] == "done"
     assert app._in_done_cooldown(app._find_account(aid))
     state["result_at"] = time.monotonic() - (g.DONE_COOLDOWN_S + 1)
@@ -3598,7 +3777,7 @@ def test_done_cooldown_skips_batch_but_not_single_start(app, monkeypatch):
     state = app._state(aid)
 
     state["run_phase"] = g.PHASE_BACKING
-    app._on_account_done(aid, 3, 0, 2.0, False, 3)
+    app._on_account_done(aid, 3, 0, 2.0, False, 3, 0, 0, 0, 0, 0)
     app._on_start_selected()
     assert started == []                                   # 冷却中：不进预检
     assert box.warnings and box.warnings[-1][0] == g.COOLING_WARN_TITLE

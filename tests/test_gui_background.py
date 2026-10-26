@@ -14,6 +14,7 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 tk = pytest.importorskip("tkinter")
+import tkinter.ttk as ttk
 
 import imapbackup_gui as g
 
@@ -67,6 +68,25 @@ def widgets(node, kind):
         if isinstance(child, kind):
             yield child
         yield from widgets(child, kind)
+
+
+def find_toplevel(app, title):
+    """主窗口名下标题为 title 的弹窗（after 预排驱动真实 wait 循环时用）。"""
+    return next(w for w in app.root.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.title() == title)
+
+
+def find_button(dialog, text):
+    return next(w for w in widgets(dialog, ttk.Button) if str(w.cget("text")) == text)
+
+
+def dialog_center_error(app, dialog) -> tuple[int, int]:
+    """弹窗客户区中心相对主窗口客户区中心的偏差（px）。"""
+    app.root.update()
+    return ((dialog.winfo_rootx() + dialog.winfo_width() // 2)
+            - (app.root.winfo_rootx() + app.root.winfo_width() // 2),
+            (dialog.winfo_rooty() + dialog.winfo_height() // 2)
+            - (app.root.winfo_rooty() + app.root.winfo_height() // 2))
 
 
 def drain_log(app) -> list[str]:
@@ -135,6 +155,7 @@ def begin_account_run(app, account_id="acc", backed=0, skipped=0, failures=None,
         app.accounts.append({"id": account_id, "name": "甲", "user": "a@x.com", "server": "s"})
     app._state(account_id)["run_phase"] = g.PHASE_BACKING
     app._cycle = {"t0": time.monotonic() - elapsed, "backed": backed, "skipped": skipped,
+                  "fetch_failed": 0, "folder_failures": 0,
                   "failures": failures or [], "stopped": stopped, "ids": {account_id}}
     app._on_active_set_changed()
 
@@ -306,7 +327,7 @@ def test_run_finished_in_background_only_sends_a_balloon(app, tray):
     """后台隐藏期间备份结束：窗口保持隐藏，只弹托盘气泡。"""
     begin_account_run(app, "acc", elapsed=61.1)
     app.root.withdraw()
-    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 3))
+    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 3, 0, 0, 0, 0, 0))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_DONE,
             f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.1)}") in tray.calls
@@ -317,9 +338,19 @@ def test_run_finished_in_background_only_sends_a_balloon(app, tray):
 def test_stopped_run_in_background_sends_the_stopped_balloon(app, tray):
     begin_account_run(app, "acc", stopped=True, elapsed=3.0)
     app.root.withdraw()
-    app._handle_event(("account_done", "acc", 0, 0, 3.0, True, 5))
+    # 停止优先：即使伴随取信/文件夹失败，气泡仍是「已停止」
+    app._handle_event(("account_done", "acc", 0, 0, 3.0, True, 5, 2, 2, 0, 0, 1))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_STOPPED, g.TRAY_BODY_STOPPED) in tray.calls
+
+
+def test_partial_run_in_background_counts_failures(app, tray):
+    begin_account_run(app, "acc", elapsed=61.1)
+    app.root.withdraw()
+    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 23, 2, 2, 0, 0, 1))
+    assert ("notify", g.TRAY_TITLE_PARTIAL,
+            f"本次备份 3 封，跳过 7 封，取信失败 2 封，文件夹失败 1 个，用时 "
+            f"{g._fmt_duration(61.1)}") in tray.calls
 
 
 def test_failed_run_in_background_does_not_pop_a_dialog(app, tray, monkeypatch):
@@ -359,6 +390,64 @@ def test_tray_quit_confirms_only_while_running(app, tray, monkeypatch):
     monkeypatch.setattr(app, "_begin_quit_after_stop", lambda *a, **k: started.append(1))
     app._handle_event(("tray_quit",))
     assert started == [1]                    # 确认后进入优雅停止流程
+
+
+def test_quit_confirmation_starts_stopping_before_the_waiting_dialog_closes(app, tray, monkeypatch):
+    """确认退出要立刻发停止信号：等待窗等账户收尾才关，调用方不能反过来等窗关。
+
+    回归自现场：确认后弹窗转「正在停止…」但备份一直不停，因为确认回调刻意不关窗，
+    wait_window 却要等窗口销毁才返回，后面的 _begin_quit_after_stop 永远走不到。
+    """
+    begin_account_run(app, "acc")
+    started: list[bool] = []
+
+    def begin(*, waiting_label=None, on_done=None):
+        started.append(any(isinstance(w, tk.Toplevel) and w.title() == g.QUIT_CONFIRM_TITLE
+                           for w in app.root.winfo_children()))
+        app._on_stop_all()
+        for w in list(app.root.winfo_children()):
+            if isinstance(w, tk.Toplevel) and w.title() == g.QUIT_CONFIRM_TITLE:
+                w.destroy()
+
+    monkeypatch.setattr(app, "_begin_quit_after_stop", begin)
+    timed_out: list[bool] = []
+
+    def drive():
+        dialog = find_toplevel(app, g.QUIT_CONFIRM_TITLE)
+        find_button(dialog, g.QUIT_CONFIRM_BTN).invoke()
+
+        def watchdog():
+            # 旧实现：确认后不关窗，wait_window 卡住；这里替真实用户把窗关掉，免得挂死测试
+            if not started:
+                timed_out.append(True)
+                dialog.destroy()
+
+        app.root.after(100, watchdog)
+
+    app.root.after(0, drive)
+    assert app._confirm_and_quit() is True
+    assert timed_out == [] and started == [True]
+    assert app._stop_events["acc"].is_set()
+    assert app._state("acc")["run_phase"] == g.PHASE_STOPPING
+
+
+def test_quit_waiting_dialog_stays_centered_after_the_text_shrinks(app, tray, monkeypatch):
+    """确认后文案换成「正在停止…」，窗口缩小时必须重新居中，不能固定左上角缩。"""
+    begin_account_run(app, "acc")
+    monkeypatch.setattr(app, "_begin_quit_after_stop", lambda **kwargs: None)
+    seen = {}
+
+    def drive():
+        dialog = find_toplevel(app, g.QUIT_CONFIRM_TITLE)
+        seen["before"] = dialog_center_error(app, dialog)
+        find_button(dialog, g.QUIT_CONFIRM_BTN).invoke()
+        seen["after"] = dialog_center_error(app, dialog)
+        dialog.destroy()
+
+    app.root.after(0, drive)
+    app._confirm_and_quit()
+    assert abs(seen["before"][0]) <= 2 and abs(seen["before"][1]) <= 2, seen
+    assert abs(seen["after"][0]) <= 2 and abs(seen["after"][1]) <= 2, seen
 
 
 def test_hiding_while_active_never_asks(app, tray, monkeypatch):

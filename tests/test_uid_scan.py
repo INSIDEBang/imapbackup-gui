@@ -2,7 +2,8 @@
 
 一条 `UID SEARCH ALL` 取全量 UID，头部每 500 UID 一页；消息标识只从响应元数据的
 `UID` 取，不依赖 IMAP 序号；缺 Message-Id 的消息走既有的合成标识回退；任何一页
-或一条无法可靠解析都让整个文件夹跳过，不返回半截快照。
+或一条无法可靠解析都让整个文件夹跳过，不返回半截快照。SELECT 没有可用的
+UIDVALIDITY 时同样跳过，且不运行 SEARCH——那种 SELECT 可能根本没切换邮箱。
 """
 import hashlib
 import logging
@@ -84,18 +85,22 @@ def test_scan_duplicate_message_id_keeps_the_later_uid_and_warns(caplog):
     assert any("duplicate Message-Id <dup@x>" in rec.message for rec in caplog.records), caplog.text
 
 
-def test_scan_returns_uidvalidity_and_degrades_to_none(caplog):
-    assert scan(UidFetchServer(raws(1))).uidvalidity == 777
-
-    missing = UidFetchServer(raws(1), uidvalidity=None)
+def test_scan_skips_a_folder_without_usable_uidvalidity(caplog):
+    """缺失/畸形 UIDVALIDITY 不能扫描：SEARCH 可能落在上一个选中的邮箱上。"""
     log = logging.getLogger("test.uid_scan.uidvalidity")
     caplog.set_level(logging.WARNING, logger=log.name)
-    assert scan(missing, log).uidvalidity is None
+
+    missing = UidFetchServer(raws(1), uidvalidity=None)
+    with pytest.raises(core.SkipFolderException, match="UIDVALIDITY"):
+        scan(missing, log)
+    assert missing.uid_calls == [], missing.uid_calls
     assert any("did not report UIDVALIDITY" in rec.message for rec in caplog.records), caplog.text
 
     caplog.clear()
     malformed = UidFetchServer(raws(1), uidvalidity="not-a-number")
-    assert scan(malformed, log).uidvalidity is None
+    with pytest.raises(core.SkipFolderException, match="UIDVALIDITY"):
+        scan(malformed, log)
+    assert malformed.uid_calls == [], malformed.uid_calls
     assert any("malformed UIDVALIDITY" in rec.message for rec in caplog.records), caplog.text
 
 
