@@ -2660,16 +2660,15 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     monkeypatch.setattr(g.core, "scan_folder",
                         lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, 777))
 
-    def fake_scan_file(label, *_a, **_k):
-        scanned["label"] = label
-        return {}
-
-    monkeypatch.setattr(g.core, "scan_file", fake_scan_file)
     monkeypatch.setattr(g.core, "scan_eml_dir", lambda *a, **k: {})
     monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
     monkeypatch.setattr(g.core, "create_folder_structure",
                         lambda names, basedir, account: scanned.setdefault("dir", account))
-    monkeypatch.setattr(g.core, "download_messages", lambda *a, **k: None)
+
+    def fake_download(_server, label, *_a, **_k):
+        scanned["label"] = label
+
+    monkeypatch.setattr(g.core, "download_messages", fake_download)
 
     app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
                         g.threading.Event())
@@ -2833,6 +2832,8 @@ def test_backup_account_skips_a_non_selectable_container(app, monkeypatch, tmp_p
     local = {"u@qq.com/INBOX.mbox": inbox_local,
              "u@qq.com/Sent Messages.mbox": sent_local}
     monkeypatch.setattr(g.core, "scan_file", lambda label, *_a, **_k: local.get(label, {}))
+    # 本用例关注容器跳过；本地扫描索引的命中/失效另有 test_scan_index.py 覆盖
+    monkeypatch.setattr(g.core.ScanIndex, "open", lambda log, stats=None: None)
 
     app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test"),
                         g.threading.Event())
@@ -2846,6 +2847,66 @@ def test_backup_account_skips_a_non_selectable_container(app, monkeypatch, tmp_p
     assert done[6] == 0, done
     assert done[7:12] == (0, 0, 0, 0, 0), done
     assert container not in server.selects, server.selects
+
+
+def test_backup_account_threads_share_the_index_without_lock_failures(app, monkeypatch, tmp_path, caplog):
+    """两个账户线程各自打开 ScanIndex，并发建库/写盘不判锁，备份与事件都完整（规格 §5.6.6）。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    raw = b"From: sender@example.com\r\nSubject: one\r\nMessage-Id: <one@x>\r\n\r\nbody\r\n"
+    servers: dict[str, UidFetchServer] = {}
+
+    def connect(cfg, log):
+        server = UidFetchServer({1: raw}, folders=("INBOX",))
+        servers[cfg.user] = server
+        return server
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    accounts = [{"id": f"acc-wal-{i}", "name": f"账户{i}", "user": f"u{i}@example.com",
+                 "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+                 "folders": ["INBOX"], "mbox": True, "eml": True} for i in range(2)]
+    log = logging.getLogger("test.gui.scan-index-wal")
+    errors: list[BaseException] = []
+
+    def run(account):
+        try:
+            app._backup_account(account, str(tmp_path / account["id"]), app.events, log,
+                                g.threading.Event())
+        except BaseException as exc:   # 线程异常带回主线程断言
+            errors.append(exc)
+
+    def run_round() -> None:
+        errors.clear()
+        servers.clear()
+        threads = [g.threading.Thread(target=run, args=(account,)) for account in accounts]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        assert not any(thread.is_alive() for thread in threads), "账户线程超时"
+        assert errors == [], errors
+        assert set(servers) == {account["user"] for account in accounts}, servers
+
+    with caplog.at_level(logging.INFO, logger=log.name):
+        run_round()   # 冷：两个线程同时建库并写快照
+        for account in accounts:
+            assert (tmp_path / account["id"] / account["user"] / "INBOX.mbox").exists(), account
+            assert (tmp_path / account["id"] / account["user"] / "INBOX").is_dir(), account
+        assert all(server.body_fetches == [[1]] for server in servers.values()), servers
+
+        run_round()   # 热：两个线程各自命中索引，不再取正文
+        assert all(server.body_fetches == [] for server in servers.values()), servers
+
+    done = []
+    while not app.events.empty():
+        event = app.events.get_nowait()
+        if event[0] == "account_done":
+            done.append(event)
+    assert {event[1] for event in done} == {account["id"] for account in accounts}, done
+    assert not any("Local scan index disabled" in record.message for record in caplog.records), (
+        [record.message for record in caplog.records])
+    assert any("Local index hit" in record.message for record in caplog.records), (
+        [record.message for record in caplog.records])
 
 
 def test_entry_context_menu_has_three_actions(app, monkeypatch):

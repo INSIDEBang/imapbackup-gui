@@ -188,7 +188,7 @@ begin
     DeleteSettingsBox.Top := DeleteLogsBox.Top + DeleteLogsBox.Height;
     DeleteSettingsBox.Width := DeleteLogsBox.Width;
     DeleteSettingsBox.Height := DeleteLogsBox.Height;
-    DeleteSettingsBox.Caption := '同时删除界面设置（列宽、窗口位置、已保存的账号与加密密码）';
+    DeleteSettingsBox.Caption := '同时删除界面设置与本地扫描索引（含已保存的账号与加密密码）';
     DeleteSettingsBox.Checked := True;
 
     HintLabel := TLabel.Create(Form);
@@ -279,7 +279,7 @@ end;
 // DelTree 的四个开关都要 True：日志目录有子目录，也可能有只读或隐藏文件。
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  LogDir, SettingsFile: String;
+  LogDir, SettingsFile, IndexDir: String;
 begin
   if CurUninstallStep <> usPostUninstall then
     Exit;
@@ -294,6 +294,10 @@ begin
     SettingsFile := ExpandConstant('{localappdata}\imapbackup-gui\treeview-columns.json');
     if FileExists(SettingsFile) then
       DeleteFile(SettingsFile);
+    // 本地扫描索引是可重建缓存；只随「删除设置」删除，绝不碰用户选择的备份目录
+    IndexDir := ExpandConstant('{localappdata}\imapbackup-gui\index');
+    if DirExists(IndexDir) then
+      DelTree(IndexDir, True, True, True);
   end;
 
   // 完成对话框只在 ARP 向导模式补位——该路径的原生「已顺利移除」弹窗已被 /SILENT

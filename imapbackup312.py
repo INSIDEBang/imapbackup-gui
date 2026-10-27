@@ -41,8 +41,10 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import ssl
 import sys
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Container, Iterable
@@ -137,6 +139,17 @@ class DownloadProgress:
     batches: int = 0
     last_batch: BatchStats | None = None
     stopped: bool = False
+
+
+@dataclass
+class IndexStats:
+    """Per-run local-scan index counters; diagnostics read them, backup never depends on them."""
+
+    hits: int = 0
+    misses: int = 0
+    rebuilds: int = 0
+    disabled: bool = False
+    local_ms: float = 0.0
 
 
 def _has_console() -> bool:
@@ -269,6 +282,12 @@ FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
 SCAN_MSGID_FETCH_ITEMS = "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
 SCAN_FALLBACK_FETCH_ITEMS = "(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])"
 BODY_FETCH_ITEMS = "(UID INTERNALDATE BODY.PEEK[])"
+# 本地扫描索引是缓存，不是判重事实来源：删掉只会让下次运行变慢（规格 §5.6）。
+INDEX_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppDataLocal") / "imapbackup-gui" / "index"
+DB_NAME = "scan-index.sqlite3"
+INDEX_SCHEMA_VERSION = 1
+INDEX_BUSY_TIMEOUT_MS = 5000
+_INDEX_OPEN_LOCK = threading.Lock()
 UID_RE = re.compile(rb"\bUID (\d+)\b")
 FETCH_SIZE_RE = re.compile(rb"\bRFC822\.SIZE (\d+)\b")
 
@@ -642,6 +661,8 @@ class _MessageOutput:
     subject_value: str
     size: int
     wrote: bool
+    wrote_mbox: bool
+    eml_relpath: str | None
 
 
 def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
@@ -654,6 +675,8 @@ def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
     subject_value = folded_header(head, "Subject")
     size = 0
     wrote = False
+    wrote_mbox = False
+    eml_relpath: str | None = None
     try:
         if mbox is not None and msg_id not in skip_mbox:
             buf = f"From nobody {time.ctime()}\n"
@@ -666,6 +689,7 @@ def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
             mbox.write(text_bytes + b"\n\n")
             size = len(text_bytes)
             wrote = True
+            wrote_mbox = True
         if eml_dir is not None and msg_id not in skip_eml:
             payload = raw_bytes.strip() + b"\r\n"
             if UUID in msg_id and b"message-id:" not in head.lower():
@@ -676,9 +700,10 @@ def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
             target.write_bytes(payload)
             size = max(size, len(payload))
             wrote = True
+            eml_relpath = target.relative_to(eml_dir).as_posix()
     except OSError as exc:
         raise BackupWriteError(f"Failed writing message {msg_id} to {filename}: {exc}") from exc
-    return _MessageOutput(timestamp, from_value, subject_value, size, wrote)
+    return _MessageOutput(timestamp, from_value, subject_value, size, wrote, wrote_mbox, eml_relpath)
 
 
 def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, tuple[int, int]],
@@ -691,7 +716,9 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                       should_stop: Callable[[], bool] | None = None,
                       *, written: set[str] | None = None,
                       progress: DownloadProgress | None = None,
-                      on_batch: Callable[[BatchStats], None] | None = None) -> DownloadProgress:
+                      on_batch: Callable[[BatchStats], None] | None = None,
+                      index_mbox: IndexWriter | None = None,
+                      index_eml: IndexWriter | None = None) -> DownloadProgress:
     """Fetch pending messages in UID batches, writing only the formats each one lacks.
 
     Messages are fetched once each as `(UID, RFC822.SIZE)` pairs; a batch is fully
@@ -724,6 +751,9 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
         except OSError as exc:
             raise BackupWriteError(f"Failed deleting {eml_dir}: {exc}") from exc
     if not messages:
+        for writer in (index_mbox, index_eml):
+            if writer is not None:
+                writer.finish()
         if not quiet:
             log.info("%s: New messages: 0", filename)
         return progress
@@ -738,6 +768,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     output_bytes = 0
     t0 = time.monotonic()
     mbox: IO[bytes] | None = None
+    completed = False
     try:
         if basedir is not None:
             try:
@@ -784,6 +815,10 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                                         skip_eml=skip_eml, thunderbird=thunderbird, filename=filename)
                 if not output.wrote:
                     continue
+                if output.wrote_mbox and index_mbox is not None:
+                    index_mbox.mbox_written(msg_id)
+                if output.eml_relpath is not None and index_eml is not None:
+                    index_eml.eml_written(output.eml_relpath, msg_id)
                 written.add(msg_id)
                 progress.backed += 1
                 progress.done_bytes += size
@@ -814,10 +849,20 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                                fetch_failed=progress.fetch_failed - failed_before)
             progress.batches += 1
             progress.last_batch = stats
+            if mbox is not None:
+                try:
+                    mbox.flush()
+                except OSError as exc:
+                    raise BackupWriteError(f"Failed flushing {filename}: {exc}") from exc
+            if index_mbox is not None:
+                index_mbox.batch_end(mbox.fileno() if mbox is not None else None)
+            if index_eml is not None:
+                index_eml.batch_end()
             if on_batch is not None:
                 on_batch(stats)
             if progress.stopped:
                 break
+        completed = True
     finally:
         if mbox is not None:
             try:
@@ -825,6 +870,12 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
             except OSError as exc:
                 if sys.exc_info()[0] is None:
                     raise BackupWriteError(f"Failed closing {filename}: {exc}") from exc
+        for writer in (index_mbox, index_eml):
+            if writer is not None:
+                if completed:
+                    writer.finish()
+                else:
+                    writer.abort()
         spinner.stop()
     if not quiet:
         log.info("%s: %s total, %s largest", filename, pretty_byte_count(output_bytes), pretty_byte_count(biggest))
@@ -872,6 +923,55 @@ def scan_file(filename: str, overwrite: bool, nospinner: bool, basedir: Path, qu
     return messages
 
 
+@dataclass(frozen=True)
+class _EmlFile:
+    """One .eml file's fingerprint and Message-Id; empty msg_id marks a file without the header."""
+
+    relpath: str
+    size: int
+    mtime_ns: int
+    msg_id: str
+
+
+def _scan_eml_files(folder_dir: Path, quiet: bool, log: logging.Logger,
+                    spinner: Spinner | None = None) -> dict[str, _EmlFile]:
+    """Read each .eml header once, returning relpath -> fingerprint + Message-Id."""
+    files: dict[str, _EmlFile] = {}
+    for path in sorted(folder_dir.rglob("*" + EML_SUFFIX)):
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as f:
+                head = f.read(65536)
+            st = path.stat()
+        except OSError as exc:
+            if not quiet:
+                log.warning("Cannot read %s: %s", path, exc)
+            continue
+        value = folded_header(head, "Message-Id")
+        if not value and not quiet:
+            log.warning("%s has no Message-Id header", path)
+        relpath = path.relative_to(folder_dir).as_posix()
+        files[relpath] = _EmlFile(relpath, st.st_size, st.st_mtime_ns, value)
+        if spinner is not None:
+            spinner.spin()
+    return files
+
+
+def _stat_eml_files(folder_dir: Path) -> dict[str, tuple[int, int]] | None:
+    """Fingerprints only; None means the tree could not be fully enumerated."""
+    files: dict[str, tuple[int, int]] = {}
+    for path in sorted(folder_dir.rglob("*" + EML_SUFFIX)):
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        files[path.relative_to(folder_dir).as_posix()] = (st.st_size, st.st_mtime_ns)
+    return files
+
+
 def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> dict[str, str]:
     """Content-level scan mirroring scan_file(): recover Message-Ids from each .eml header block."""
     if overwrite:
@@ -881,25 +981,14 @@ def scan_eml_dir(folder_dir: Path, overwrite: bool, nospinner: bool, quiet: bool
             log.info("eml folder %s: not found", folder_dir)
         return {}
     spinner = Spinner(f"Scanning eml {folder_dir.name}", nospinner, quiet=quiet)
-    messages: dict[str, str] = {}
     try:
-        for path in sorted(folder_dir.rglob("*" + EML_SUFFIX)):
-            try:
-                with path.open("rb") as f:
-                    head = f.read(65536)
-            except OSError as exc:
-                if not quiet:
-                    log.warning("Cannot read %s: %s", path, exc)
-                continue
-            value = folded_header(head, "Message-Id")
-            if value:
-                messages.setdefault(value, value)
-            else:
-                if not quiet:
-                    log.warning("%s has no Message-Id header", path)
-            spinner.spin()
+        records = _scan_eml_files(folder_dir, quiet, log, spinner)
     finally:
         spinner.stop()
+    messages: dict[str, str] = {}
+    for record in records.values():
+        if record.msg_id:
+            messages.setdefault(record.msg_id, record.msg_id)
     if not quiet:
         log.info("%s: %d messages", folder_dir, len(messages))
     return messages
@@ -915,6 +1004,536 @@ def pending_messages[T](remote: dict[str, T], *scans: dict[str, str] | None) -> 
     """
     selected = [scan for scan in scans if scan is not None]
     return {mid: remote[mid] for mid in remote if any(mid not in scan for scan in selected)}
+
+
+_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sink (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('mbox','eml')),
+    root TEXT NOT NULL,
+    account TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    relpath TEXT NOT NULL,
+    size INTEGER,
+    mtime_ns INTEGER,
+    UNIQUE (kind, root, account, folder)
+);
+
+CREATE TABLE IF NOT EXISTS message (
+    sink_id INTEGER NOT NULL REFERENCES sink(id) ON DELETE CASCADE,
+    msg_id TEXT NOT NULL,
+    PRIMARY KEY (sink_id, msg_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS eml_file (
+    sink_id INTEGER NOT NULL REFERENCES sink(id) ON DELETE CASCADE,
+    relpath TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    msg_id TEXT NOT NULL,
+    PRIMARY KEY (sink_id, relpath)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS eml_file_msg ON eml_file (sink_id, msg_id);
+"""
+
+
+class _IndexSchemaMismatch(Exception):
+    """The DB exists but belongs to another scan-index schema; safe to delete and rebuild."""
+
+
+@dataclass(frozen=True)
+class _IndexSink:
+    id: int
+    relpath: str
+    size: int | None
+    mtime_ns: int | None
+
+
+def _normalized_index_root(root: str | Path) -> str:
+    """Cache key for an output root: absolute and case-normalized (Windows)."""
+    return os.path.normcase(os.path.abspath(os.fspath(root)))
+
+
+class IndexWriter:
+    """Register written messages in the scan index; every failure disables the index only.
+
+    Rows are registered as messages are written but only committed at batch_end(),
+    so a process killed mid-batch leaves a fingerprint mismatch for the next run to
+    detect and rebuild from content (never an incorrect skip).
+    """
+
+    def __init__(self, index: ScanIndex, kind: str, root: str | Path, account: str, folder: str,
+                 relpath: str, overwrite: bool = False):
+        self._index = index
+        self._kind = kind
+        self._root = Path(root)
+        self._account = account
+        self._folder = folder
+        self._relpath = relpath
+        self._overwrite = overwrite
+        self._sink_id: int | None = None
+        self._closed = False
+
+    def _conn(self) -> sqlite3.Connection | None:
+        if self._closed or self._index._disabled:
+            return None
+        return self._index._conn
+
+    def _ensure_sink(self) -> int | None:
+        if self._sink_id is not None:
+            return self._sink_id
+        conn = self._conn()
+        if conn is None:
+            return None
+        root_key = _normalized_index_root(self._root)
+        try:
+            row = conn.execute(
+                "SELECT id, relpath FROM sink WHERE kind = ? AND root = ? AND account = ? AND folder = ?",
+                (self._kind, root_key, self._account, self._folder)).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO sink(kind, root, account, folder, relpath, size, mtime_ns) "
+                    "VALUES(?,?,?,?,?,NULL,NULL)",
+                    (self._kind, root_key, self._account, self._folder, self._relpath))
+                if cur.lastrowid is None:
+                    raise sqlite3.IntegrityError("scan index sink insert returned no id")
+                self._sink_id = int(cur.lastrowid)
+                return self._sink_id
+            sink_id = int(row[0])
+            if self._overwrite or str(row[1]) != self._relpath:
+                # 覆盖写或换了输出文件：旧 Message-Id 不能留在索引里冒充本地已有
+                conn.execute("DELETE FROM message WHERE sink_id = ?", (sink_id,))
+                if self._kind == "eml":
+                    conn.execute("DELETE FROM eml_file WHERE sink_id = ?", (sink_id,))
+                conn.execute("UPDATE sink SET relpath = ? WHERE id = ?", (self._relpath, sink_id))
+            self._sink_id = sink_id
+            return sink_id
+        except (sqlite3.Error, OSError) as exc:
+            self._index._disable(exc)
+            return None
+
+    def mbox_written(self, msg_id: str) -> None:
+        sink_id = self._ensure_sink()
+        if sink_id is None:
+            return
+        conn = self._conn()
+        if conn is None:
+            return
+        try:
+            conn.execute("INSERT OR IGNORE INTO message(sink_id, msg_id) VALUES(?,?)", (sink_id, msg_id))
+        except sqlite3.Error as exc:
+            self._index._disable(exc)
+
+    def eml_written(self, relpath: str, msg_id: str) -> None:
+        sink_id = self._ensure_sink()
+        if sink_id is None:
+            return
+        conn = self._conn()
+        if conn is None:
+            return
+        try:
+            st = (self._root / self._relpath / relpath).stat()
+            conn.execute(
+                "INSERT OR REPLACE INTO eml_file(sink_id, relpath, size, mtime_ns, msg_id) VALUES(?,?,?,?,?)",
+                (sink_id, relpath, st.st_size, st.st_mtime_ns, msg_id))
+            conn.execute("INSERT OR IGNORE INTO message(sink_id, msg_id) VALUES(?,?)", (sink_id, msg_id))
+        except (sqlite3.Error, OSError) as exc:
+            self._index._disable(exc)
+
+    def batch_end(self, mbox_fd: int | None = None) -> None:
+        if self._closed or self._index._disabled:
+            return
+        conn = self._index._conn
+        try:
+            if self._kind == "mbox" and mbox_fd is not None:
+                sink_id = self._ensure_sink()
+                if sink_id is None:
+                    return
+                st = os.fstat(mbox_fd)
+                conn.execute("UPDATE sink SET size = ?, mtime_ns = ? WHERE id = ?",
+                             (st.st_size, st.st_mtime_ns, sink_id))
+            conn.commit()
+        except (sqlite3.Error, OSError) as exc:
+            self._index._disable(exc)
+
+    def finish(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._index._disabled:
+            return
+        try:
+            self._index._conn.commit()
+        except sqlite3.Error as exc:
+            self._index._disable(exc)
+
+    def abort(self) -> None:
+        """Drop the uncommitted batch; the written files stay and force a rebuild next run."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._index._disabled:
+            return
+        with contextlib.suppress(sqlite3.Error):
+            self._index._conn.rollback()
+
+
+class ScanIndex:
+    """Rebuildable SQLite cache of local Message-Ids (spec §5.6).
+
+    The index answers "which Message-Ids are already on disk for this sink" while
+    a file/directory fingerprint proves the answer is still current. It is never
+    the dedupe source of truth: any failure disables it for the run and the caller
+    falls back to the existing content scan.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, stats: IndexStats, log: logging.Logger,
+                 db_path: Path):
+        self._conn = conn
+        self._stats = stats
+        self._log = log
+        self._db_path = db_path
+        self._disabled = False
+
+    @classmethod
+    def open(cls, log: logging.Logger, stats: IndexStats | None = None) -> ScanIndex | None:
+        """Open (or create) the index for this thread; None means disabled for this run."""
+        stats = stats if stats is not None else IndexStats()
+        # 首次建库时多账户线程会同时切换 WAL；journal_mode 不遵守 busy_timeout，
+        # 串行化打开过程，避免刚启动就互相判成锁超时。
+        with _INDEX_OPEN_LOCK:
+            return cls._open(log, stats)
+
+    @classmethod
+    def _open(cls, log: logging.Logger, stats: IndexStats) -> ScanIndex | None:
+        db_path = INDEX_DIR / DB_NAME
+        try:
+            INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            stats.disabled = True
+            log.warning("Local scan index disabled; falling back to content scans: %s", exc)
+            return None
+        for attempt in (1, 2):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(db_path, timeout=INDEX_BUSY_TIMEOUT_MS / 1000.0)
+                index = cls(conn, stats, log, db_path)
+                index._prepare()
+                return index
+            except _IndexSchemaMismatch as exc:
+                if conn is not None:
+                    conn.close()
+                if attempt == 2:
+                    stats.disabled = True
+                    log.warning("Local scan index disabled; falling back to content scans: %s", exc)
+                    return None
+                cls._delete_db_files(db_path)
+            except sqlite3.OperationalError as exc:
+                # 锁超时/目录不可写：数据库可能正被其他账户线程使用，不能删
+                if conn is not None:
+                    conn.close()
+                stats.disabled = True
+                log.warning("Local scan index disabled; falling back to content scans: %s", exc)
+                return None
+            except sqlite3.DatabaseError as exc:
+                if conn is not None:
+                    conn.close()
+                if attempt == 2:
+                    stats.disabled = True
+                    log.warning("Local scan index disabled; falling back to content scans: %s", exc)
+                    return None
+                log.warning("Local scan index is unusable, rebuilding: %s", exc)
+                cls._delete_db_files(db_path)
+            except OSError as exc:
+                if conn is not None:
+                    conn.close()
+                stats.disabled = True
+                log.warning("Local scan index disabled; falling back to content scans: %s", exc)
+                return None
+        stats.disabled = True
+        log.warning("Local scan index disabled; falling back to content scans")
+        return None
+
+    def _prepare(self) -> None:
+        self._conn.execute(f"PRAGMA busy_timeout = {INDEX_BUSY_TIMEOUT_MS}")
+        mode = self._conn.execute("PRAGMA journal_mode").fetchone()
+        if mode is None or str(mode[0]).lower() != "wal":
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        row = self._conn.execute("PRAGMA user_version").fetchone()
+        version = int(row[0]) if row is not None else 0
+        if version not in (0, INDEX_SCHEMA_VERSION):
+            raise _IndexSchemaMismatch(f"unsupported scan index schema version {version}")
+        self._conn.executescript(_INDEX_SCHEMA)
+        if version != INDEX_SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version = {INDEX_SCHEMA_VERSION}")
+            self._conn.commit()
+
+    @staticmethod
+    def _delete_db_files(db_path: Path) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                Path(f"{db_path}{suffix}").unlink()
+
+    def _disable(self, exc: BaseException) -> None:
+        if self._disabled:
+            return
+        self._disabled = True
+        self._stats.disabled = True
+        self._log.warning("Local scan index disabled for this run; falling back to content scans: %s", exc)
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.close()
+
+    def _discard_corrupt(self, exc: BaseException) -> None:
+        """Drop a malformed DB so the next run rebuilds instead of disabling forever."""
+        self._disable(exc)
+        self._delete_db_files(self._db_path)
+
+    def _handle_query_error(self, exc: BaseException) -> bool:
+        """Disable this run's index; True means a corrupt DB was dropped and must be rebuilt."""
+        corrupt = isinstance(exc, sqlite3.DatabaseError) and not isinstance(
+            exc, (sqlite3.OperationalError, sqlite3.ProgrammingError))
+        if corrupt:
+            self._discard_corrupt(exc)
+        else:
+            self._disable(exc)
+        return corrupt
+
+    def _get_sink(self, kind: str, root: str | Path, account: str, folder: str) -> _IndexSink | None:
+        row = self._conn.execute(
+            "SELECT id, relpath, size, mtime_ns FROM sink "
+            "WHERE kind = ? AND root = ? AND account = ? AND folder = ?",
+            (kind, _normalized_index_root(root), account, folder)).fetchone()
+        if row is None:
+            return None
+        return _IndexSink(int(row[0]), str(row[1]),
+                          int(row[2]) if row[2] is not None else None,
+                          int(row[3]) if row[3] is not None else None)
+
+    def _upsert_sink(self, kind: str, root: str | Path, account: str, folder: str, relpath: str,
+                     size: int | None, mtime_ns: int | None) -> int:
+        root_key = _normalized_index_root(root)
+        row = self._conn.execute(
+            "SELECT id FROM sink WHERE kind = ? AND root = ? AND account = ? AND folder = ?",
+            (kind, root_key, account, folder)).fetchone()
+        if row is None:
+            cur = self._conn.execute(
+                "INSERT INTO sink(kind, root, account, folder, relpath, size, mtime_ns) VALUES(?,?,?,?,?,?,?)",
+                (kind, root_key, account, folder, relpath, size, mtime_ns))
+            if cur.lastrowid is None:
+                raise sqlite3.IntegrityError("scan index sink insert returned no id")
+            return int(cur.lastrowid)
+        sink_id = int(row[0])
+        self._conn.execute("UPDATE sink SET relpath = ?, size = ?, mtime_ns = ? WHERE id = ?",
+                           (relpath, size, mtime_ns, sink_id))
+        return sink_id
+
+    def _delete_sink(self, kind: str, root: str | Path, account: str, folder: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM sink WHERE kind = ? AND root = ? AND account = ? AND folder = ?",
+                (kind, _normalized_index_root(root), account, folder))
+
+    def _write_mbox_snapshot(self, root: str | Path, account: str, folder: str, relpath: str,
+                             messages: dict[str, str]) -> None:
+        st = (Path(root) / relpath).stat()
+        with self._conn:
+            sink_id = self._upsert_sink("mbox", root, account, folder, relpath, st.st_size, st.st_mtime_ns)
+            self._conn.execute("DELETE FROM message WHERE sink_id = ?", (sink_id,))
+            self._conn.executemany("INSERT OR IGNORE INTO message(sink_id, msg_id) VALUES(?,?)",
+                                   [(sink_id, msg_id) for msg_id in messages])
+
+    def _write_eml_snapshot(self, root: str | Path, account: str, folder: str, relpath: str,
+                            records: dict[str, _EmlFile]) -> None:
+        with self._conn:
+            sink_id = self._upsert_sink("eml", root, account, folder, relpath, None, None)
+            self._conn.execute("DELETE FROM eml_file WHERE sink_id = ?", (sink_id,))
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO eml_file(sink_id, relpath, size, mtime_ns, msg_id) VALUES(?,?,?,?,?)",
+                [(sink_id, record.relpath, record.size, record.mtime_ns, record.msg_id)
+                 for record in records.values()])
+            self._conn.execute("DELETE FROM message WHERE sink_id = ?", (sink_id,))
+            msg_ids = sorted({record.msg_id for record in records.values() if record.msg_id})
+            self._conn.executemany("INSERT OR IGNORE INTO message(sink_id, msg_id) VALUES(?,?)",
+                                   [(sink_id, msg_id) for msg_id in msg_ids])
+
+    def _load_mbox_messages(self, sink_id: int) -> dict[str, str] | None:
+        rows = self._conn.execute("SELECT msg_id FROM message WHERE sink_id = ?", (sink_id,)).fetchall()
+        messages: dict[str, str] = {}
+        for (msg_id,) in rows:
+            if not isinstance(msg_id, str) or not msg_id:
+                return None
+            messages[msg_id] = msg_id
+        return messages
+
+    def _load_eml_messages(self, sink_id: int,
+                           fingerprints: dict[str, tuple[int, int]]) -> dict[str, str] | None:
+        rows = self._conn.execute(
+            "SELECT relpath, size, mtime_ns, msg_id FROM eml_file WHERE sink_id = ?", (sink_id,)).fetchall()
+        if len(rows) != len(fingerprints):
+            return None
+        messages: dict[str, str] = {}
+        for relpath, size, mtime_ns, msg_id in rows:
+            if fingerprints.get(relpath) != (size, mtime_ns) or not isinstance(msg_id, str):
+                return None
+            if msg_id:
+                messages.setdefault(msg_id, msg_id)
+        stored: set[str] = set()
+        for (msg_id,) in self._conn.execute("SELECT msg_id FROM message WHERE sink_id = ?", (sink_id,)):
+            if not isinstance(msg_id, str) or not msg_id:
+                return None
+            stored.add(msg_id)
+        if stored != set(messages):
+            return None
+        return messages
+
+    def local_mbox_ids(self, root: str | Path, account: str, folder: str, relpath: str,
+                       overwrite: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> dict[str, str] | None:
+        """Local mbox Message-Ids, or None when overwrite makes the local set empty."""
+        t0 = time.perf_counter()
+        try:
+            if overwrite:
+                if not self._disabled:
+                    try:
+                        self._delete_sink("mbox", root, account, folder)
+                    except (sqlite3.Error, OSError) as exc:
+                        self._handle_query_error(exc)
+                return None
+            if self._disabled:
+                return scan_file(relpath, False, nospinner, Path(root), quiet=quiet, log=log)
+            try:
+                sink = self._get_sink("mbox", root, account, folder)
+                full = Path(root) / relpath
+                if not full.exists():
+                    if sink is not None:
+                        self._delete_sink("mbox", root, account, folder)
+                    self._stats.misses += 1
+                    log.info("Local index miss: %s (mbox not found)", relpath)
+                    return {}
+                if sink is not None and sink.relpath == relpath:
+                    st = full.stat()
+                    if sink.size == st.st_size and sink.mtime_ns == st.st_mtime_ns:
+                        loaded = self._load_mbox_messages(sink.id)
+                        if loaded is not None:
+                            self._stats.hits += 1
+                            log.info("Local index hit: %s (%d messages)", relpath, len(loaded))
+                            return loaded
+            except (sqlite3.Error, OSError) as exc:
+                if self._handle_query_error(exc):
+                    self._stats.misses += 1
+                    self._stats.rebuilds += 1
+                return scan_file(relpath, False, nospinner, Path(root), quiet=quiet, log=log)
+            messages = scan_file(relpath, False, nospinner, Path(root), quiet=quiet, log=log)
+            self._stats.misses += 1
+            self._stats.rebuilds += 1
+            try:
+                self._write_mbox_snapshot(root, account, folder, relpath, messages)
+            except (sqlite3.Error, OSError) as exc:
+                self._disable(exc)
+            else:
+                log.info("Local index rebuild: %s (%d messages)", relpath, len(messages))
+            return messages
+        finally:
+            self._stats.local_ms += (time.perf_counter() - t0) * 1000.0
+
+    def local_eml_ids(self, root: str | Path, account: str, folder: str, relpath: str,
+                      overwrite: bool, nospinner: bool, quiet: bool, log: logging.Logger) -> dict[str, str] | None:
+        """Local eml Message-Ids, or None when overwrite makes the local set empty."""
+        t0 = time.perf_counter()
+        folder_dir = Path(root) / relpath
+        try:
+            if overwrite:
+                if not self._disabled:
+                    try:
+                        self._delete_sink("eml", root, account, folder)
+                    except (sqlite3.Error, OSError) as exc:
+                        self._handle_query_error(exc)
+                return None
+            if self._disabled:
+                return scan_eml_dir(folder_dir, False, nospinner, quiet=quiet, log=log)
+            try:
+                sink = self._get_sink("eml", root, account, folder)
+                if not folder_dir.is_dir():
+                    if sink is not None:
+                        self._delete_sink("eml", root, account, folder)
+                    self._stats.misses += 1
+                    log.info("Local index miss: %s (eml folder not found)", relpath)
+                    return {}
+                if sink is not None and sink.relpath == relpath:
+                    fingerprints = _stat_eml_files(folder_dir)
+                    if fingerprints is not None:
+                        loaded = self._load_eml_messages(sink.id, fingerprints)
+                        if loaded is not None:
+                            self._stats.hits += 1
+                            log.info("Local index hit: %s (%d messages)", relpath, len(loaded))
+                            return loaded
+            except (sqlite3.Error, OSError) as exc:
+                if self._handle_query_error(exc):
+                    self._stats.misses += 1
+                    self._stats.rebuilds += 1
+                return scan_eml_dir(folder_dir, False, nospinner, quiet=quiet, log=log)
+            spinner = Spinner(f"Scanning eml {folder_dir.name}", nospinner, quiet=quiet)
+            try:
+                records = _scan_eml_files(folder_dir, quiet, log, spinner)
+            finally:
+                spinner.stop()
+            messages: dict[str, str] = {}
+            for record in records.values():
+                if record.msg_id:
+                    messages.setdefault(record.msg_id, record.msg_id)
+            self._stats.misses += 1
+            self._stats.rebuilds += 1
+            try:
+                self._write_eml_snapshot(root, account, folder, relpath, records)
+            except (sqlite3.Error, OSError) as exc:
+                self._disable(exc)
+            else:
+                log.info("Local index rebuild: %s (%d messages)", relpath, len(messages))
+            return messages
+        finally:
+            self._stats.local_ms += (time.perf_counter() - t0) * 1000.0
+
+    def writer(self, kind: str, root: str | Path, account: str, folder: str, relpath: str,
+               overwrite: bool = False) -> IndexWriter:
+        return IndexWriter(self, kind, root, account, folder, relpath, overwrite)
+
+    def close(self) -> None:
+        if self._disabled:
+            return
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.rollback()
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.close()
+
+
+def local_snapshots(scan_index: ScanIndex | None, basedir: Path | None, eml_root: Path | None,
+                    account: str, folder: str, mbox_relpath: str, eml_relpath: str, *,
+                    overwrite: bool, nospinner: bool, quiet: bool,
+                    log: logging.Logger) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Local Message-Ids for each selected output format, from the index or a content scan.
+
+    A None entry means that format is not selected. When the index reports overwrite,
+    the selected sink is deliberately empty, so it becomes an empty set here.
+    """
+    local_mbox: dict[str, str] | None = None
+    if basedir is not None:
+        if scan_index is not None:
+            local_mbox = scan_index.local_mbox_ids(basedir, account, folder, mbox_relpath,
+                                                   overwrite, nospinner, quiet, log) or {}
+        else:
+            local_mbox = scan_file(mbox_relpath, overwrite, nospinner, basedir,
+                                   quiet=quiet, log=log)
+    local_eml: dict[str, str] | None = None
+    if eml_root is not None:
+        if scan_index is not None:
+            local_eml = scan_index.local_eml_ids(eml_root, account, folder, eml_relpath,
+                                                 overwrite, nospinner, quiet, log) or {}
+        else:
+            local_eml = scan_eml_dir(eml_root / eml_relpath, overwrite, nospinner,
+                                     quiet=quiet, log=log)
+    return local_mbox, local_eml
 
 
 def _read_uidvalidity(server: imaplib.IMAP4, display: str, log: logging.Logger) -> int | None:
@@ -1342,6 +1961,7 @@ def main(argv: list[str] | None = None) -> int:
     # First line of every run: the version, and a delimiter in the shared daily
     # log, which now holds both CLI and GUI runs.
     log.info("imapbackup v%s starting", __version__)
+    scan_index: ScanIndex | None = None
     # Starts before connect_and_login so connection and authentication
     # failures reach the run log too; argparse failures still happen earlier,
     # before any handler exists (see ADR 0005).
@@ -1365,6 +1985,7 @@ def main(argv: list[str] | None = None) -> int:
             if unmatched:
                 log.warning("No folder matches --exclude-folders '%s'", ", ".join(unmatched))
         account = sanitize_segment(cfg.user, EML_SEGMENT_MAX)
+        scan_index = ScanIndex.open(log)
         if cfg.basedir is not None:
             ensure_basedir(cfg.basedir)
             create_folder_structure(names, cfg.basedir, account)
@@ -1381,22 +2002,26 @@ def main(argv: list[str] | None = None) -> int:
                 remote = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
                 # per-format incremental: pending iff any selected format lacks the message;
                 # download_messages then writes only the sinks that still lack it
-                local_mbox: dict[str, str] | None = None
-                if cfg.basedir is not None:
-                    local_mbox = scan_file(f"{account}/{filename}", cfg.overwrite, cfg.nospinner,
-                                           cfg.basedir, quiet=cfg.quiet, log=log)
-                local_eml: dict[str, str] | None = None
-                eml_folder_dir = None
-                if cfg.eml_dir is not None:
-                    eml_folder_dir = cfg.eml_dir / account / eml_relpath
-                    local_eml = scan_eml_dir(eml_folder_dir, cfg.overwrite, cfg.nospinner, quiet=cfg.quiet, log=log)
+                mbox_relpath = f"{account}/{filename}"
+                eml_rel = f"{account}/{eml_relpath}"
+                local_mbox, local_eml = local_snapshots(
+                    scan_index, cfg.basedir, cfg.eml_dir, account, display_name,
+                    mbox_relpath, eml_rel, overwrite=cfg.overwrite,
+                    nospinner=cfg.nospinner, quiet=cfg.quiet, log=log)
+                eml_folder_dir = cfg.eml_dir / eml_rel if cfg.eml_dir is not None else None
                 new_messages = pending_messages(remote.messages, local_mbox, local_eml)
-                label = f"{account}/{filename}" if cfg.basedir is not None else f"{account}/{eml_relpath}"
+                label = mbox_relpath if cfg.basedir is not None else eml_rel
+                index_mbox = (scan_index.writer("mbox", cfg.basedir, account, display_name,
+                                                mbox_relpath, cfg.overwrite)
+                              if scan_index is not None and cfg.basedir is not None else None)
+                index_eml = (scan_index.writer("eml", cfg.eml_dir, account, display_name,
+                                               eml_rel, cfg.overwrite)
+                             if scan_index is not None and cfg.eml_dir is not None else None)
                 download_messages(server, label, new_messages, cfg.overwrite, cfg.nospinner,
                                   cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
                                   eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                   foldername=display_name, verbose=cfg.verbose, compact=cfg.compact,
-                                  progress=progress)
+                                  progress=progress, index_mbox=index_mbox, index_eml=index_eml)
             except SkipFolderException as e:
                 folder_failures += 1
                 if not cfg.quiet:
@@ -1430,6 +2055,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         runlog.exception("Run failed")
         raise
+    finally:
+        if scan_index is not None:
+            scan_index.close()
 
 
 def cli_exception(typ, value, traceback):

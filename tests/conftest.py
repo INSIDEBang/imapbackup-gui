@@ -49,6 +49,12 @@ def _drop_file_handlers(logger):
         logger.removeHandler(handler)
 
 
+@pytest.fixture(autouse=True)
+def isolate_index(tmp_path, monkeypatch):
+    """把本地扫描索引重定向到每个测试自己的临时目录，绝不写真实应用数据。"""
+    monkeypatch.setattr(core, "INDEX_DIR", tmp_path / "index")
+
+
 @pytest.fixture
 def clean_logging():
     """根 logger 回到「没有当日运行日志」的状态，像新起一个进程。

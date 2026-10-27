@@ -4386,6 +4386,8 @@ class BackupApp:
                  account_display(account), v["user"], outdir, v["mbox"], v["eml"])
         server = core.connect_and_login(cfg, log)
         account_dir = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
+        # 每个账户线程用自己的连接（规格 §5.6.6）；打不开就整轮退回内容扫描
+        scan_index = core.ScanIndex.open(log) if basedir is not None or eml_root is not None else None
         try:
             names = core.get_names(server, False, True, quiet=False, log=log)
             selected = [n for n in names if n[0] in wanted]
@@ -4408,14 +4410,11 @@ class BackupApp:
                     self.log.warning("%s：跳过（%s）", display, e)
                     continue
                 # 两种格式各自判重：任一已选格式缺这封就算待备份，写盘时只补缺的那一份。
-                local_mbox: dict[str, str] | None = None
-                if basedir is not None:
-                    local_mbox = core.scan_file(f"{account_dir}/{filename}", False, True, basedir,
-                                                quiet=False, log=log)
-                local_eml: dict[str, str] | None = None
-                if eml_root is not None:
-                    local_eml = core.scan_eml_dir(eml_root / account_dir / eml_relpath, False, True,
-                                                  quiet=False, log=log)
+                mbox_relpath = f"{account_dir}/{filename}"
+                eml_rel = f"{account_dir}/{eml_relpath}"
+                local_mbox, local_eml = core.local_snapshots(
+                    scan_index, basedir, eml_root, account_dir, display, mbox_relpath, eml_rel,
+                    overwrite=False, nospinner=True, quiet=False, log=log)
                 new = core.pending_messages(scan.messages, local_mbox, local_eml)
                 server_total += len(scan.messages)
                 pending_total += len(new)
@@ -4439,20 +4438,28 @@ class BackupApp:
                         folder_failures += 1
                         self.log.warning("%s：SELECT 失败 %s", display, data)
                         continue
-                    label = f"{account_dir}/{filename}" if basedir is not None else f"{account_dir}/{eml_relpath}"
-                    eml_folder_dir = eml_root / account_dir / eml_relpath if eml_root is not None else None
+                    mbox_relpath = f"{account_dir}/{filename}"
+                    eml_rel = f"{account_dir}/{eml_relpath}"
+                    label = mbox_relpath if basedir is not None else eml_rel
+                    eml_folder_dir = eml_root / eml_rel if eml_root is not None else None
+                    index_mbox = (scan_index.writer("mbox", basedir, account_dir, display, mbox_relpath)
+                                  if scan_index is not None and basedir is not None else None)
+                    index_eml = (scan_index.writer("eml", eml_root, account_dir, display, eml_rel)
+                                 if scan_index is not None and eml_root is not None else None)
                     try:
                         core.download_messages(server, label, new, False, True, False,
                                                basedir, False, quiet=False, log=log,
                                                eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                                foldername=display,
                                                report=report, should_stop=stop_event.is_set,
-                                               progress=progress)
+                                               progress=progress, index_mbox=index_mbox, index_eml=index_eml)
                     except core.FolderFetchError as e:
                         folder_failures += 1
                         self.log.warning("%s：取信失败（%s）", display, e)
                         continue
         finally:
+            if scan_index is not None:
+                scan_index.close()
             with contextlib.suppress(Exception):
                 server.logout()
         seconds = time.monotonic() - t0
