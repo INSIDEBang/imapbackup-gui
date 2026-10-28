@@ -635,7 +635,7 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
    - 不同：
      - `state.uidvalidity_checked` 为假：重跑 `scan_folder`；`uidvalidity_changes += 1`；用新 `FolderScan` 重算 pending（复用本地快照），再减去 `written`；把新结果存回 `state`，设 `uidvalidity_checked=True`。
      - `state.uidvalidity_checked` 已为真：抛 `FolderFetchError`，不再重扫。
-   - 重扫导致该文件夹的 `server_total` / `pending_total` / `pending_bytes` 变化时，GUI 重发 `totals` 事件并更新 `AccountStats`；已备份计数不清零。
+   - 重扫导致该文件夹的 `server_total` / `pending_total` / `pending_bytes` 变化时，GUI 重发 `totals` 事件并更新 `AccountStats`；已备份计数不清零。重发时的 `pending_bytes` 仍是本轮 ETA 基线，要包含当前文件夹已 `written` 的字节，避免 GUI 的累计 `done_bytes` 被重复扣减。
 3. 从 `state.messages` 中排除 `written`，调用 `download_messages`；传入同一个 `progress` 与 `written`，索引 writer 继续用。
 4. 重连成功后 `stats.successes += 1`，连续失败计数清零。
 
@@ -679,7 +679,7 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
 - `connecting` → `PHASE_CONNECTING`
 - `scanning` → `PHASE_SCANNING`
 - `download` → `PHASE_BACKING`
-- `backoff` → `PHASE_BACKING`（第二行显示重连文案）
+- `backoff` → 保留进入退避前的 `run_phase`（第二行显示重连文案，不把连接/扫描改成下载）
 - `stopping` → `PHASE_STOPPING`
 
 `AccountStats`（线程安全，GUI 主线程读取快照）：
@@ -764,7 +764,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | connecting | 现有连接文案 | 无 | 无 |
 | scanning | `扫描 i/N：display` + 失败后缀 | 无 | 无 |
 | download | 见 6.2.1 | 有 | 满足条件时有 |
-| backoff | `连接中断，8 秒后重试（第 2/5 次）` + 失败后缀 | 无 | 无 |
+| backoff | `连接中断，8 秒后重连（第 2/5 次）` + 失败后缀 | 无 | 无 |
 | stopping | `正在停止…` + 失败后缀 | 无 | 无 |
 
 - 失败后缀：`取信失败 N 封`、`文件夹失败 F 个`，只在 `N>0`/`F>0` 时出现；顺序固定为取信失败在前。
@@ -782,21 +782,21 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
   ```text
   cutoff = now - 30
   samples = 窗口内样本
-  elapsed = now - max(cutoff, 第一个样本时间)
+  elapsed = min(30, now - 本段下载第一封完成时间)
   rate_msgs = len(samples) / elapsed * 60
   rate_bytes = sum(size) / elapsed
   ```
 
-- `elapsed < 5 秒` 或 `len(samples) < 3` → 显示 `—`，不显示字节速率与 ETA。
-- 达到阈值后即使速率为 0，也如实显示 `0.0 封/分`，不藏。
+- 首次预热：距本段下载第一封完成不足 5 秒，或本段累计完成不足 3 封 → 显示 `—`，不显示字节速率与 ETA。
+- 预热完成后，窗口内不足 3 封仍按实际完成量计算；空窗口显示 `0.0 封/分 · 0 bytes/s`。旧样本出窗不重置预热，下一封完成后立即恢复数值；成熟窗口的分母固定为 30 秒，包含等待中的时间。
 - 合计速率 = 各下载中账户的当前速率之和；若没有任何账户的速率可计算，显示 `全部 —`。
 
 #### 6.2.4 预计剩余
 
 - `remaining_bytes = max(0, pending_bytes - done_bytes)`。
 - `done_bytes` 只累加已备份消息的 `RFC822.SIZE`；`size=0` 按 0。
-- 使用 60 秒字节速率 `rate60`（同窗口口径，样本不足 10 秒或没有首批完成 → 不显示 ETA）。
-- `eta_s = remaining_bytes / rate60`；`rate60 == 0` → 不显示。
+- 使用 60 秒字节速率 `rate60`（同窗口口径，距本段首封完成不足 10 秒或首次预热未完成 → 不显示 ETA）。
+- `eta_s = remaining_bytes / rate60`；`rate60 == 0` 或当前 30 秒字节速率为零 → 不显示。
 - 显示：`<1 分钟`、`N 分钟`（向上取整）、`N 小时 M 分钟`（≥60 分钟）。
 - 不做向下钳制：速率下降时 ETA 可以变长；不要为了「看起来好」强行单调递减。
 - `size` 未知的邮件不进入字节口径；若未知占比高，ETA 只作参考。

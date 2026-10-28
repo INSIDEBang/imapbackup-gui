@@ -280,6 +280,80 @@ def _message(folder="INBOX", index=1, total=23, **overrides):
     return fields
 
 
+def test_speed_tracker_uses_a_30_second_window_and_minimum_samples():
+    """速率只统计近 30 秒；首次预热需要 5 秒与累计 3 封完成消息。"""
+    tracker = g.SpeedTracker()
+    tracker.add(100.0, 100)
+    tracker.add(101.0, 200)
+    tracker.add(102.0, 300)
+    assert tracker.rates(102.0) is None       # 3 封，但只有 2 秒
+
+    tracker = g.SpeedTracker()
+    tracker.add(100.0, 100)
+    tracker.add(105.0, 200)
+    assert tracker.rates(110.0) is None       # 只有 2 封
+    tracker.add(110.0, 300)
+    assert tracker.rates(110.0) == pytest.approx((18.0, 60.0))
+
+    tracker.add(120.0, 400)
+    assert tracker.rates(135.0) == pytest.approx((6.0, 30.0))  # 100 秒的样本已出窗
+    assert tracker.rates(140.0) == pytest.approx((4.0, 700 / 30))
+
+
+@pytest.mark.parametrize("read_during_warmup", [False, True])
+def test_speed_tracker_stays_ready_across_empty_windows(read_during_warmup):
+    tracker = g.SpeedTracker()
+    for at in (0.0, 1.0, 2.0):
+        tracker.add(at, 300)
+    if read_during_warmup:
+        assert tracker.rates(4.0) is None
+        assert tracker.rates(5.0) == pytest.approx((36.0, 180.0))
+    assert tracker.rates(32.0) == pytest.approx((2.0, 10.0))
+    assert tracker.rates(33.0) == (0.0, 0.0)
+    assert tracker.rates(70.0) == (0.0, 0.0)
+    assert tracker.eta_seconds(70.0, 9000, 900) is None
+    tracker.add(70.0, 900)
+    assert tracker.rates(70.0) == pytest.approx((2.0, 30.0))
+    assert tracker.rates(75.0) == pytest.approx((2.0, 30.0))
+    assert tracker.eta_seconds(75.0, 9000, 1800) == pytest.approx(480.0)
+
+
+def test_speed_tracker_reports_a_zero_byte_rate_without_an_eta():
+    """达到时间/封数阈值后，0 字节速率照实显示；零速率不能拿来估 ETA。"""
+    tracker = g.SpeedTracker()
+    tracker.add(100.0, 0)
+    tracker.add(105.0, 0)
+    tracker.add(110.0, 0)
+    assert tracker.rates(110.0) == pytest.approx((18.0, 0.0))
+    assert tracker.eta_seconds(110.0, 1000, 0) is None
+
+
+def test_speed_tracker_eta_uses_60_second_byte_rate_and_remaining_bytes():
+    """ETA 用近 60 秒字节速率去除剩余字节；少于 10 秒样本不显示，降速后允许变长。"""
+    tracker = g.SpeedTracker()
+    assert tracker.eta_seconds(10.0, 1000, 200) is None   # 首批尚未完成
+    tracker.add(0.0, 100)
+    tracker.add(5.0, 100)
+    tracker.add(8.0, 100)
+    assert tracker.eta_seconds(9.0, 1000, 200) is None    # 只有 9 秒
+    tracker.add(9.0, 100)
+    assert tracker.eta_seconds(10.0, 1000, 200) == pytest.approx(20.0)   # 800 / 40
+    assert tracker.eta_seconds(65.0, 1000, 200) == pytest.approx(160.0)  # 800 / 5
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [
+    (0, "<1 分钟"),
+    (59.9, "<1 分钟"),
+    (60, "1 分钟"),
+    (61, "2 分钟"),
+    (3599, "60 分钟"),
+    (3600, "1 小时 0 分钟"),
+    (3661, "1 小时 2 分钟"),
+])
+def test_eta_format_uses_ceiling_minutes(seconds, expected):
+    assert g._format_eta(seconds) == expected
+
+
 def test_window_initial_state(app):
     assert app.root.title() == "IMAP Backup GUI"
     assert is_disabled(app.start_btn)
@@ -600,12 +674,12 @@ def test_reload_keeps_checks_and_expansion_state(app):
 
 def test_totals_message_and_done_events_fill_the_ui(app):
     aid = app._selected_account_id
-    app.events.put(("totals", aid, 12345, 23))
+    app.events.put(("totals", aid, 12345, 23, 0))
     pump(app)
     assert "12345" in app.count_var.get() and "23" in app.count_var.get(), app.count_var.get()
     assert float(app.progress["maximum"]) == 23.0
 
-    app.events.put(("message", aid, _message()))
+    app.events.put(("message", aid, _message(), 0))
     pump(app)
     kids = app.tree.get_children()
     assert len(kids) == 1
@@ -620,7 +694,7 @@ def test_message_rows_are_zebra_striped(app):
     """偶数行打 zebra tag，奇数行走 Treeview 默认白底；新一轮从第 1 行重新起算。"""
     aid = app._selected_account_id
     app._clear_message_rows()
-    app.events.put(("message", aid, _message()))
+    app.events.put(("message", aid, _message(), 0))
     pump(app)
 
     assert str(app.tree.tag_configure(g.ZEBRA_TAG, "background")).lower() == g.ZEBRA_BG.lower(), (
@@ -630,7 +704,7 @@ def test_message_rows_are_zebra_striped(app):
 
     for i in range(2, 7):
         app.events.put(("message", aid, _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
-                                                 size=100, msg_id=f"<{i}@y>")))
+                                                 size=100, msg_id=f"<{i}@y>"), 0))
     pump(app)
     assert [row_tags(app, iid) for iid in app.tree.get_children()] == (
         [[], [g.ZEBRA_TAG], [], [g.ZEBRA_TAG], [], [g.ZEBRA_TAG]])
@@ -640,43 +714,69 @@ def test_message_rows_are_zebra_striped(app):
     # 新一轮开始前提示重新挂出（待备份为 0 时整轮都不会有行，提示必须留着）
     assert app.list_ph.winfo_manager() == "grid", app.list_ph.winfo_manager()
 
-    app.events.put(("message", aid, _message(subject="重跑首轮", msg_id="<z@y>")))
+    app.events.put(("message", aid, _message(subject="重跑首轮", msg_id="<z@y>"), 0))
     pump(app)
     first = app.tree.get_children()[0]
     assert row_tags(app, first) == [], row_tags(app, first)
     assert app.tree.item(first, "values")[1] == "重跑首轮"
 
 
-def test_incoming_rows_keep_the_mail_list_viewport_when_scrolled_up(app):
-    """备份途中用户在往回翻：新邮件照常追加，视图停在原地；回到底部才恢复跟随。
-
-    回归自：_insert_message_row 对每一行都调 tree.see()，列表被一路拽到底——用户正看旧邮件时
-    每来一封就被夺走位置（用户截图：备份进行中列表自己往下跑）。
-    """
+def test_message_rows_wait_for_the_pump_and_scroll_once_per_batch(app, monkeypatch):
+    """消息事件只累积待插入行；一次 100ms 泵合并插入，并且只 see 最后一行一次。"""
     aid = app._selected_account_id
     app._clear_message_rows()
-    app.events.put(("totals", aid, 60, 60))
-    for i in range(60):
-        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<scroll{i}@y>")))
+    app.events.put(("totals", aid, 100, 100, 0))
+    pump(app)
+    app._handle_event(("message", aid, _message(index=1, msg_id="<batch0@y>"), 0))
+    assert not app.tree.get_children(), "消息事件本身不直接操作 Treeview"
+
+    for i in range(1, 100):
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<batch{i}@y>"), 0))
+    seen = []
+    original_see = app.tree.see
+    monkeypatch.setattr(app.tree, "see", lambda iid: seen.append(iid) or original_see(iid))
+    app._pump()
+    app.root.update()
+    children = app.tree.get_children()
+    assert len(children) == 100
+    assert seen == [children[-1]], seen
+    assert app.tree.bbox(children[-1]), "批量追加后最后一行必须可见"
+
+    app._clear_message_rows()
+
+
+def test_incoming_rows_keep_the_mail_list_viewport_when_scrolled_up(app):
+    """上移后追加 100 行不抢视图；每秒状态刷新不动 yview；回到底部才恢复跟随。"""
+    aid = app._selected_account_id
+    app._clear_message_rows()
+    app.events.put(("totals", aid, 201, 201, 0))
+    for i in range(100):
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<scroll{i}@y>"), 0))
     pump(app)
     app.root.update()
     assert app.tree.yview()[1] == pytest.approx(1.0), app.tree.yview()   # 贴着底部就一路跟随
 
-    app.tree.yview_moveto(0)                       # 用户往上翻着看
+    app.tree.yview_moveto(0.2)                     # 用户往上翻着看
     app.root.update()
-    top = app.tree.get_children()[0]
+    top = app.tree.identify_row(app.tree.winfo_height() // 2)
     top_y = app.tree.bbox(top)[1]
 
-    for i in range(3):
-        app.events.put(("message", aid, _message(index=61 + i, msg_id=f"<up{i}@y>")))
+    for i in range(100):
+        app.events.put(("message", aid, _message(index=101 + i, msg_id=f"<up{i}@y>"), 0))
     pump(app)
     app.root.update()
     assert app.tree.identify_row(top_y + 2) == top, "新行不能把正在浏览的位置推走"
     assert app.tree.yview()[1] < 1.0
 
+    view_before_tick = app.tree.yview()
+    app._status_tick()
+    assert app.tree.yview() == pytest.approx(view_before_tick)
+    app.root.after_cancel(app._status_job)
+    app._status_job = None
+
     app.tree.yview_moveto(1)                       # 用户自己回到底部：跟随恢复
     app.root.update()
-    app.events.put(("message", aid, _message(index=64, msg_id="<bottom@y>", subject="最新一封")))
+    app.events.put(("message", aid, _message(index=201, msg_id="<bottom@y>", subject="最新一封"), 0))
     pump(app)
     app.root.update()
     last = app.tree.get_children()[-1]
@@ -685,6 +785,36 @@ def test_incoming_rows_keep_the_mail_list_viewport_when_scrolled_up(app):
     assert app.tree.yview()[1] == pytest.approx(1.0), app.tree.yview()
 
     app._clear_message_rows()
+
+
+def test_switching_accounts_renders_the_latest_message_at_the_bottom(app, monkeypatch):
+    """切换账户会重画该账户的全部行，并直接落在最新邮件所在的底部。"""
+    first = current_account(app)
+    first_state = app._state(first["id"])
+    original_messages = first_state["messages"]
+    second = g.new_account()
+    second.update({"name": "切换列表", "user": "switch-list@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda _aid: None)
+    first_state["messages"] = [_message(index=i + 1, msg_id=f"<first{i}@y>") for i in range(100)]
+    second_state = app._state(second["id"])
+    second_state["messages"] = [
+        _message(index=i + 1, subject=f"第二账户 {i + 1}", msg_id=f"<second{i}@y>") for i in range(100)]
+    app._switch_account(first["id"])
+
+    app._switch_account(second["id"])
+    assert app.tree.yview()[1] == pytest.approx(1.0), app.tree.yview()
+    last = app.tree.get_children()[-1]
+    assert app.tree.item(last, "values")[1] == "第二账户 100"
+    assert app.tree.bbox(last), "目标账户的最新邮件必须可见"
+
+    app._switch_account(first["id"])
+    first_state["messages"] = original_messages
+    app.accounts.remove(second)
+    app._states.pop(second["id"], None)
+    app._refresh_account_list()
+    app._render_account_detail()
 
 
 def test_run_done_summaries(app):
@@ -698,7 +828,7 @@ def test_run_done_summaries(app):
         app.status_var.get())
     assert not is_disabled(app.start_btn)
 
-    app.events.put(("totals", aid, 100, 0))
+    app.events.put(("totals", aid, 100, 0, 0))
     app.events.put(("account_done", aid, 0, 100, 3.0, False, 0, 0, 0, 0, 0, 0))
     pump(app)
     assert app.status_var.get() == "已是最新，无待备份邮件", app.status_var.get()
@@ -712,9 +842,9 @@ def test_account_done_reports_partial_and_does_not_fill_progress(app):
     """账户结束时只备了 10/46：进度条停在 10，状态行写明 36 封取信失败。"""
     aid = app._selected_account_id
     app.events.put(("account_begin", aid))
-    app.events.put(("totals", aid, 163, 46))
+    app.events.put(("totals", aid, 163, 46, 0))
     for i in range(10):
-        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<{i}@y>")))
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<{i}@y>"), 0))
     app.events.put(("account_done", aid, 10, 117, 16.0, False, 46, 36, 36, 0, 0, 0))
     pump(app)
     assert float(app.progress["maximum"]) == 46.0
@@ -730,6 +860,336 @@ def test_account_done_reports_partial_and_does_not_fill_progress(app):
     app._clear_message_rows()
     app._state(aid).update({"result": None, "result_at": None, "run_phase": g.PHASE_IDLE})
     app._apply_account_icon(aid)
+
+
+def test_second_line_shows_selected_account_rate_and_eta(app, monkeypatch):
+    """下载第二行：样本不足只显示本账户 —；达到阈值后依次显示消息速率、字节速率、ETA。"""
+    aid = app._selected_account_id
+    clock = [100.0]
+    monkeypatch.setattr(g.time, "monotonic", lambda: clock[0])
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+    app.events.put(("totals", aid, 3, 3, 3000))
+    pump(app)
+    assert app._status_full == "备份 INBOX（3 封） · 本账户 —", app._status_full
+
+    for at in (100.0, 105.0, 110.0):
+        clock[0] = at
+        app.events.put(("message", aid, _message(index=len(app._state(aid)["messages"]) + 1), 1000))
+        pump(app)
+    app._status_tick()
+    assert app._status_full == (
+        "备份 INBOX（3 封） · 本账户 18.0 封/分 · 300 bytes/s · 预计剩余 <1 分钟"
+    ), app._status_full
+
+    app.root.after_cancel(app._status_job)
+    app._status_job = None
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_keeps_zero_rates_and_resumes_without_warmup(app, monkeypatch):
+    aid = app._selected_account_id
+    clock = [100.0]
+    monkeypatch.setattr(g.time, "monotonic", lambda: clock[0])
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（10 封）"))
+    app.events.put(("totals", aid, 10, 10, 10000))
+    try:
+        for index, at in enumerate((100.0, 105.0, 110.0), 1):
+            clock[0] = at
+            app.events.put(("message", aid, _message(index=index, total=10), 1000))
+            pump(app)
+        app._refresh_status_line()
+        assert "本账户 18.0 封/分" in app._status_full
+        assert "预计剩余" in app._status_full
+        counts = app._count_full
+        progress = (app.progress["value"], app.progress["maximum"])
+        viewport = app.tree.yview()
+
+        clock[0] = 141.0
+        app._status_tick()
+        assert app._status_full == "备份 INBOX（10 封） · 本账户 0.0 封/分 · 0 bytes/s"
+        assert app._count_full == counts
+        assert (app.progress["value"], app.progress["maximum"]) == progress
+        assert app.tree.yview() == viewport
+
+        clock[0] = 175.0
+        app.events.put(("message", aid, _message(index=4, total=10), 1000))
+        pump(app)
+        app._refresh_status_line()
+        assert app._status_full == (
+            "备份 INBOX（10 封） · 本账户 2.0 封/分 · 33 bytes/s · 预计剩余 6 分钟"
+        )
+        app.events.put(("phase", aid, "download", "备份 Archive（6 封）"))
+        pump(app)
+        assert "本账户 2.0 封/分" in app._status_full
+        app.events.put(("phase", aid, "backoff", "连接中断，8 秒后重连（第 1/5 次）"))
+        pump(app)
+        assert "本账户" not in app._status_full
+        app.events.put(("phase", aid, "download", "备份 Archive（6 封）"))
+        pump(app)
+        assert app._status_full == "备份 Archive（6 封） · 本账户 —"
+    finally:
+        if app._status_job is not None:
+            app.root.after_cancel(app._status_job)
+            app._status_job = None
+        app._clear_message_rows()
+        app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                               "status_error": False, "result": None, "result_at": None})
+        app._restore_run_state(app._state(aid))
+        app._on_active_set_changed()
+
+
+def test_second_line_restores_immediately_when_switching_to_a_downloading_account(app, monkeypatch):
+    """后台账户正在下载时切过去：当帧就恢复第二行，不等下一次事件或 1 秒刷新。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "切换速率", "user": "switch-rate@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda _aid: None)
+    app._switch_account(first["id"])
+    aid = second["id"]
+    app._state(aid)
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+    pump(app)
+
+    app._switch_account(aid)
+    assert app._status_full == "备份 INBOX（3 封） · 本账户 —", app._status_full
+
+    app._switch_account(first["id"])
+    app.accounts.remove(second)
+    app._states.pop(aid, None)
+    app._refresh_account_list()
+    app._on_active_set_changed()
+
+
+def test_run_schedules_the_one_second_status_refresh(app, monkeypatch):
+    """启动主循环时同时启动事件泵与第二行的每秒刷新。"""
+    scheduled = []
+    monkeypatch.setattr(app.root, "after", lambda delay, callback: scheduled.append((delay, callback)))
+    monkeypatch.setattr(app.root, "mainloop", lambda: None)
+    app.run()
+    assert (100, app._pump) in scheduled
+    assert (1000, app._status_tick) in scheduled
+
+
+def test_second_line_aggregates_only_downloading_accounts(app, monkeypatch):
+    """合计只汇总下载中的账户；顺序是本账户速率 → ETA → 合计，一个下载账户时合计消失。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "合计账户", "user": "aggregate@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda _aid: None)
+    app._switch_account(first["id"])
+    clock = [100.0]
+    monkeypatch.setattr(g.time, "monotonic", lambda: clock[0])
+    aid, other = first["id"], second["id"]
+    for account_id, pending_bytes in ((aid, 21900), (other, 600)):
+        app._state(account_id)
+        app.events.put(("account_begin", account_id))
+        app.events.put(("phase", account_id, "download", "备份 INBOX（3 封）"))
+        app.events.put(("totals", account_id, 3, 3, pending_bytes))
+    pump(app)
+    app._refresh_status_line()
+    assert app._status_full.endswith("本账户 — · 全部 —"), app._status_full
+    for at in (100.0, 105.0, 110.0):
+        clock[0] = at
+        for account_id, size in ((aid, 100), (other, 200)):
+            index = len(app._state(account_id)["messages"]) + 1
+            app.events.put(("message", account_id, _message(index=index), size))
+        pump(app)
+    app._status_tick()
+    assert app._status_full == (
+        "备份 INBOX（3 封） · 本账户 18.0 封/分 · 30 bytes/s · 预计剩余 12 分钟 · "
+        "全部 36.0 封/分 · 90 bytes/s"
+    ), app._status_full
+
+    clock[0] = 141.0
+    app._refresh_status_line()
+    assert app._status_full == (
+        "备份 INBOX（3 封） · 本账户 0.0 封/分 · 0 bytes/s · 全部 0.0 封/分 · 0 bytes/s"
+    ), app._status_full
+
+    app.events.put(("phase", other, "backoff", "连接中断，8 秒后重连（第 2/5 次）"))
+    pump(app)
+    app._refresh_status_line()
+    assert "全部" not in app._status_full
+    assert app._status_full.endswith("本账户 0.0 封/分 · 0 bytes/s"), app._status_full
+
+    app.root.after_cancel(app._status_job)
+    app._status_job = None
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app.accounts.remove(second)
+    app._states.pop(other, None)
+    app._refresh_account_list()
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_places_failure_suffix_after_rates(app):
+    """阶段文案带来的失败计数固定排在速率之后，顺序为取信失败、文件夹失败。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download",
+                    "备份 INBOX（3 封） · 取信失败 2 封 · 文件夹失败 1 个"))
+    pump(app)
+    assert app._status_full == (
+        "备份 INBOX（3 封） · 本账户 — · 取信失败 2 封 · 文件夹失败 1 个"
+    ), app._status_full
+
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_hides_rates_while_connecting_scanning_and_in_backoff(app):
+    """连接、扫描、退避只显示阶段文案；回到下载时重新积累速率窗口。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    for kind, text in (("connecting", "正在连接…"),
+                       ("scanning", "扫描 1/1：INBOX"),
+                       ("backoff", "连接中断，8 秒后重连（第 2/5 次）")):
+        app.events.put(("phase", aid, kind, text))
+        pump(app)
+        app._refresh_status_line()
+        assert app._status_full == text, app._status_full
+        app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+        pump(app)
+        assert app._status_full == "备份 INBOX（3 封） · 本账户 —", app._status_full
+
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_backoff_preserves_the_interrupted_run_phase(app):
+    """重连退避只改第二行，不把连接/扫描中的账户错标成下载中。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    pump(app)
+    for kind, run_phase in (("connecting", g.PHASE_CONNECTING),
+                            ("scanning", g.PHASE_SCANNING),
+                            ("download", g.PHASE_BACKING)):
+        app.events.put(("phase", aid, kind, "阶段"))
+        pump(app)
+        app.events.put(("phase", aid, "backoff", "连接中断，8 秒后重连（第 2/5 次）"))
+        pump(app)
+        state = app._state(aid)
+        assert state["run_phase"] == run_phase, (kind, state["run_phase"])
+        assert state["phase_kind"] == "backoff"
+
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_does_not_regain_rates_after_account_done(app):
+    """账户已到终态后，1 秒刷新不能把下载速率重新拼回结果文案。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+    app.events.put(("totals", aid, 3, 3, 300))
+    app.events.put(("account_done", aid, 0, 0, 1.0, False, 3, 0, 0, 0, 0, 0))
+    pump(app)
+    app._refresh_status_line()
+    assert app._status_full == "完成：本次备份 0 封，跳过 0 封（本地已存在），用时 0:01", app._status_full
+
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._apply_account_icon(aid)
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_does_not_regain_rates_after_account_failed(app, monkeypatch):
+    """账户失败后，1 秒刷新不能把下载速率拼回错误文案。"""
+    monkeypatch.setattr(g, "messagebox", FakeBox())
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+    app.events.put(("account_failed", aid, "boom"))
+    pump(app)
+    app._refresh_status_line()
+    assert app._status_full == "备份失败，详见运行日志", app._status_full
+
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._apply_account_icon(aid)
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_second_line_hides_rates_while_stopping(app):
+    """停止中显示「正在停止…」与既有失败后缀，1 秒刷新也不能补回速率。"""
+    aid = app._selected_account_id
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download",
+                    "备份 INBOX（3 封） · 取信失败 2 封 · 文件夹失败 1 个"))
+    app.events.put(("totals", aid, 3, 3, 300))
+    pump(app)
+    app._on_stop()
+    app._refresh_status_line()
+    assert app._status_full == "正在停止… · 取信失败 2 封 · 文件夹失败 1 个", app._status_full
+    assert app._state(aid)["phase_kind"] == "stopping"
+
+    app._stop_events.pop(aid, None)
+    app._clear_message_rows()
+    app._state(aid).update({"run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+                            "status_error": False, "result": None, "result_at": None})
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
+
+
+def test_stop_all_restores_stopping_text_after_switching_accounts(app, monkeypatch):
+    """停止所有给每个账户各存一份停止文案；切走再切回不丢失败后缀。"""
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "停止切换", "user": "stop-switch@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda _aid: None)
+    app._switch_account(first["id"])
+    aid, other = first["id"], second["id"]
+    for account_id, text in ((aid, "备份 INBOX（3 封） · 取信失败 2 封 · 文件夹失败 1 个"),
+                             (other, "备份 Sent（4 封）")):
+        app._state(account_id)
+        app.events.put(("account_begin", account_id))
+        app.events.put(("phase", account_id, "download", text))
+    pump(app)
+
+    app._on_stop_all()
+    assert app._status_full == "正在停止… · 取信失败 2 封 · 文件夹失败 1 个", app._status_full
+    app._switch_account(other)
+    assert app._status_full == "正在停止…", app._status_full
+    app._switch_account(aid)
+    assert app._status_full == "正在停止… · 取信失败 2 封 · 文件夹失败 1 个", app._status_full
+
+    for account_id in (aid, other):
+        app._stop_events.pop(account_id, None)
+        app._states[account_id].update({
+            "run_phase": g.PHASE_IDLE, "phase_kind": "idle", "status_text": "",
+            "status_error": False, "result": None, "result_at": None})
+    app.accounts.remove(second)
+    app._states.pop(other, None)
+    app._refresh_account_list()
+    app._restore_run_state(app._state(aid))
+    app._on_active_set_changed()
 
 
 def test_background_account_restores_final_counts_when_switched_back(app, monkeypatch):
@@ -750,9 +1210,9 @@ def test_background_account_restores_final_counts_when_switched_back(app, monkey
     app._state(aid)                  # _launch_accounts 开跑前会为每个账户建状态
 
     app.events.put(("account_begin", aid))
-    app.events.put(("totals", aid, 163, 46))
+    app.events.put(("totals", aid, 163, 46, 0))
     for i in range(7):
-        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<bg{i}>")))
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<bg{i}>"), 0))
     app.events.put(("account_done", aid, 7, 39, 9.0, False, 46, 0, 0, 0, 0, 0))
     pump(app)
 
@@ -775,7 +1235,7 @@ def test_partial_folder_failure_overrides_up_to_date(app):
     """文件夹失败优先于「已是最新」：即使没有待备份邮件，也不能显示绿勾或已是最新。"""
     aid = app._selected_account_id
     app.events.put(("account_begin", aid))
-    app.events.put(("totals", aid, 100, 0))
+    app.events.put(("totals", aid, 100, 0, 0))
     app.events.put(("account_done", aid, 0, 100, 3.0, False, 0, 0, 0, 0, 0, 1))
     pump(app)
     status = app.status_var.get()
@@ -1513,12 +1973,11 @@ def test_collapsing_a_branch_keeps_the_folder_view_in_range(app):
 
 
 def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
-    """「停止中」三处同时换口径：停止按钮接手转圈、开始按钮退回静止外观、状态行清空、提示改文案。
+    """「停止中」三处同时换口径：停止按钮接手转圈、开始按钮退回静止外观、状态行提示正在停止。
 
-    回归自：点了停止之后开始按钮还在转圈「正在备份…」、停止按钮只是变灰且文案不变、
-    第二行还写着「正在停止…」（与按钮重复）——按钮和状态行都没有「我收到了」的反应。
+    回归自：点了停止之后开始按钮还在转圈「正在备份…」、停止按钮只是变灰且文案不变。
     现在的口径：转圈挪到停止按钮上（红方块换透明占位）、开始按钮复位成静止外观（仍禁用）、
-    第二行只清文案（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
+    第二行显示「正在停止…」（行与版本号留着，收尾出「已停止：…」时不跳版）、配置区提示改口径。
     """
     aid = app._selected_account_id
     set_phase(app, aid, g.PHASE_BACKING)
@@ -1535,7 +1994,8 @@ def test_stopping_feedback_covers_buttons_status_line_and_hint(app):
     assert is_disabled(app.stop_btn)
     assert_start_button_idle(app)                             # 开始按钮：文案与绿三角回位
     assert is_disabled(app.start_btn)     # 但仍不可点（运行还没真正结束）
-    assert app.status_var.get() == "" and app._status_full == ""           # 第二行清空
+    assert app.status_var.get() == g.STOPPING_BTN_LABEL
+    assert app._status_full == g.STOPPING_BTN_LABEL
     assert app._msg_bar.winfo_manager() == "pack"             # 行不收回
     assert app.version_label.winfo_manager() == "pack"        # 版本号留在原处
     # 停止这个动作本身不动第一行计数与进度条（工作线程在途的那封照常落盘、计数据实更新，
@@ -1695,7 +2155,7 @@ def test_row_selection_clears_on_click_outside(app):
     for i in range(1, 4):
         app.events.put(("message", app._selected_account_id,
                         _message(index=i, from_="b@b.com", subject=f"第 {i} 封",
-                                 size=100, msg_id=f"<{i}@y>")))
+                                 size=100, msg_id=f"<{i}@y>"), 0))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 3, len(ids)
@@ -2010,7 +2470,7 @@ def test_tree_context_menu_copies_the_clicked_cell(app, monkeypatch):
     app._clear_message_rows()
     for i in range(1, 3):
         app.events.put(("message", app._selected_account_id,
-                        _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>")))
+                        _message(index=i, subject=f"主题{i}", size=100 + i, msg_id=f"<{i}@y>"), 0))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 2, ids
@@ -2162,7 +2622,7 @@ def test_entry_focus_clears_on_click_outside(app, monkeypatch):
     app._clear_message_rows()
     for i in range(1, 3):
         app.events.put(("message", app._selected_account_id,
-                        _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>")))
+                        _message(index=i, subject=f"焦点 {i}", size=100, msg_id=f"<f{i}@y>"), 0))
     pump(app)
     ids = app.tree.get_children()
     assert len(ids) == 2, len(ids)
@@ -2763,6 +3223,35 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     assert "工作邮箱" not in str(scanned)
 
 
+def test_backup_account_emits_structured_phases_and_byte_counts(app, monkeypatch, tmp_path):
+    """第二行的事实来源：阶段有类型，totals 带待备份字节，message 带本封 RFC822.SIZE。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    raws = _fake_mailbox("events", 3)[0]
+    account = _worker_account("events")
+    monkeypatch.setattr(g.core, "connect_and_login",
+                        lambda _cfg, _log: UidFetchServer(dict(raws), folders=("INBOX",)))
+    monkeypatch.setattr(g.core.ScanIndex, "open", lambda log, stats=None: None)
+
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test.gui.events"),
+                        g.threading.Event())
+    events = _drain_worker_events(app)
+
+    assert [(event[2], event[3]) for event in events if event[0] == "phase"] == [
+        ("connecting", "正在连接…"),
+        ("scanning", "扫描 1/1：INBOX"),
+        ("download", "备份 INBOX（3 封）"),
+    ]
+    totals = [event for event in events if event[0] == "totals"]
+    assert len(totals) == 1
+    assert totals[0][2:] == (3, 3, sum(len(raw) for raw in raws.values()))
+    messages = [event for event in events if event[0] == "message"]
+    assert len(messages) == 3
+    assert {event[2]["msg_id"]: event[3] for event in messages} == {
+        f"<events{uid}@x>": len(raw) for uid, raw in raws.items()
+    }
+
+
 def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch, tmp_path):
     """FolderFetchError 只算一个文件夹失败（规格 §5.3），不能升级为账户失败。"""
     while not app.events.empty():
@@ -2806,6 +3295,8 @@ def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch,
         events.append(app.events.get_nowait())
     done = [e for e in events if e[0] == "account_done"][-1]
     assert done[7:12] == (0, 0, 0, 0, 1), done
+    assert ("download", "备份 ZZ（1 封） · 文件夹失败 1 个") in [
+        (event[2], event[3]) for event in events if event[0] == "phase"]
 
 
 def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path):
@@ -2845,9 +3336,11 @@ def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path
         if label.endswith("INBOX.mbox"):
             progress.fetch_failed += 2
             progress.fetch_failed_no_bad += 2
+            _k["on_batch"](None)
         else:
             progress.fetch_failed += 1
             progress.fetch_failed_malformed += 1
+            _k["on_batch"](None)
             raise g.core.FolderFetchError("every UID in a FETCH batch was rejected by the server")
 
     monkeypatch.setattr(g.core, "download_messages", fake_download)
@@ -2861,6 +3354,15 @@ def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path
     assert done[2:7] == (0, 0, done[4], False, 2), done
     assert done[7:12] == (3, 0, 2, 1, 1), done
     assert scan_calls == ["INBOX", "ZZ"], scan_calls
+    assert [(event[2], event[3]) for event in events if event[0] == "phase"] == [
+        ("connecting", "正在连接…"),
+        ("scanning", "扫描 1/2：INBOX"),
+        ("scanning", "扫描 2/2：ZZ"),
+        ("download", "备份 INBOX（1 封）"),
+        ("download", "备份 INBOX（1 封） · 取信失败 2 封"),
+        ("download", "备份 ZZ（1 封） · 取信失败 2 封"),
+        ("download", "备份 ZZ（1 封） · 取信失败 3 封"),
+    ]
 
 
 class ContainerFolderServer(UidFetchServer):
@@ -2933,7 +3435,7 @@ def test_backup_account_skips_a_non_selectable_container(app, monkeypatch, tmp_p
     while not app.events.empty():
         events.append(app.events.get_nowait())
     totals = [e for e in events if e[0] == "totals"][-1]
-    assert totals[2:] == (5, 0), totals
+    assert totals[2:] == (5, 0, 0), totals
     done = [e for e in events if e[0] == "account_done"][-1]
     assert done[2:4] == (0, 5), done
     assert done[6] == 0, done
@@ -2975,6 +3477,13 @@ def test_backup_account_reconnects_after_the_server_drops_the_connection(app, mo
     while not app.events.empty():
         events.append(app.events.get_nowait())
     assert [e for e in events if e[0] == "account_failed"] == [], events
+    assert [(event[2], event[3]) for event in events if event[0] == "phase"] == [
+        ("connecting", "正在连接…"),
+        ("scanning", "扫描 1/1：INBOX"),
+        ("download", "备份 INBOX（3 封）"),
+        ("backoff", "连接中断，0 秒后重连（第 1/5 次）"),
+        ("download", "备份 INBOX（3 封）"),
+    ]
     done = [e for e in events if e[0] == "account_done"][-1]
     assert done[2] == 3, done                     # 三封都备份，断连那批不算失败
     assert done[7:12] == (0, 0, 0, 0, 0), done    # 没有取信失败/文件夹失败
@@ -2984,6 +3493,48 @@ def test_backup_account_reconnects_after_the_server_drops_the_connection(app, mo
         assert sorted(m.get("Message-Id") for m in mb) == ["<r1@x>", "<r2@x>", "<r3@x>"]
     finally:
         mb.close()
+
+
+def test_uidvalidity_rescan_keeps_completed_bytes_in_the_eta_baseline(app, monkeypatch, tmp_path):
+    """重扫只移除未完成的 pending；totals 仍含当前文件夹已完成的 40 字节，ETA 不重复扣减。"""
+    _drain_worker_events(app)
+    raws = {uid: (f"From: sender{uid}@example.com\r\nSubject: message {uid}\r\n"
+                  f"Message-Id: <m{uid}@x>\r\n\r\nbody {uid}\r\n").encode()
+            for uid in (1, 2)}
+    servers = iter((UidFetchServer(raws, sizes={1: 40, 2: 60}, uidvalidity=777),
+                    UidFetchServer(raws, sizes={1: 40, 2: 60}, uidvalidity=888)))
+    monkeypatch.setattr(g.core, "connect_and_login", lambda _cfg, _log: next(servers))
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)
+    monkeypatch.setattr(g.core.ScanIndex, "open", lambda log, stats=None: None)
+    monkeypatch.setattr(g.core, "scan_file", lambda *_a, **_k: {})
+    download_calls = 0
+
+    def partial_then_resumed_download(_conn, _label, messages, *_args, **kwargs):
+        nonlocal download_calls
+        download_calls += 1
+        if download_calls == 1:
+            assert set(messages) == {"<m1@x>", "<m2@x>"}
+            kwargs["report"]({"folder": "INBOX", "msg_id": "<m1@x>"})
+            kwargs["written"].add("<m1@x>")
+            raise imaplib.IMAP4.abort("socket error: EOF")
+        assert set(messages) == {"<m2@x>"}
+        kwargs["report"]({"folder": "INBOX", "msg_id": "<m2@x>"})
+        kwargs["written"].add("<m2@x>")
+
+    monkeypatch.setattr(g.core, "download_messages", partial_then_resumed_download)
+    account = {"id": "acc-rescan-bytes", "name": "重扫字节", "user": "bytes@example.com",
+               "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+               "folders": ["INBOX"], "mbox": True, "eml": False}
+
+    app._backup_account(account, str(tmp_path), app.events, logging.getLogger("test.gui.rescan_bytes"),
+                        g.threading.Event())
+    events = _drain_worker_events(app)
+    assert [event[2:] for event in events if event[0] == "totals"] == [
+        (2, 2, 100),
+        (2, 1, 100),
+    ], events
+    assert [event[3] for event in events if event[0] == "message"] == [40, 60], events
+    assert [event for event in events if event[0] == "account_failed"] == [], events
 
 
 def test_backup_account_stops_instead_of_retrying_after_a_drop(app, monkeypatch, tmp_path):
@@ -3337,11 +3888,14 @@ def test_reconnect_of_one_account_does_not_hold_up_another(app, monkeypatch, tmp
     done = _done_events(events)
     assert set(done) == {account["id"] for account in accounts}, done
 
-    # 5 个 B 账户的整条事件流与干净跑法一致：两个阶段、一条 totals、10 条消息，重连没碰它们
+    # 5 个 B 账户的整条事件流与干净跑法一致：三个阶段、一条 totals、10 条消息，重连没碰它们
     for account in b_accounts:
         b_events = [event for event in events if event[0] != "log" and event[1] == account["id"]]
-        assert [event[2] for event in b_events if event[0] == "phase"] == \
-            ["扫描 1/1：INBOX", "备份 INBOX（10 封）"], b_events
+        assert [event[2:4] for event in b_events if event[0] == "phase"] == [
+            ("connecting", "正在连接…"),
+            ("scanning", "扫描 1/1：INBOX"),
+            ("download", "备份 INBOX（10 封）"),
+        ], b_events
         assert [(event[2], event[3]) for event in b_events if event[0] == "totals"] == [(10, 10)], b_events
         assert len([event for event in b_events if event[0] == "message"]) == 10, b_events
         event = done[account["id"]]
@@ -4241,15 +4795,15 @@ def test_account_row_status_icons_follow_phases_and_ttl(app, monkeypatch):
         return str(row["icon"].cget("image")) == str(image)
 
     assert icon_is(app.row_icon_blank)
-    app._on_phase(aid, "扫描 1/3：INBOX")
+    app._on_phase(aid, "scanning", "扫描 1/3：INBOX")
     assert icon_is(app.row_scan_icon) and state["run_phase"] == g.PHASE_SCANNING
-    app._on_phase(aid, "备份 INBOX（7 封）")
+    app._on_phase(aid, "download", "备份 INBOX（7 封）")
     assert icon_is(app.row_download_icon) and state["run_phase"] == g.PHASE_BACKING
     # stopping 后到达的 phase 事件不许把阶段降回去，图标保持红块
     app._stop_events[aid] = g.threading.Event()
     app._on_stop()
     assert icon_is(app.row_stop_icon)
-    app._on_phase(aid, "备份 INBOX（7 封）")
+    app._on_phase(aid, "download", "备份 INBOX（7 封）")
     assert state["run_phase"] == g.PHASE_STOPPING and icon_is(app.row_stop_icon)
 
     # 已停止：灰方块 + 5s TTL；到期回调把图标清回空白
@@ -4429,9 +4983,9 @@ def test_progress_bar_value_tracks_messages_without_overfilling(app):
     st = app._state(aid)
     st["backed"] = 0
     st["run_phase"] = g.PHASE_BACKING
-    app._handle_event(("totals", aid, 5626, 4839))
+    app._handle_event(("totals", aid, 5626, 4839, 0))
     for i in range(1, 123):
-        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<p{i}>")))
+        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<p{i}>"), 0))
     assert float(app.progress.cget("maximum")) == 4839.0
     assert float(app.progress.cget("value")) == 122.0
     assert float(app.progress.cget("value")) / float(app.progress.cget("maximum")) < 0.1
@@ -4452,7 +5006,7 @@ def test_progress_length_not_reconfigured_every_message(app):
     st["run_phase"] = g.PHASE_BACKING
     app.root.geometry("960x736")
     app.root.update()
-    app._handle_event(("totals", aid, 5626, 4839))
+    app._handle_event(("totals", aid, 5626, 4839, 0))
     configured = []
     original = app.progress.configure
 
@@ -4464,7 +5018,7 @@ def test_progress_length_not_reconfigured_every_message(app):
     app.progress.configure = spy
     length_before = getattr(app, "_progress_length", None)
     for i in range(1, 50):
-        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<l{i}>")))
+        app._handle_event(("message", aid, _message(index=i, total=4839, msg_id=f"<l{i}>"), 0))
     app.progress.configure = original
     # 位数没变（都 <100），length 全程不重配
     assert configured == [] or all(v == length_before for v in configured)

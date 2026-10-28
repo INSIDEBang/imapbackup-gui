@@ -36,6 +36,7 @@ import ctypes
 import email.utils
 import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -45,6 +46,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -604,6 +606,57 @@ def account_display(account: dict) -> str:
     return ACCOUNT_NAME_FALLBACK
 
 
+def _format_eta(seconds: float) -> str:
+    """把 ETA 秒数格式化为向上取整的分钟或小时分钟。"""
+    if seconds < 60:
+        return "<1 分钟"
+    if seconds < 3600:
+        return f"{math.ceil(seconds / 60)} 分钟"
+    minutes = math.ceil(seconds / 60)
+    return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+
+class SpeedTracker:
+    """单账户的完成消息样本，提供 30 秒速率与 60 秒 ETA 口径。"""
+
+    def __init__(self) -> None:
+        self._samples: deque[tuple[float, int]] = deque()
+        self._first_completed_at: float | None = None
+        self._completed_count = 0
+
+    def add(self, at: float, size: int) -> None:
+        """记录一封已备份消息的完成时间与 RFC822.SIZE。"""
+        if self._first_completed_at is None:
+            self._first_completed_at = at
+        self._completed_count += 1
+        self._samples.append((at, max(0, size)))
+        cutoff = at - 60.0
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def _rate(self, now: float, window: float) -> tuple[float, float, float] | None:
+        if self._first_completed_at is None or self._completed_count < 3:
+            return None
+        elapsed = min(window, now - self._first_completed_at)
+        if elapsed < 5.0:
+            return None
+        samples = [sample for sample in self._samples if sample[0] >= now - window]
+        return len(samples) / elapsed * 60.0, sum(size for _, size in samples) / elapsed, elapsed
+
+    def rates(self, now: float) -> tuple[float, float] | None:
+        """返回近 30 秒的（封/分, 字节/秒）；样本不足时返回 None。"""
+        rate = self._rate(now, 30.0)
+        return rate[:2] if rate is not None else None
+
+    def eta_seconds(self, now: float, pending_bytes: int, done_bytes: int) -> float | None:
+        """按近 60 秒字节速率估算剩余秒数；样本不足或零速率时返回 None。"""
+        rate = self._rate(now, 60.0)
+        if rate is None or rate[2] < 10.0 or rate[1] == 0:
+            return None
+        remaining = max(0, pending_bytes - done_bytes)
+        return remaining / rate[1]
+
+
 @dataclass
 class _FolderPlan:
     """pass 1 得到的单个文件夹快照；重连重扫时 scan/pending 会被原地替换。"""
@@ -950,8 +1003,10 @@ class BackupApp:
         self.pending_total = 0
         self.backed_count = 0
         self._row_index = 0  # 邮件列表插入序号；清表归零，斑马纹按它的奇偶决定
+        self._pending_message_rows: list[dict] = []  # 可见账户待合批插入的消息
         self._status_full = ""              # 状态行全文；status_var 里可能是它的截断形
         self._status_error = False          # 状态行当前是否错误色（切账户时要跟着状态一起还原）
+        self._status_job: str | None = None  # 第二行速率/ETA 的 1 秒刷新 after 句柄
         self._count_full = "尚未开始备份"    # 计数行全文；count_var 同理
         self._fit_font: tkfont.Font | None = None  # 量字宽的缓存，两行标签同一默认字体
         self._tip: tk.Toplevel | None = None
@@ -2037,9 +2092,11 @@ class BackupApp:
                      "folder_rows": [], "open_keys": None,  # open_keys=None → 首次全部展开
                      "messages": [], "row_index": 0,
                      "server_total": 0, "pending_total": 0, "backed": 0,
+                     "pending_bytes": 0, "done_bytes": 0, "speed": SpeedTracker(),
                      "count_text": "尚未开始备份", "status_text": "", "status_error": False,
                      "progress": None, "result": None,
                      "run_phase": PHASE_IDLE,        # 账户独立备份阶段（见 ACTIVE_PHASES）
+                     "phase_kind": PHASE_IDLE,       # 第二行阶段：download/backoff 等，不只四种运行态
                      "result_at": None,             # 终态时刻（monotonic）：冷却窗与绿勾 TTL 共用
                      "icon_job": None}              # 终态图标的自动清除 after 句柄
             self._states[account_id] = state
@@ -2876,6 +2933,7 @@ class BackupApp:
             self._row_index += 1
             self._insert_message_row(data, self._row_index)
         state["row_index"] = self._row_index
+        self.tree.yview_moveto(1.0)
         self._toggle_hint(self.list_ph, not state["messages"])
 
     def _restore_run_state(self, state: dict) -> None:
@@ -2891,6 +2949,7 @@ class BackupApp:
             self.progress.configure(maximum=max(maximum, 1), value=min(value, max(maximum, 1)))
         self._set_counts(state["count_text"])
         self._set_status(state["status_text"], state["status_error"])
+        self._refresh_status_line()
 
     def _sync_account_edit_scroll(self) -> None:
         """设置页账户列表的智能滚条：内容装不下才把滚条挂出来，装下就收走。
@@ -4320,6 +4379,7 @@ class BackupApp:
             state["status_text"] = CONNECTING_STATUS_TEXT
             state["count_text"] = "正在统计…"
             state["run_phase"] = PHASE_CONNECTING
+            state["phase_kind"] = "connecting"
             self._cancel_result_icon_job(state)
             self._apply_account_icon(account_id)
         self._cycle["ids"].update(account_ids)
@@ -4385,12 +4445,13 @@ class BackupApp:
         folder_failures = 0
         progress = core.DownloadProgress()
         wanted = {name for name in account.get("folders", []) if isinstance(name, str) and name} or {"INBOX"}
+        sizes: dict[str, int] = {}
 
         def report(d: dict) -> None:
             nonlocal backed
             backed += 1
             log.debug("已备份 %s：%s", d["folder"], d["msg_id"])
-            eq.put(("message", account_id, d))
+            eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
         v = {"user": account["user"], "server": account["server"], "password": account["password"],
              "ssl": bool(account.get("ssl", DEFAULT_ACCOUNT_SSL)),
@@ -4411,22 +4472,49 @@ class BackupApp:
         def reconnect():
             return core.connect_for_reconnect(cfg, log)
 
+        def emit_phase(kind: str, text: str) -> None:
+            parts = [text]
+            if progress.fetch_failed:
+                parts.append(f"取信失败 {progress.fetch_failed} 封")
+            if folder_failures:
+                parts.append(f"文件夹失败 {folder_failures} 个")
+            eq.put(("phase", account_id, kind, " · ".join(parts)))
+
+        def on_backoff(attempt: int, delay: float) -> None:
+            emit_phase("backoff", f"连接中断，{math.ceil(delay)} 秒后重连（第 {attempt}/{core.RECONNECT_MAX_ATTEMPTS} 次）")
+
+        def list_folders(conn) -> list[tuple[str, str, str, str]]:
+            emit_phase("connecting", CONNECTING_STATUS_TEXT)
+            return core.get_names(conn, False, True, quiet=False, log=log)
+
         plans: list[_FolderPlan] = []
 
-        def totals() -> tuple[int, int]:
-            return (sum(len(p.scan.messages) for p in plans), sum(len(p.pending) for p in plans))
+        def totals() -> tuple[int, int, int]:
+            return (sum(len(p.scan.messages) for p in plans),
+                    sum(len(p.pending) for p in plans),
+                    sum(size for p in plans for _, size in p.pending.values()))
 
         def run_plan(plan: _FolderPlan) -> None:
             """下载一个文件夹；断连时由核心重连并按 UIDVALIDITY 续跑（规格 §5.7.6）。"""
-            nonlocal server
+            nonlocal server, sizes
+            sizes = {msg_id: size for msg_id, (_, size) in plan.pending.items()}
             foldername, filename, eml_relpath, display = plan.name
             mbox_relpath = f"{account_dir}/{filename}"
             eml_rel = f"{account_dir}/{eml_relpath}"
             label = mbox_relpath if basedir is not None else eml_rel
             eml_folder_dir = eml_root / eml_rel if eml_root is not None else None
             written: set[str] = set()
+            download_text = f"备份 {display}（{len(plan.pending)} 封）"
+            reported_failures = progress.fetch_failed
+
+            def report_batch(_stats) -> None:
+                nonlocal reported_failures
+                if progress.fetch_failed != reported_failures:
+                    reported_failures = progress.fetch_failed
+                    emit_phase("download", download_text)
 
             def do_download(conn, messages, overwrite_now):
+                emit_phase("download", download_text)
                 # abort() 会关掉 writer：每次重连尝试都用新的 writer
                 index_mbox = (scan_index.writer("mbox", basedir, account_dir, display, mbox_relpath,
                                                 overwrite=overwrite_now)
@@ -4439,30 +4527,34 @@ class BackupApp:
                                        eml_dir=eml_folder_dir, skip_mbox=plan.local_mbox,
                                        skip_eml=plan.local_eml, foldername=display,
                                        report=report, should_stop=stop_event.is_set,
-                                       written=written, progress=progress,
+                                       written=written, progress=progress, on_batch=report_batch,
                                        index_mbox=index_mbox, index_eml=index_eml)
 
             def rescan(conn):
                 return core.scan_folder(conn, foldername, True, quiet=False, log=log, display=display)
 
             def scan_changed(scan, pending):
+                nonlocal sizes
+                completed_bytes = sum(size for msg_id, (_, size) in plan.pending.items() if msg_id in written)
                 plan.scan, plan.pending = scan, pending
-                eq.put(("totals", account_id, *totals()))
+                sizes = {msg_id: size for msg_id, (_, size) in pending.items()}
+                server_total, pending_total, pending_bytes = totals()
+                eq.put(("totals", account_id, server_total, pending_total,
+                        pending_bytes + completed_bytes))
 
             state = core.FolderDownloadState(plan.scan, plan.pending)
             server, state = core.download_folder_with_reconnect(
                 server, reconnect, state, foldername=foldername, display=display,
                 local_mbox=plan.local_mbox, local_eml=plan.local_eml, written=written,
                 download=do_download, rescan=rescan, should_stop=stop_event.is_set,
-                log=log, on_scan_changed=scan_changed, stats=reconnect_stats)
+                log=log, on_scan_changed=scan_changed, stats=reconnect_stats, on_backoff=on_backoff)
             plan.scan, plan.pending = state.scan, state.pending
 
         try:
             try:
                 names, server = core.run_with_reconnect(
-                    server, reconnect,
-                    lambda conn: core.get_names(conn, False, True, quiet=False, log=log),
-                    should_stop=stop_event.is_set, log=log, stats=reconnect_stats)
+                    server, reconnect, list_folders, should_stop=stop_event.is_set,
+                    log=log, stats=reconnect_stats, on_backoff=on_backoff)
             except core.ReconnectStopped:
                 names = []
             selected = [n for n in names if n[0] in wanted]
@@ -4474,13 +4566,15 @@ class BackupApp:
                 if stop_event.is_set():
                     break
                 foldername, filename, eml_relpath, display = n
-                eq.put(("phase", account_id, f"扫描 {i}/{len(selected)}：{display}"))
+
+                def scan_attempt(conn, folder=foldername, shown=display, ordinal=i):
+                    emit_phase("scanning", f"扫描 {ordinal}/{len(selected)}：{shown}")
+                    return core.scan_folder(conn, folder, True, quiet=False, log=log, display=shown)
+
                 try:
                     scan, server = core.run_with_reconnect(
-                        server, reconnect,
-                        lambda conn, folder=foldername, shown=display: core.scan_folder(
-                            conn, folder, True, quiet=False, log=log, display=shown),
-                        should_stop=stop_event.is_set, log=log, stats=reconnect_stats)
+                        server, reconnect, scan_attempt, should_stop=stop_event.is_set,
+                        log=log, stats=reconnect_stats, on_backoff=on_backoff)
                 except core.ReconnectStopped:
                     break
                 except core.SkipFolderException as e:
@@ -4495,8 +4589,8 @@ class BackupApp:
                     overwrite=False, nospinner=True, quiet=False, log=log)
                 new = core.pending_messages(scan.messages, local_mbox, local_eml)
                 plans.append(_FolderPlan(n, scan, local_mbox, local_eml, new))
-            server_total, pending_total = totals()
-            eq.put(("totals", account_id, server_total, pending_total))
+            server_total, pending_total, pending_bytes = totals()
+            eq.put(("totals", account_id, server_total, pending_total, pending_bytes))
 
             # pass 2: re-select every folder with pending messages (spec §5.4) and download
             if pending_total > 0 and not stop_event.is_set():
@@ -4509,7 +4603,6 @@ class BackupApp:
                     if not plan.pending:
                         continue
                     display = plan.name[3]
-                    eq.put(("phase", account_id, f"备份 {display}（{len(plan.pending)} 封）"))
                     try:
                         run_plan(plan)
                     except core.ReconnectStopped:
@@ -4522,7 +4615,7 @@ class BackupApp:
                         folder_failures += 1
                         self.log.warning("%s：取信失败（%s）", display, e)
                         continue
-                server_total, pending_total = totals()
+                server_total, pending_total, _ = totals()
         finally:
             if scan_index is not None:
                 scan_index.close()
@@ -4560,11 +4653,14 @@ class BackupApp:
             return
         self._stop_events.setdefault(account_id, threading.Event()).set()
         state["run_phase"] = PHASE_STOPPING
+        state["phase_kind"] = "stopping"
         self.stop_btn.configure(state="disabled", image=self.blank_icon)
         self._restore_start_button()
         self._stop_run_spinner()  # 取消挂起的那一帧，立即按新目标重画第 0 帧：点下去当刻就见反馈
         self._run_spinner_tick(0)
-        self._set_status("", error=False)
+        failures = [part for part in state["status_text"].split(" · ")
+                    if part.startswith(("取信失败 ", "文件夹失败 "))]
+        self._set_status(" · ".join([STOPPING_BTN_LABEL, *failures]), error=False)
         self._apply_account_icon(account_id)
         if self._bar.winfo_ismapped():
             self._bar.update_idletasks()   # 开始按钮恢复静止后请求宽变化，立即重排避免文本被裁
@@ -4577,16 +4673,22 @@ class BackupApp:
         for account_id in active:
             self._stop_events.setdefault(account_id, threading.Event()).set()
             state = self._states[account_id]
+            failures = [part for part in state["status_text"].split(" · ")
+                        if part.startswith(("取信失败 ", "文件夹失败 "))]
+            state["status_text"] = " · ".join([STOPPING_BTN_LABEL, *failures])
+            state["status_error"] = False
             if state["run_phase"] != PHASE_STOPPING:
                 state["run_phase"] = PHASE_STOPPING
+                state["phase_kind"] = "stopping"
                 self._apply_account_icon(account_id)
         self._stopping_all = True
         self.stop_all_btn.configure(state="disabled", image=self.blank_icon)
         self._update_start_state()                 # 可见账户若在活动，右下停止钮同步进停止态
         self._stop_run_spinner()
         self._run_spinner_tick(0)
-        if self._visible_account_active():
-            self._set_status("", error=False)
+        state = self._visible_state()
+        if state is not None and state["run_phase"] == PHASE_STOPPING:
+            self._set_status(state["status_text"], error=False)
 
     def _on_active_set_changed(self) -> None:
         """活动集合（哪些账户在备份）变化的唯一收口：按钮、spinner、配置锁、托盘统一在这里刷。"""
@@ -4622,6 +4724,7 @@ class BackupApp:
                 self._handle_event(ev)
         except queue.Empty:
             pass
+        self._flush_message_rows()
         self.root.after(100, self._pump)
 
     def _handle_event(self, ev: tuple) -> None:
@@ -4661,40 +4764,48 @@ class BackupApp:
         state["messages"] = []
         state["row_index"] = 0
         state["server_total"] = state["pending_total"] = state["backed"] = 0
+        state["pending_bytes"] = state["done_bytes"] = 0
+        state["speed"] = SpeedTracker()
         state["progress"] = None
         state["status_text"] = CONNECTING_STATUS_TEXT
         state["status_error"] = False
         state["count_text"] = "正在统计…"
         if state["run_phase"] != PHASE_STOPPING:
             state["run_phase"] = PHASE_CONNECTING
+            state["phase_kind"] = "connecting"
             self._apply_account_icon(account_id)
         if account_id == self._selected_account_id:
             self._render_messages(state)
             self._restore_run_state(state)
 
-    def _on_phase(self, account_id: str, text: str) -> None:
+    def _on_phase(self, account_id: str, kind: str, text: str) -> None:
         state = self._states.get(account_id)
         if state is None:
             return
         # 停止信号已发：worker 可能还在投文件夹间隙的 phase 事件，不允许把 stopping 降回活动态
         if state["run_phase"] == PHASE_STOPPING:
             return
+        previous_kind = state["phase_kind"]
+        state["phase_kind"] = kind
+        if kind == "download" and previous_kind != "download":
+            state["speed"] = SpeedTracker()
         state["status_text"] = text
         state["status_error"] = False
-        if text.startswith("备份"):
-            state["run_phase"] = PHASE_BACKING
-        else:
-            state["run_phase"] = PHASE_SCANNING
+        if kind != "backoff":
+            state["run_phase"] = {"connecting": PHASE_CONNECTING, "scanning": PHASE_SCANNING,
+                                  "download": PHASE_BACKING, "stopping": PHASE_STOPPING}[kind]
         self._apply_account_icon(account_id)
         if account_id == self._selected_account_id:
             self._set_status(text, error=False)
+            self._refresh_status_line()
 
-    def _on_totals(self, account_id: str, server_total: int, pending_total: int) -> None:
+    def _on_totals(self, account_id: str, server_total: int, pending_total: int, pending_bytes: int) -> None:
         state = self._states.get(account_id)
         if state is None:
             return
         state["server_total"] = server_total
         state["pending_total"] = pending_total
+        state["pending_bytes"] = pending_bytes
         if state["run_phase"] != PHASE_STOPPING and pending_total > 0:
             state["run_phase"] = PHASE_BACKING
             self._apply_account_icon(account_id)
@@ -4711,20 +4822,21 @@ class BackupApp:
         if pending_total == 0:
             self._set_status(UPTODATE_STATUS, error=False)
 
-    def _on_message_event(self, account_id: str, data: dict) -> None:
+    def _on_message_event(self, account_id: str, data: dict, fetch_size: int) -> None:
         state = self._states.get(account_id)
         if state is None:
             return
         state["messages"].append(data)
         state["backed"] += 1
+        state["done_bytes"] += max(0, fetch_size)
+        state["speed"].add(time.monotonic(), fetch_size)
         maximum = max(state["pending_total"], 1)
         state["count_text"] = _counts_text(state["server_total"], state["pending_total"], state["backed"])
         state["progress"] = (float(min(state["backed"], maximum)), float(maximum))
         if account_id != self._selected_account_id:
             return
         self.backed_count = state["backed"]
-        self._row_index = state["row_index"] = state["row_index"] + 1
-        self._insert_message_row(data, self._row_index)
+        self._pending_message_rows.append(data)
         self._refresh_counts()
 
     def _on_account_done(self, account_id: str, backed: int, skipped: int, seconds: float,
@@ -4744,6 +4856,7 @@ class BackupApp:
         partial = not stopped and bool(failure_text)
         kind = "stopped" if stopped else "partial" if partial else "done"
         state["run_phase"] = PHASE_IDLE
+        state["phase_kind"] = PHASE_IDLE
         if stopped:
             state["status_text"] = f"已停止：本次备份 {backed} 封"
             if failure_text:
@@ -4798,6 +4911,7 @@ class BackupApp:
         failed_account = self._find_account(account_id)
         name = account_display(failed_account) if failed_account is not None else account_id
         state["run_phase"] = PHASE_IDLE
+        state["phase_kind"] = PHASE_IDLE
         state["result"] = ("failed", message)
         state["result_at"] = time.monotonic()
         state["status_text"] = "备份失败，详见运行日志"
@@ -4850,16 +4964,62 @@ class BackupApp:
                 self._notify_background(TRAY_TITLE_DONE,
                                         f"本次备份 {backed} 封，跳过 {skipped} 封，用时 {_fmt_duration(elapsed)}")
 
-    def _set_status(self, text: str, error: bool) -> None:
-        """写状态行（截断显示），并同步进可见账户的状态字典——切账户后还要原样回来。"""
+    def _paint_status(self, text: str, error: bool) -> None:
+        """只在显示文案或颜色变化时重画第二行。"""
+        if text == self._status_full and error == self._status_error:
+            return
         self._status_full = text
         self._status_error = error
+        self.status_label.configure(foreground="red" if error else "black")
+        self._fit_status()
+
+    def _set_status(self, text: str, error: bool) -> None:
+        """写账户的基础状态文案，再刷新可见的第二行。"""
         state = self._visible_state()
         if state is not None:
             state["status_text"] = text
             state["status_error"] = error
-        self.status_label.configure(foreground="red" if error else "black")
-        self._fit_status()
+        self._paint_status(text, error)
+
+    def _refresh_status_line(self) -> None:
+        """按选中账户的阶段合成第二行；不改账户的基础状态文案。"""
+        state = self._visible_state()
+        if state is None:
+            return
+        text = state["status_text"]
+        if state["phase_kind"] == "download":
+            segments = text.split(" · ")
+            failures = [part for part in segments if part.startswith(("取信失败 ", "文件夹失败 "))]
+            if failures:
+                text = " · ".join(part for part in segments if part not in failures)
+            now = time.monotonic()
+            parts = [text]
+            rates = state["speed"].rates(now)
+            if rates is None:
+                parts.append("本账户 —")
+            else:
+                messages, byte_rate = rates
+                parts.append(f"本账户 {messages:.1f} 封/分")
+                parts.append(f"{core.pretty_byte_count(int(byte_rate))}/s")
+                eta = state["speed"].eta_seconds(now, state["pending_bytes"], state["done_bytes"])
+                if eta is not None and byte_rate > 0:
+                    parts.append(f"预计剩余 {_format_eta(eta)}")
+            downloading = [item for item in self._states.values() if item["phase_kind"] == "download"]
+            if len(downloading) >= 2:
+                available = [rate for item in downloading if (rate := item["speed"].rates(now)) is not None]
+                if available:
+                    parts.append(f"全部 {sum(rate[0] for rate in available):.1f} 封/分")
+                    parts.append(f"{core.pretty_byte_count(int(sum(rate[1] for rate in available)))}/s")
+                else:
+                    parts.append("全部 —")
+            parts.extend(failures)
+            text = " · ".join(parts)
+        self._paint_status(text, state["status_error"])
+
+    def _status_tick(self) -> None:
+        """每秒只重算第二行；邮件列表与滚动位置不在这个刷新路径上。"""
+        self._refresh_status_line()
+        self._status_job = self.root.after(1000, self._status_tick)
 
     def _set_counts(self, text: str) -> None:
         """写计数行（截断显示），并同步进可见账户的状态字典。"""
@@ -5039,6 +5199,7 @@ class BackupApp:
 
     def _clear_message_rows(self) -> None:
         """清掉上一轮的邮件行；序号归零，斑马纹从第 1 行重新起算，空态提示重新挂出。"""
+        self._pending_message_rows.clear()
         if children := self.tree.get_children():
             self.tree.delete(*children)
         self._row_index = 0
@@ -5047,7 +5208,24 @@ class BackupApp:
             state["row_index"] = 0
         self._toggle_hint(self.list_ph, True)
 
-    def _insert_message_row(self, d: dict, row_index: int) -> None:
+    def _flush_message_rows(self) -> None:
+        """合批插入可见账户的消息，只在批次开始前已贴底时跟随到最后。"""
+        if not self._pending_message_rows:
+            return
+        pending = self._pending_message_rows
+        self._pending_message_rows = []
+        at_bottom = self.tree.yview()[1] >= 0.999
+        last_iid = ""
+        for data in pending:
+            self._row_index += 1
+            last_iid = self._insert_message_row(data, self._row_index)
+        state = self._visible_state()
+        if state is not None:
+            state["row_index"] = self._row_index
+        if at_bottom:
+            self.tree.see(last_iid)
+
+    def _insert_message_row(self, d: dict, row_index: int) -> str:
         """把一封邮件画进邮件列表的第 row_index 行（斑马纹按视觉行号奇偶）。"""
         dt: datetime = d["timestamp"]
         ts_fmt = "%m-%d %H:%M" if dt.year == datetime.now().year else "%Y-%m-%d %H:%M"
@@ -5059,17 +5237,9 @@ class BackupApp:
         if row_index == 1:
             self._toggle_hint(self.list_ph, False)
         tags = (ZEBRA_TAG,) if row_index % 2 == 0 else ()
-        follow = self._list_follows_new_rows()   # 必须在插入前判断：追加一行后列表就不再贴底
-        iid = self.tree.insert("", "end", values=(sender, subject or "(no subject)",
-                                                  dt.strftime(ts_fmt), d["folder"],
-                                                  core.pretty_byte_count(d["size"])), tags=tags)
-        if follow:
-            self.tree.see(iid)
-
-    def _list_follows_new_rows(self) -> bool:
-        """邮件列表贴着底部（或整列装得下）才跟随新行；用户往上翻过就原地不动。"""
-        bottom = self.tree.identify_row(self.tree.winfo_height() - 1)
-        return not bottom or not self.tree.next(bottom)
+        return self.tree.insert("", "end", values=(sender, subject or "(no subject)",
+                                                   dt.strftime(ts_fmt), d["folder"],
+                                                   core.pretty_byte_count(d["size"])), tags=tags)
 
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")
@@ -5326,6 +5496,7 @@ class BackupApp:
     def run(self) -> None:
         """启动事件泵与 Tk 主循环。"""
         self.root.after(100, self._pump)
+        self._status_job = self.root.after(1000, self._status_tick)
         self.root.mainloop()
 
 

@@ -1711,6 +1711,7 @@ def download_folder_with_reconnect(
     reuse_selection: bool = False,
     on_scan_changed: Callable[[FolderScan, dict[str, tuple[int, int]]], None] | None = None,
     stats: ReconnectStats | None = None,
+    on_backoff: Callable[[int, float], None] | None = None,
 ) -> tuple[imaplib.IMAP4, FolderDownloadState]:
     """Download one folder with bounded reconnect and UIDVALIDITY-aware resume.
 
@@ -1752,7 +1753,7 @@ def download_folder_with_reconnect(
         download(conn, remaining, attempt == 1 and overwrite)
 
     _, live = run_with_reconnect(server, connect, operation, should_stop=should_stop,
-                                 log=log, stats=stats)
+                                 log=log, stats=stats, on_backoff=on_backoff)
     return live, state
 
 
@@ -2096,6 +2097,7 @@ def run_with_reconnect[T](
     should_stop: Callable[[], bool] | None,
     log: logging.Logger,
     stats: ReconnectStats | None = None,
+    on_backoff: Callable[[int, float], None] | None = None,
 ) -> tuple[T, imaplib.IMAP4]:
     """Run one operation, rebuilding the connection after a dropped link (spec §5.7).
 
@@ -2154,6 +2156,8 @@ def run_with_reconnect[T](
             delay = random.uniform(0.0, cap)
             log.info("Reconnect attempt %d/%d in %.1fs (%s)", failures,
                      RECONNECT_MAX_ATTEMPTS, delay, stats.last_reason)
+            if on_backoff is not None:
+                on_backoff(failures, delay)
             if _wait_before_reconnect(delay, should_stop):
                 raise ReconnectStopped("stopped while waiting to reconnect")
             try:
