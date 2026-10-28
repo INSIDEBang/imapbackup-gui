@@ -3084,6 +3084,287 @@ def test_backup_account_threads_share_the_index_without_lock_failures(app, monke
         [record.message for record in caplog.records])
 
 
+# ------------------------------------------------ G 组：多账户真实并发（规格 §12.2）
+
+class _InFlightProbe:
+    """按账户统计同时在途的 IMAP 命令（LIST/SELECT/UID，跨该账户的每条连接）。"""
+
+    def __init__(self):
+        self._lock = g.threading.Lock()
+        self._current: dict[str, int] = {}
+        self.max: dict[str, int] = {}
+
+    def instrument(self, server, user: str) -> None:
+        for name in ("list", "select", "uid"):
+            self._wrap(server, user, name)
+
+    def _wrap(self, server, user: str, name: str) -> None:
+        original = getattr(server, name)
+
+        def call(*args, **kwargs):
+            with self._lock:
+                self._current[user] = self._current.get(user, 0) + 1
+                self.max[user] = max(self.max.get(user, 0), self._current[user])
+            try:
+                return original(*args, **kwargs)
+            finally:
+                with self._lock:
+                    self._current[user] -= 1
+
+        setattr(server, name, call)
+
+
+def _worker_account(tag: str, index: int = 0) -> dict:
+    """一个最小账户记录：只备份 INBOX 到 mbox，地址用虚构域名。"""
+    return {"id": f"acc-{tag}-{index}", "name": f"{tag}{index}", "user": f"{tag}-{index}@example.com",
+            "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+            "folders": ["INBOX"], "mbox": True, "eml": False}
+
+
+def _start_backup_workers(app, accounts, root, log, stop_events):
+    """每账户一个真实 worker 线程；线程里的异常带回主线程断言（同 WAL 用例口径）。"""
+    errors: list[BaseException] = []
+
+    def run(account: dict) -> None:
+        try:
+            app._backup_account(account, str(root / account["id"]), app.events, log,
+                                stop_events[account["id"]])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [g.threading.Thread(target=run, args=(account,), daemon=True) for account in accounts]
+    for thread in threads:
+        thread.start()
+    return threads, errors
+
+
+def _join_backup_workers(threads, errors) -> None:
+    for thread in threads:
+        thread.join(timeout=20)
+    assert not any(thread.is_alive() for thread in threads), "账户线程超时未结束"
+    assert errors == [], errors
+
+
+def _drain_worker_events(app) -> list[tuple]:
+    events: list[tuple] = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    return events
+
+
+def _done_events(events: list[tuple]) -> dict[str, tuple]:
+    return {event[1]: event for event in events if event[0] == "account_done"}
+
+
+def test_six_accounts_back_up_concurrently_without_shared_waiting(app, monkeypatch, tmp_path):
+    """G 组：6 个账户并发，正文请求真的同时在路上；每账户至多 1 个在途请求、1 条连接。"""
+    _drain_worker_events(app)
+    raws = _fake_mailbox("g6", 3)[0]
+    accounts = [_worker_account("g6", i) for i in range(6)]
+    barrier = g.threading.Barrier(len(accounts))
+    broken: list[BaseException] = []
+    connect_calls: list[str] = []
+    probe = _InFlightProbe()
+    servers: dict[str, UidFetchServer] = {}
+
+    def all_at_once(_server, _uids):
+        # 6 个 worker 的正文请求必须同时在路上：任何共享锁/队列/限速都会让这里等到破裂
+        try:
+            barrier.wait(timeout=10)
+        except g.threading.BrokenBarrierError as exc:
+            broken.append(exc)
+
+    def connect(cfg, _log):
+        connect_calls.append(cfg.user)
+        servers[cfg.user] = UidFetchServer(dict(raws), folders=("INBOX",), body_hook=all_at_once)
+        probe.instrument(servers[cfg.user], cfg.user)
+        return servers[cfg.user]
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    log = logging.getLogger("test.gui.g6-concurrency")
+    stop_events = {account["id"]: g.threading.Event() for account in accounts}
+    threads, errors = _start_backup_workers(app, accounts, tmp_path, log, stop_events)
+    _join_backup_workers(threads, errors)
+    events = _drain_worker_events(app)
+
+    assert broken == [], "6 个账户的正文请求没能同时在路上（疑似共享锁/队列/限速）"
+    assert sorted(connect_calls) == sorted(account["user"] for account in accounts), connect_calls
+    assert probe.max == {account["user"]: 1 for account in accounts}, probe.max
+    assert [event[0] for event in events].count("account_done") == len(accounts), events
+    done = _done_events(events)
+    assert set(done) == {account["id"] for account in accounts}, done
+    for account in accounts:
+        event = done[account["id"]]
+        assert event[2] == 3, (account["id"], event)      # 3 封全部备份
+        assert event[5] is False, event                   # 没有账户被停止
+        assert event[7:12] == (0, 0, 0, 0, 0), event      # 无取信/文件夹失败
+        mbox = g.core.mailbox.mbox(tmp_path / account["id"] / account["user"] / "INBOX.mbox")
+        try:
+            assert sorted(str(message.get("Message-Id")) for message in mbox) == \
+                [f"<g6{uid}@x>" for uid in (1, 2, 3)], account["id"]
+        finally:
+            mbox.close()
+
+
+def test_stopping_one_concurrent_account_leaves_the_others_running(app, monkeypatch, tmp_path):
+    """G 组：6 个账户同时在取正文时停一个，其余账户照常跑完（ADR 0012 每账户独立停止信号）。"""
+    _drain_worker_events(app)
+    raws = _fake_mailbox("gs", 3)[0]
+    accounts = [_worker_account("gs", i) for i in range(6)]
+    target, others = accounts[0], accounts[1:]
+    stop_target = g.threading.Event()
+    all_fetching = g.threading.Barrier(len(accounts))   # 六条连接必须同时在取正文
+    stop_fired = g.threading.Event()
+    broken: list[BaseException] = []
+    stalled: list[str] = []
+    probe = _InFlightProbe()
+
+    def hook_for(user: str):
+        def hook(_server, _uids):
+            try:
+                all_fetching.wait(timeout=10)
+            except g.threading.BrokenBarrierError as exc:
+                broken.append(exc)
+                return
+            if user == target["user"]:
+                stop_target.set()   # 正文已取回、写盘前看到停止：这一批整批丢弃（规格 §5.5）
+                stop_fired.set()
+            elif not stop_fired.wait(timeout=10):
+                stalled.append(user)
+        return hook
+
+    def connect(cfg, _log):
+        server = UidFetchServer(dict(raws), folders=("INBOX",), body_hook=hook_for(cfg.user))
+        probe.instrument(server, cfg.user)
+        return server
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    log = logging.getLogger("test.gui.g-stop-one")
+    stop_events = {account["id"]: g.threading.Event() for account in accounts}
+    stop_events[target["id"]] = stop_target
+    threads, errors = _start_backup_workers(app, accounts, tmp_path, log, stop_events)
+    _join_backup_workers(threads, errors)
+    events = _drain_worker_events(app)
+
+    assert broken == [] and stalled == [], (broken, stalled)
+    assert probe.max == {account["user"]: 1 for account in accounts}, probe.max
+    assert [event[0] for event in events].count("account_done") == len(accounts), events
+    done = _done_events(events)
+    assert set(done) == {account["id"] for account in accounts}, done
+    event = done[target["id"]]
+    assert event[5] is True, event          # 停止优先，不判失败
+    assert event[2] == 0, event             # 在途批被丢弃，一封都没写
+    for account in others:
+        event = done[account["id"]]
+        assert event[5] is False, (account["id"], event)   # 停止信号没有外溢
+        assert event[2] == 3, (account["id"], event)
+        assert event[3] == 0, (account["id"], event)       # 没有被算成「已存在」
+        assert event[7:12] == (0, 0, 0, 0, 0), (account["id"], event)
+
+
+def test_reconnect_of_one_account_does_not_hold_up_another(app, monkeypatch, tmp_path):
+    """G 组：6 个账户并发时 A 断线重连；其余 5 个在重连期间跑完，阶段与计数和干净跑法一致。"""
+    _drain_worker_events(app)
+    raws_a = _fake_mailbox("ra", 10)[0]
+    raws_b = _fake_mailbox("rb", 10)[0]
+    a = _worker_account("ga")
+    b_accounts = [_worker_account("gb", i) for i in range(5)]
+    b_done_sem = g.threading.Semaphore(0)     # 主线程每看到 B 账户跑完就放行一个
+    a_in_reconnect = g.threading.Event()
+    b_stalled: list[bool] = []
+    a_batches: list[list[int]] = []
+    a_waited: list[bool] = []
+    a_servers: list[UidFetchServer] = []
+    b_servers: dict[str, list[UidFetchServer]] = {account["id"]: [] for account in b_accounts}
+    b_ids = {account["user"]: account["id"] for account in b_accounts}
+    probe = _InFlightProbe()
+
+    def drop_second_batch(_server, uids):
+        # 第一批 8 封已落盘，第二批取回前断线：重连后只该补后两封（written 续跑）
+        a_batches.append(list(uids))
+        if len(a_batches) == 2:
+            raise imaplib.IMAP4.abort("socket error: EOF")
+
+    def b_waits_for_a_reconnect(_server, _uids):
+        # B 的正文请求等 A 进入重连再走：保证「B 在 A 重连期间跑完」不是碰巧的先后
+        if not a_in_reconnect.wait(timeout=10):
+            b_stalled.append(True)
+
+    def connect(cfg, _log):
+        if cfg.user == a["user"]:
+            server = UidFetchServer(dict(raws_a), folders=("INBOX",), body_hook=drop_second_batch)
+            if a_servers:
+                a_in_reconnect.set()
+                # A 的重连拨号必须等 5 个账户都跑完：B 若被 A 的重连挡住，这里会等到超时
+                a_waited.append(all(b_done_sem.acquire(timeout=15) for _ in b_accounts))
+            a_servers.append(server)
+            probe.instrument(server, cfg.user)
+            return server
+        server = UidFetchServer(dict(raws_b), folders=("INBOX",), body_hook=b_waits_for_a_reconnect)
+        probe.instrument(server, cfg.user)
+        b_servers[b_ids[cfg.user]].append(server)
+        return server
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)   # 退避取 0，不睡真实秒数
+    log = logging.getLogger("test.gui.g-reconnect-isolation")
+    accounts = [a, *b_accounts]
+    stop_events = {account["id"]: g.threading.Event() for account in accounts}
+    threads, errors = _start_backup_workers(app, accounts, tmp_path, log, stop_events)
+
+    events: list[tuple] = []
+    b_done: set[str] = set()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            event = app.events.get(timeout=0.05)
+        except g.queue.Empty:
+            continue
+        events.append(event)
+        if event[0] == "account_done" and event[1] != a["id"] and event[1] not in b_done:
+            b_done.add(event[1])
+            b_done_sem.release()
+            if len(b_done) == len(b_accounts):
+                break
+    b_finished_during_reconnect = len(b_done) == len(b_accounts)
+    _join_backup_workers(threads, errors)
+    events.extend(_drain_worker_events(app))
+    assert b_finished_during_reconnect, "B 账户没有在 A 断线重连期间跑完（疑似共享锁/等待）"
+
+    assert b_stalled == [], "B 的正文请求在等 A 进入重连时超时"
+    assert probe.max == {account["user"]: 1 for account in accounts}, probe.max
+    assert [event[0] for event in events].count("account_done") == len(accounts), events
+    done = _done_events(events)
+    assert set(done) == {account["id"] for account in accounts}, done
+
+    # 5 个 B 账户的整条事件流与干净跑法一致：两个阶段、一条 totals、10 条消息，重连没碰它们
+    for account in b_accounts:
+        b_events = [event for event in events if event[0] != "log" and event[1] == account["id"]]
+        assert [event[2] for event in b_events if event[0] == "phase"] == \
+            ["扫描 1/1：INBOX", "备份 INBOX（10 封）"], b_events
+        assert [(event[2], event[3]) for event in b_events if event[0] == "totals"] == [(10, 10)], b_events
+        assert len([event for event in b_events if event[0] == "message"]) == 10, b_events
+        event = done[account["id"]]
+        assert event[2] == 10, (account["id"], event)      # 10 封全部备份
+        assert event[3] == 0, (account["id"], event)       # 没有被算成「已存在」
+        assert event[5] is False, (account["id"], event)   # 没被 A 的断线连累停止
+        assert event[7:12] == (0, 0, 0, 0, 0), (account["id"], event)
+        assert len(b_servers[account["id"]]) == 1, b_servers[account["id"]]
+
+    assert a_waited == [True], a_waited       # A 的重连拨号确实等到了「5 个 B 都已跑完」
+    assert len(a_servers) == 2, a_servers     # 断一次、重连一次
+    assert a_servers[0].body_fetches == [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10]], a_servers[0].body_fetches
+    assert a_servers[1].body_fetches == [[9, 10]], a_servers[1].body_fetches   # 只补没写完的两封
+    assert done[a["id"]][2] == 10 and done[a["id"]][5] is False, done[a["id"]]
+    assert done[a["id"]][7:12] == (0, 0, 0, 0, 0), done[a["id"]]
+    mbox = g.core.mailbox.mbox(tmp_path / a["id"] / a["user"] / "INBOX.mbox")
+    try:
+        assert sorted(str(message.get("Message-Id")) for message in mbox) == \
+            sorted(f"<ra{uid}@x>" for uid in range(1, 11))
+    finally:
+        mbox.close()
+
+
 def test_entry_context_menu_has_three_actions(app, monkeypatch):
     """账户表单输入框共用一张右键菜单：剪切/复制/粘贴，动作与快捷键同一路径；不含全选。"""
     assert [app._entry_menu.entrycget(i, "label") for i in range(app._entry_menu.index("end") + 1)] == [
