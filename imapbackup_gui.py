@@ -46,6 +46,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -367,6 +368,12 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def _counts_text(server_total: int, pending_total: int, backed: int) -> str:
+    """计数行文案：界面镜像与各账户状态共用一种格式，切账户还原出的也是同一行字。"""
+    return (f"服务器共 {server_total} ｜ 待备份 {pending_total} ｜ "
+            f"已备份 {backed} / {pending_total}")
+
+
 def _ellipsize(full: str, budget: int, font: tkfont.Font) -> str:
     """按像素预算截断出「前缀 + …」。
 
@@ -595,6 +602,17 @@ def account_display(account: dict) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ACCOUNT_NAME_FALLBACK
+
+
+@dataclass
+class _FolderPlan:
+    """pass 1 得到的单个文件夹快照；重连重扫时 scan/pending 会被原地替换。"""
+
+    name: tuple[str, str, str, str]
+    scan: core.FolderScan
+    local_mbox: dict[str, str] | None
+    local_eml: dict[str, str] | None
+    pending: dict[str, tuple[int, int]]
 
 
 def _make_tray(events: queue.Queue[tuple], log: logging.Logger) -> imapbackup_tray.TrayHost | None:
@@ -4388,26 +4406,86 @@ class BackupApp:
         account_dir = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
         # 每个账户线程用自己的连接（规格 §5.6.6）；打不开就整轮退回内容扫描
         scan_index = core.ScanIndex.open(log) if basedir is not None or eml_root is not None else None
+        reconnect_stats = core.ReconnectStats()
+
+        def reconnect():
+            return core.connect_for_reconnect(cfg, log)
+
+        plans: list[_FolderPlan] = []
+
+        def totals() -> tuple[int, int]:
+            return (sum(len(p.scan.messages) for p in plans), sum(len(p.pending) for p in plans))
+
+        def run_plan(plan: _FolderPlan) -> None:
+            """下载一个文件夹；断连时由核心重连并按 UIDVALIDITY 续跑（规格 §5.7.6）。"""
+            nonlocal server
+            foldername, filename, eml_relpath, display = plan.name
+            mbox_relpath = f"{account_dir}/{filename}"
+            eml_rel = f"{account_dir}/{eml_relpath}"
+            label = mbox_relpath if basedir is not None else eml_rel
+            eml_folder_dir = eml_root / eml_rel if eml_root is not None else None
+            written: set[str] = set()
+
+            def do_download(conn, messages, overwrite_now):
+                # abort() 会关掉 writer：每次重连尝试都用新的 writer
+                index_mbox = (scan_index.writer("mbox", basedir, account_dir, display, mbox_relpath,
+                                                overwrite=overwrite_now)
+                              if scan_index is not None and basedir is not None else None)
+                index_eml = (scan_index.writer("eml", eml_root, account_dir, display, eml_rel,
+                                               overwrite=overwrite_now)
+                             if scan_index is not None and eml_root is not None else None)
+                core.download_messages(conn, label, messages, overwrite_now, True, False,
+                                       basedir, False, quiet=False, log=log,
+                                       eml_dir=eml_folder_dir, skip_mbox=plan.local_mbox,
+                                       skip_eml=plan.local_eml, foldername=display,
+                                       report=report, should_stop=stop_event.is_set,
+                                       written=written, progress=progress,
+                                       index_mbox=index_mbox, index_eml=index_eml)
+
+            def rescan(conn):
+                return core.scan_folder(conn, foldername, True, quiet=False, log=log, display=display)
+
+            def scan_changed(scan, pending):
+                plan.scan, plan.pending = scan, pending
+                eq.put(("totals", account_id, *totals()))
+
+            state = core.FolderDownloadState(plan.scan, plan.pending)
+            server, state = core.download_folder_with_reconnect(
+                server, reconnect, state, foldername=foldername, display=display,
+                local_mbox=plan.local_mbox, local_eml=plan.local_eml, written=written,
+                download=do_download, rescan=rescan, should_stop=stop_event.is_set,
+                log=log, on_scan_changed=scan_changed, stats=reconnect_stats)
+            plan.scan, plan.pending = state.scan, state.pending
+
         try:
-            names = core.get_names(server, False, True, quiet=False, log=log)
+            try:
+                names, server = core.run_with_reconnect(
+                    server, reconnect,
+                    lambda conn: core.get_names(conn, False, True, quiet=False, log=log),
+                    should_stop=stop_event.is_set, log=log, stats=reconnect_stats)
+            except core.ReconnectStopped:
+                names = []
             selected = [n for n in names if n[0] in wanted]
-            if not selected:
+            if not selected and not stop_event.is_set():
                 log.warning("账户 %s：选中的文件夹在服务器上都不存在，本次无备份", account_display(account))
 
             # pass 1: enumerate + incremental scan, so 待备份 total is known before any download
-            plans: list[tuple] = []
-            server_total = 0
-            pending_total = 0
             for i, n in enumerate(selected, 1):
                 if stop_event.is_set():
                     break
                 foldername, filename, eml_relpath, display = n
                 eq.put(("phase", account_id, f"扫描 {i}/{len(selected)}：{display}"))
                 try:
-                    scan = core.scan_folder(server, foldername, True, quiet=False, log=log, display=display)
+                    scan, server = core.run_with_reconnect(
+                        server, reconnect,
+                        lambda conn, folder=foldername, shown=display: core.scan_folder(
+                            conn, folder, True, quiet=False, log=log, display=shown),
+                        should_stop=stop_event.is_set, log=log, stats=reconnect_stats)
+                except core.ReconnectStopped:
+                    break
                 except core.SkipFolderException as e:
                     folder_failures += 1
-                    self.log.warning("%s：跳过（%s）", display, e)
+                    self.log.warning("%s：文件夹失败（%s）", display, e)
                     continue
                 # 两种格式各自判重：任一已选格式缺这封就算待备份，写盘时只补缺的那一份。
                 mbox_relpath = f"{account_dir}/{filename}"
@@ -4416,47 +4494,35 @@ class BackupApp:
                     scan_index, basedir, eml_root, account_dir, display, mbox_relpath, eml_rel,
                     overwrite=False, nospinner=True, quiet=False, log=log)
                 new = core.pending_messages(scan.messages, local_mbox, local_eml)
-                server_total += len(scan.messages)
-                pending_total += len(new)
-                plans.append((n, new, local_mbox, local_eml))
+                plans.append(_FolderPlan(n, scan, local_mbox, local_eml, new))
+            server_total, pending_total = totals()
             eq.put(("totals", account_id, server_total, pending_total))
 
-            # pass 2: re-select every folder with pending messages; pass 1 left the last one selected
+            # pass 2: re-select every folder with pending messages (spec §5.4) and download
             if pending_total > 0 and not stop_event.is_set():
                 if basedir is not None:
                     core.ensure_basedir(basedir)
-                    core.create_folder_structure([p[0] for p in plans], basedir, account_dir)
-                for n, new, local_mbox, local_eml in plans:
+                    core.create_folder_structure([p.name for p in plans], basedir, account_dir)
+                for plan in plans:
                     if stop_event.is_set():
                         break
-                    foldername, filename, eml_relpath, display = n
-                    if not new:
+                    if not plan.pending:
                         continue
-                    eq.put(("phase", account_id, f"备份 {display}（{len(new)} 封）"))
-                    typ, data = server.select(f'"{foldername}"', readonly=True)
-                    if typ != "OK":
-                        folder_failures += 1
-                        self.log.warning("%s：SELECT 失败 %s", display, data)
-                        continue
-                    mbox_relpath = f"{account_dir}/{filename}"
-                    eml_rel = f"{account_dir}/{eml_relpath}"
-                    label = mbox_relpath if basedir is not None else eml_rel
-                    eml_folder_dir = eml_root / eml_rel if eml_root is not None else None
-                    index_mbox = (scan_index.writer("mbox", basedir, account_dir, display, mbox_relpath)
-                                  if scan_index is not None and basedir is not None else None)
-                    index_eml = (scan_index.writer("eml", eml_root, account_dir, display, eml_rel)
-                                 if scan_index is not None and eml_root is not None else None)
+                    display = plan.name[3]
+                    eq.put(("phase", account_id, f"备份 {display}（{len(plan.pending)} 封）"))
                     try:
-                        core.download_messages(server, label, new, False, True, False,
-                                               basedir, False, quiet=False, log=log,
-                                               eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
-                                               foldername=display,
-                                               report=report, should_stop=stop_event.is_set,
-                                               progress=progress, index_mbox=index_mbox, index_eml=index_eml)
+                        run_plan(plan)
+                    except core.ReconnectStopped:
+                        break
+                    except core.SkipFolderException as e:
+                        folder_failures += 1
+                        self.log.warning("%s：文件夹失败（%s）", display, e)
+                        continue
                     except core.FolderFetchError as e:
                         folder_failures += 1
                         self.log.warning("%s：取信失败（%s）", display, e)
                         continue
+                server_total, pending_total = totals()
         finally:
             if scan_index is not None:
                 scan_index.close()
@@ -4632,12 +4698,15 @@ class BackupApp:
         if state["run_phase"] != PHASE_STOPPING and pending_total > 0:
             state["run_phase"] = PHASE_BACKING
             self._apply_account_icon(account_id)
+        # 计数与进度先记进账户自己的状态：后台账户的事件不走可见分支，
+        # 只刷界面镜像的话，切回来会停在上次可见时的「正在统计…」与 0 进度
+        maximum = max(pending_total, 1)
+        state["count_text"] = _counts_text(server_total, pending_total, state["backed"])
+        state["progress"] = (float(min(state["backed"], maximum)), float(maximum))
         if account_id != self._selected_account_id:
             return
         self.server_total, self.pending_total = server_total, pending_total
-        maximum = max(pending_total, 1)
         self.progress.configure(maximum=maximum, value=0)
-        state["progress"] = (0.0, float(maximum))
         self._refresh_counts()
         if pending_total == 0:
             self._set_status(UPTODATE_STATUS, error=False)
@@ -4648,6 +4717,9 @@ class BackupApp:
             return
         state["messages"].append(data)
         state["backed"] += 1
+        maximum = max(state["pending_total"], 1)
+        state["count_text"] = _counts_text(state["server_total"], state["pending_total"], state["backed"])
+        state["progress"] = (float(min(state["backed"], maximum)), float(maximum))
         if account_id != self._selected_account_id:
             return
         self.backed_count = state["backed"]
@@ -4955,8 +5027,7 @@ class BackupApp:
         # 多账户事件流下二者绝不脱节。镜像由可见账户的 totals/message 事件实时同步。
         maximum = max(self.pending_total, 1)
         value = max(0, min(self.backed_count, maximum))
-        self._set_counts(f"服务器共 {self.server_total} ｜ 待备份 {self.pending_total} ｜ "
-                         f"已备份 {self.backed_count} / {self.pending_total}")
+        self._set_counts(_counts_text(self.server_total, self.pending_total, self.backed_count))
         # range 只在真正变化时配（每封邮件都重配 maximum 会让原生进度条在几何抖动时填充错位）
         if float(self.progress.cget("maximum")) != float(maximum):
             self.progress.configure(maximum=maximum)
@@ -4988,10 +5059,17 @@ class BackupApp:
         if row_index == 1:
             self._toggle_hint(self.list_ph, False)
         tags = (ZEBRA_TAG,) if row_index % 2 == 0 else ()
+        follow = self._list_follows_new_rows()   # 必须在插入前判断：追加一行后列表就不再贴底
         iid = self.tree.insert("", "end", values=(sender, subject or "(no subject)",
                                                   dt.strftime(ts_fmt), d["folder"],
                                                   core.pretty_byte_count(d["size"])), tags=tags)
-        self.tree.see(iid)
+        if follow:
+            self.tree.see(iid)
+
+    def _list_follows_new_rows(self) -> bool:
+        """邮件列表贴着底部（或整列装得下）才跟随新行；用户往上翻过就原地不动。"""
+        bottom = self.tree.identify_row(self.tree.winfo_height() - 1)
+        return not bottom or not self.tree.next(bottom)
 
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")

@@ -12,6 +12,7 @@
 winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示环境的 runner 用
 `pytest -m "not gui"` 跳过。
 """
+import imaplib
 import json
 import logging
 import time
@@ -646,6 +647,46 @@ def test_message_rows_are_zebra_striped(app):
     assert app.tree.item(first, "values")[1] == "重跑首轮"
 
 
+def test_incoming_rows_keep_the_mail_list_viewport_when_scrolled_up(app):
+    """备份途中用户在往回翻：新邮件照常追加，视图停在原地；回到底部才恢复跟随。
+
+    回归自：_insert_message_row 对每一行都调 tree.see()，列表被一路拽到底——用户正看旧邮件时
+    每来一封就被夺走位置（用户截图：备份进行中列表自己往下跑）。
+    """
+    aid = app._selected_account_id
+    app._clear_message_rows()
+    app.events.put(("totals", aid, 60, 60))
+    for i in range(60):
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<scroll{i}@y>")))
+    pump(app)
+    app.root.update()
+    assert app.tree.yview()[1] == pytest.approx(1.0), app.tree.yview()   # 贴着底部就一路跟随
+
+    app.tree.yview_moveto(0)                       # 用户往上翻着看
+    app.root.update()
+    top = app.tree.get_children()[0]
+    top_y = app.tree.bbox(top)[1]
+
+    for i in range(3):
+        app.events.put(("message", aid, _message(index=61 + i, msg_id=f"<up{i}@y>")))
+    pump(app)
+    app.root.update()
+    assert app.tree.identify_row(top_y + 2) == top, "新行不能把正在浏览的位置推走"
+    assert app.tree.yview()[1] < 1.0
+
+    app.tree.yview_moveto(1)                       # 用户自己回到底部：跟随恢复
+    app.root.update()
+    app.events.put(("message", aid, _message(index=64, msg_id="<bottom@y>", subject="最新一封")))
+    pump(app)
+    app.root.update()
+    last = app.tree.get_children()[-1]
+    assert app.tree.item(last, "values")[1] == "最新一封"
+    assert app.tree.bbox(last), "回到底部后新行要露出来"
+    assert app.tree.yview()[1] == pytest.approx(1.0), app.tree.yview()
+
+    app._clear_message_rows()
+
+
 def test_run_done_summaries(app):
     """单账户跑完：完成 / 已是最新 / 已停止三种状态文案（账户各自独立，无批量结束事件）。"""
     aid = app._selected_account_id
@@ -689,6 +730,45 @@ def test_account_done_reports_partial_and_does_not_fill_progress(app):
     app._clear_message_rows()
     app._state(aid).update({"result": None, "result_at": None, "run_phase": g.PHASE_IDLE})
     app._apply_account_icon(aid)
+
+
+def test_background_account_restores_final_counts_when_switched_back(app, monkeypatch):
+    """后台跑完的账户切回来：计数与进度是最终数字，而不是启动时的「正在统计…」。
+
+    界面上的计数/进度只由可见账户的事件驱动；另一个账户在后台收到 totals/message/done
+    时，它自己的状态也得同步记账，否则切回来只剩状态行知道跑完了。
+    """
+    monkeypatch.setattr(app, "_maybe_load_folders", lambda _aid: None)   # 切账户不真的连服务器
+    first = current_account(app)
+    second = g.new_account()
+    second.update({"name": "后台账户", "user": "background@example.com", "server": "imap.example.com"})
+    app.accounts.append(second)
+    app._refresh_account_list()
+    app._switch_account(first["id"])
+    set_phase(app, first["id"], g.PHASE_BACKING)   # 另一个账户还在跑（截图里的场景）
+    aid = second["id"]
+    app._state(aid)                  # _launch_accounts 开跑前会为每个账户建状态
+
+    app.events.put(("account_begin", aid))
+    app.events.put(("totals", aid, 163, 46))
+    for i in range(7):
+        app.events.put(("message", aid, _message(index=i + 1, msg_id=f"<bg{i}>")))
+    app.events.put(("account_done", aid, 7, 39, 9.0, False, 46, 0, 0, 0, 0, 0))
+    pump(app)
+
+    app._switch_account(aid)
+    assert app.count_var.get() == "服务器共 163 ｜ 待备份 46 ｜ 已备份 7 / 46", app.count_var.get()
+    assert float(app.progress.cget("value")) == 7.0
+    assert float(app.progress.cget("maximum")) == 46.0
+    assert app.status_var.get().startswith("完成：本次备份 7 封"), app.status_var.get()
+    assert app._is_account_active(first["id"])      # 切过去看结果不影响另一个账户的备份
+
+    app._switch_account(first["id"])
+    set_phase(app, first["id"], g.PHASE_IDLE)
+    app.accounts.remove(second)
+    app._states.pop(aid, None)
+    app._refresh_account_list()
+    app._render_account_detail()
 
 
 def test_partial_folder_failure_overrides_up_to_date(app):
@@ -1159,9 +1239,12 @@ def test_folder_panel_wheel_covers_the_whole_panel(app):
 
     # 面板外（下方两页签）的滚轮不该动到文件夹面板，且它们自己照常滚
     app.notebook.select(app.list_tab)                   # 只有选中的页签才真的会滚
-    for _ in range(20):
+    # 行数按「一定装不下」给：20 行在 125% 缩放下正好塞满可视区（实测 424px / 429px），
+    # 那时滚不动是列表本来如此，不是窗口级入口吞了事件
+    for _ in range(60):
         app.tree.insert("", "end", values=("from", "主题", "2026-09-21", "INBOX", "1 KB"))
     app.root.update()
+    assert app.tree.yview()[1] < 1.0, "邮件列表要装不下，下面才谈得上滚动"
     for outside in (app.tree, app.log_text):
         at_top()
         assert wheel(outside) == 0
@@ -2648,6 +2731,9 @@ def test_backup_account_uses_email_for_the_account_directory(app, monkeypatch, t
     scanned: dict = {}
 
     class FakeServer:
+        def __init__(self):
+            self.untagged_responses = {"UIDVALIDITY": [b"777"]}
+
         def select(self, *_args, **_kwargs):
             return "OK", b""
 
@@ -2687,6 +2773,9 @@ def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch,
     calls: list[str] = []
 
     class FakeServer:
+        def __init__(self):
+            self.untagged_responses = {"UIDVALIDITY": [b"777"]}
+
         def select(self, *_args, **_kwargs):
             return "OK", b""
 
@@ -2728,6 +2817,9 @@ def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path
                "mbox": True, "eml": False}
 
     class FakeServer:
+        def __init__(self):
+            self.untagged_responses = {"UIDVALIDITY": [b"777"]}
+
         def select(self, *_args, **_kwargs):
             return "OK", b""
 
@@ -2847,6 +2939,89 @@ def test_backup_account_skips_a_non_selectable_container(app, monkeypatch, tmp_p
     assert done[6] == 0, done
     assert done[7:12] == (0, 0, 0, 0, 0), done
     assert container not in server.selects, server.selects
+
+
+def test_backup_account_reconnects_after_the_server_drops_the_connection(app, monkeypatch, tmp_path):
+    """正文 FETCH 中途断连（abort）不能判账户失败：重建连接、续跑剩余消息（规格 §5.7）。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    raws = {uid: (f"From: sender{uid}@example.com\r\nSubject: message {uid}\r\n"
+                   f"Message-Id: <r{uid}@x>\r\n\r\nbody {uid}\r\n").encode()
+            for uid in (1, 2, 3)}
+    connections: list[UidFetchServer] = []
+    dropped = False
+
+    def drop_once(_server, _uids):
+        nonlocal dropped
+        if not dropped:
+            dropped = True
+            raise imaplib.IMAP4.abort("socket error: EOF")
+
+    def connect(_cfg, _log):
+        server = UidFetchServer(dict(raws), folders=("INBOX",))
+        server.body_hook = drop_once
+        connections.append(server)
+        return server
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)  # 退避全抖动取 0，测试不等
+    account = {"id": "acc-reconnect", "name": "断线", "user": "r@example.com",
+               "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+               "folders": ["INBOX"], "mbox": True, "eml": False}
+    log = logging.getLogger("test.gui.reconnect")
+
+    app._backup_account(account, str(tmp_path), app.events, log, g.threading.Event())
+    events = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    assert [e for e in events if e[0] == "account_failed"] == [], events
+    done = [e for e in events if e[0] == "account_done"][-1]
+    assert done[2] == 3, done                     # 三封都备份，断连那批不算失败
+    assert done[7:12] == (0, 0, 0, 0, 0), done    # 没有取信失败/文件夹失败
+    assert len(connections) == 2, connections     # 第一次连接断，第二次续跑
+    mb = g.core.mailbox.mbox(tmp_path / account["user"] / "INBOX.mbox")
+    try:
+        assert sorted(m.get("Message-Id") for m in mb) == ["<r1@x>", "<r2@x>", "<r3@x>"]
+    finally:
+        mb.close()
+
+
+def test_backup_account_stops_instead_of_retrying_after_a_drop(app, monkeypatch, tmp_path):
+    """断线后用户已停止：账户按停止收尾，不再拨号，也不判账户失败（规格 §5.7.8）。"""
+    while not app.events.empty():
+        app.events.get_nowait()
+    raws = {uid: (f"From: sender{uid}@example.com\r\nSubject: message {uid}\r\n"
+                   f"Message-Id: <s{uid}@x>\r\n\r\nbody {uid}\r\n").encode()
+            for uid in (1, 2)}
+    connections: list[UidFetchServer] = []
+    stop_event = g.threading.Event()
+
+    def drop_and_stop(_server, _uids):
+        stop_event.set()
+        raise imaplib.IMAP4.abort("socket error: EOF")
+
+    def connect(_cfg, _log):
+        server = UidFetchServer(dict(raws), folders=("INBOX",))
+        server.body_hook = drop_and_stop
+        connections.append(server)
+        return server
+
+    monkeypatch.setattr(g.core, "connect_and_login", connect)
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)
+    account = {"id": "acc-stop-drop", "name": "断线停止", "user": "s@example.com",
+               "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+               "folders": ["INBOX"], "mbox": True, "eml": False}
+    log = logging.getLogger("test.gui.stop_drop")
+
+    app._backup_account(account, str(tmp_path), app.events, log, stop_event)
+    events = []
+    while not app.events.empty():
+        events.append(app.events.get_nowait())
+    assert [e for e in events if e[0] == "account_failed"] == [], events
+    done = [e for e in events if e[0] == "account_done"][-1]
+    assert done[5] is True, done       # 停止优先于重连
+    assert done[2] == 0, done          # 断线那批一封都没写
+    assert len(connections) == 1, connections   # 停止后不再拨号
 
 
 def test_backup_account_threads_share_the_index_without_lock_failures(app, monkeypatch, tmp_path, caplog):

@@ -113,6 +113,10 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 
 * Repeated runs reuse a rebuildable index at `%LOCALAPPDATA%\imapbackup-gui\index\scan-index.sqlite3` instead of re-reading every local `.mbox`/`.eml` file: when a folder's local files still match their recorded size and modification time, the already-backed-up Message-Ids come straight from the index. The index is only a cache, never the dedupe source of truth — deleting it loses no mail and simply makes the next run rescan local files; a missing, corrupt, locked or unwritable index logs a warning and falls back to the normal content scan, so the backup itself always continues. Each account run writes to the index only after its files are on disk, committing once per fetch batch, so an interrupted run can only cause extra rescanning, never skipped mail. The uninstaller removes the index together with the UI settings when "delete settings" is checked; run logs and backups are separate.
 
+**Bounded reconnect**
+
+* A dropped connection no longer aborts the account (GUI) or the whole run (CLI). Socket errors, server `BYE` and reset connections are retried up to 5 consecutive times with full-jitter backoff capped at 2/8/32/128/300 seconds; each retry is written to the daily run log. LIST and folder scans simply rerun on the fresh connection, while a folder download resumes from the messages it had not finished writing, so nothing is fetched or written twice. If the folder's `UIDVALIDITY` changed while disconnected, it is rescanned once against the existing local snapshots; a second change marks that folder failed instead of rescanning forever. Authentication failures, server `NO`/`BAD`, local disk-write errors and a user stop are never retried, and a stop request wins over any pending retry.
+
 **GUI entry point and the core seams it relies on**
 
 * Added `imapbackup_gui.py`, the Tkinter GUI entry point (see Quick Start — GUI above).
@@ -146,6 +150,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * Starting a backup first opens a connection-check dialog that probes each account in turn (sign in, list folders, sign out) and shows per-account status. Only after every account checks out does the dialog close on its own and the accounts sync **concurrently** — each with its own IMAP connection.
 * A wrong (or missing) password opens a password prompt, but only on explicit actions — starting a backup or clicking ⟳; silent background loads never pop it, they just leave the pane hint. Type the right password and retry that account, or skip it and carry on with the rest. A "save password" checkbox (checked by default) stores it encrypted; leaving it unchecked uses the password only for this run. Closing the check dialog cancels the whole backup.
 * Run log lines from concurrent accounts carry an account-name prefix so interleaved output stays readable; the mail list shows only the selected account's messages and switches with the selection.
+* The mail list follows new messages only while it is scrolled to the bottom. During a run, scrolling up to read older mail keeps the view where it is — incoming rows no longer pull it down — and scrolling back to the bottom resumes following. Switching accounts still opens that account's list at its latest message.
 
 **Resizable sidebars and capped layout**
 
