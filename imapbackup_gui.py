@@ -170,6 +170,7 @@ SETTINGS_SECTION_LIST_WIDTH = 160   # 左分类栏默认宽度(px)：右栏吃�
 PAGE_BACKUP = "backup"
 PAGE_SETTINGS = "settings"
 PAGE_LABELS = ((PAGE_BACKUP, "备份"), (PAGE_SETTINGS, "设置"))
+HELP_MENU_LABEL = "帮助"
 
 # 侧边栏拖拽调宽：备份页账户列表、设置页左栏与设置页账户列表各自独立、各自持久化（用户选定）。
 # 拖拽手柄压在「侧边栏右边框与右侧内容之间」的空隙带上（隐形、只留光标提示），手柄宽＝带宽，
@@ -317,6 +318,34 @@ ACTIVE_DELETE_WARN_TEXT = "请先停止该账户的备份，再删除账户。"
 SETTINGS_HINT_TEXT = ("托盘图标（任务栏右下角通知区域）从程序启动起常驻，直到退出：左键单击它恢复窗口，右键菜单可停止备份或退出。\n"
                       "Windows 11 默认把新托盘图标收进溢出区（任务栏的 ^ 小箭头里），找不到时点开那里看看。\n"
                       "在关闭对话框里勾选「记住我的选择」与在这里选定等价。")
+
+# 菜单栏「帮助 → 常见问题」：只读静态说明，不读账户、不联网、不写设置与日志（规格 §9.2）。
+FAQ_TITLE = "常见问题"
+FAQ_INTRO = ("这些说明适用于大多数邮箱服务商。各服务商的可见范围、下载限制和限速策略可能不同；"
+             "如果下面的通用原因都不适用，请以服务商的说明为准。")
+FAQ_ITEMS = (
+    ("Q1：服务器上明明有很多邮件，软件只看到很少，或者备份出来只有几封？",
+     "最常见的原因是邮箱服务商默认只让 IMAP 客户端看到最近一段时间的邮件（例如最近 30 天）。"
+     "请登录网页邮箱，在「设置 → 邮件收取/转发」或「账户 → POP/IMAP」中把可收取范围改为「全部邮件」，"
+     "保存后重新备份。\n\n"
+     "其他可能原因：只勾选了部分文件夹；文件夹在服务器上尚未同步完成；服务商关闭了 IMAP 访问。"
+     "修改可见范围后，首次备份需要重新扫描全部邮件，耗时会明显增加。"),
+    ("Q2：为什么会出现 0 封下载、下载失败或「取信失败」？",
+     "常见原因是服务商对短时间内的连接数、请求数或下载量做了限制，或服务器暂时返回错误。"
+     "软件会记录失败数量并继续处理其他邮件，不会修改服务器上的邮件；下次备份会再次尝试这些邮件。\n\n"
+     "如果失败集中在某个文件夹，可能是该文件夹的可见范围或权限受限；如果大量失败同时出现，"
+     "先检查网络，等待一段时间后再试。"),
+    ("Q3：为什么本地备份的邮件比服务器上显示的还多？",
+     "本地备份是追加式的：软件只新增缺失的邮件，不会因为服务器上的邮件被删除或移动而删除本地文件。"
+     "因此，服务器上删除过的邮件仍会留在本地备份中。\n\n"
+     "另外，不同客户端对文件夹的显示方式可能不同；请按文件夹和时间范围对照，"
+     "而不是只看服务器网页上的总数。"),
+    ("Q4：35 云邮（35 互联邮箱）需要特别注意什么？",
+     "据公开资料，35 云邮的 IMAP 默认只显示最近 30 天，需要在网页端把收取范围改为「全部邮件」，"
+     "否则软件看不到更早的邮件。35 云邮没有公开的限速数值；如果备份到几十封后明显变慢，"
+     "通常是服务端在限速，可以暂停一段时间再继续，已备份的邮件不会重复下载。"
+     "上面的通用说明同样适用。"),
+)
 
 
 class QueueLogHandler(logging.Handler):
@@ -1203,6 +1232,9 @@ class BackupApp:
         self._fit_font: tkfont.Font | None = None  # 量字宽的缓存，两行标签同一默认字体
         self._tip: tk.Toplevel | None = None
         self._tip_after: str | None = None  # 待发的气泡 after id，leave 时取消
+        self._faq_win: tk.Toplevel | None = None  # 「常见问题」单例窗
+        self._faq_text: tk.Text | None = None
+        self._faq_question_font: tkfont.Font | None = None  # 标签只存字体名，这里留引用
         self._wheel_accum = 0               # 面板内滚轮没攒满一格的余量（小 delta 的设备要用）
         self._entry_menu_target: tk.Entry | None = None  # 输入框菜单弹窗当刻的目标，动作命令读它
         self._tree_menu_target: tuple[str, int] | None = None  # 邮件菜单的复制目标：(行 id, 列号 1 起)
@@ -1210,7 +1242,7 @@ class BackupApp:
         self._column_config_fitted = False
         self._column_reflowing = False
 
-        # 页面外壳：备份页与设置页同格叠放，tkraise 切页；菜单栏两项直接切页（不开下拉）
+        # 页面外壳：备份页与设置页同格叠放，tkraise 切页；菜单栏两项直接切页（不开下拉），第三项「帮助」是下拉
         self.page_host = tk.Frame(self.root)
         self.page_host.pack(fill="both", expand=True)
         self.page_host.columnconfigure(0, weight=1)
@@ -1792,17 +1824,20 @@ class BackupApp:
     # ------------------------------------------------------- 页面外壳与设置页
 
     def _build_menubar(self) -> None:
-        """顶部菜单栏：备份 / 设置两项直接切页（tk 原生菜单栏，不做下拉、不弹新窗口）。
+        """顶部菜单栏：备份 / 设置两项直接切页，另带「帮助 → 常见问题」（静态说明窗）。
 
         Note:
             顶层可点项（radiobutton）在 Windows 上的呈现按「当前页带选中点」读，与主流应用的
-            导航栏同义；以后加页面只需往 PAGE_LABELS 里加一行。
+            导航栏同义；以后加页面只需往 PAGE_LABELS 里加一行。帮助是下拉 cascade，不参与切页。
         """
         self._page_var = tk.StringVar(value=PAGE_BACKUP)
         self.menubar = tk.Menu(self.root, tearoff=False)
         for name, label in PAGE_LABELS:
             self.menubar.add_radiobutton(label=label, variable=self._page_var, value=name,
                                          command=lambda page=name: self._show_page(page))
+        self.help_menu = tk.Menu(self.menubar, tearoff=False)
+        self.help_menu.add_command(label=FAQ_TITLE, command=self._show_faq)
+        self.menubar.add_cascade(label=HELP_MENU_LABEL, menu=self.help_menu)
         self.root.configure(menu=self.menubar)
 
     def _show_page(self, name: str) -> None:
@@ -4349,6 +4384,49 @@ class BackupApp:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 2
         win.geometry(f"+{max(x - deco_x, 0)}+{max(y - deco_y, 0)}")
         win.deiconify()
+
+    def _show_faq(self) -> None:
+        """打开「常见问题」只读窗；单例，已打开时只聚焦，不重复创建（规格 §9.2）。"""
+        win = self._faq_win
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        self._faq_win = win
+        win.title(FAQ_TITLE)
+        win.transient(self.root)
+        body = tk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        # 自然尺寸给窗口居中量宽用：Text 是 width=1 时请求宽只有几像素，_center_on_root 会摆偏
+        text = tk.Text(body, wrap="word", width=64, height=20, borderwidth=0,
+                       highlightthickness=0, padx=10, pady=10)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        if self._faq_question_font is None:
+            self._faq_question_font = _heading_font(tkfont.nametofont("TkDefaultFont"))
+        text.tag_configure("question", font=self._faq_question_font, spacing1=10)
+        text.insert("end", FAQ_INTRO + "\n\n")
+        for index, (question, answer) in enumerate(FAQ_ITEMS):
+            if index:
+                text.insert("end", "\n")
+            text.insert("end", question + "\n", "question")
+            text.insert("end", answer + "\n")
+        text.configure(state="disabled")
+        self._faq_text = text
+        win.protocol("WM_DELETE_WINDOW", self._close_faq)
+        win.bind("<Escape>", lambda _event: self._close_faq())
+        self._center_on_root(win)
+        win.focus_force()
+
+    def _close_faq(self) -> None:
+        """关闭「常见问题」窗并清掉单例引用；窗口已关闭时什么都不做。"""
+        win, self._faq_win, self._faq_text = self._faq_win, None, None
+        if win is not None and win.winfo_exists():
+            win.destroy()
 
     # ------------------------------------------------------------ 连接预检
 

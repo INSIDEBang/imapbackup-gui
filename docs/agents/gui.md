@@ -185,7 +185,8 @@
 - **备份中退出**：可见窗口的「退出程序」与托盘退出在有活动账户时走 `_confirm_and_quit()`（自绘确认窗，取消安全侧；隐藏时从托盘退出先恢复窗口）；确认后窗转等待态，`_begin_quit_after_stop` 停所有活动账户并 100ms 轮询，排空干净退、超 `QUIT_STOP_TIMEOUT_S` 强退；预检中不拦（daemon 不写盘）。
 - **设置落盘仍是「一次写」**：设置页单选钮与关闭对话框只改内存 `_ui_settings`，隐藏/退出/外部关闭三条路径各调一次 `_save_column_config()`；隐藏时先落盘再 `withdraw()`（此刻几何还读得对）。
 - **窗口状态记忆**：`_window_maximized` 由 `_restore_window_settings()` 初始化、`<Configure>` 在 state 为 `zoomed`/`normal` 时维护；`_window_settings()` 与 `_show_window()` 都读它，**不现场读 `wm state`**——最小化（iconic）或已隐藏（withdrawn）时现读会把最大化记丢（托盘菜单退出、外部关闭正是后一种）。`withdraw()`→`deiconify()` **不带回最大化**（真机实测：回来是 normal + 最大化前几何），隐藏恢复必须重放 `state("zoomed")`；iconic 分支保持 `state("normal")`——Tk 自己记得最小化前的状态（含最大化）。
-- **页面外壳**：`page_host` 下 `backup_page` / `settings_page` 同格叠放，`_show_page()` 是唯一切页入口（`tkraise` + 菜单栏选中态 + 设置页回填）；菜单栏两项是顶层 radiobutton（不开下拉）。设置页两栏＝左 `Listbox` 分类栏（`SETTINGS_SECTIONS` 表驱动：账户 / 备份 / 窗口与后台，固定 160px，`pack_propagate(False)`）+ 右详情（`tkraise` 切分类，进页默认落在第一个分类），**四边留白等宽**（`outer` 用 `padx=8, pady=8`：备份页的底边距由运行区自带，设置页下方没有内容，漏掉就会「三边等宽、底边贴边」）；设置页控件**不进 `_register`**。备份页则是「左账户列表栏（固定 160px，`pack(before=…)` 插到右栏左侧）+ 右详情」，右栏内部的配置区与运行区沿用同一条 8px 基线。
+- **页面外壳**：`page_host` 下 `backup_page` / `settings_page` 同格叠放，`_show_page()` 是唯一切页入口（`tkraise` + 菜单栏选中态 + 设置页回填）；菜单栏两项是顶层 radiobutton（不开下拉），第三项「帮助」是唯一的下拉菜单。
+- **常见问题（帮助 → 常见问题）**：`_show_faq()` 开单例 `tk.Toplevel`（已开时只 `deiconify` + `lift` + `focus_force`，不建第二个），`tk.Text(state="disabled")` + `Scrollbar` 只读可滚；Esc 与 `WM_DELETE_WINDOW` 都走 `_close_faq()` 并清空 `_faq_win` / `_faq_text`。文案是 `FAQ_INTRO` + `FAQ_ITEMS` 常量（规格 §9.2，Q1–Q3 通用原因、Q4 35 云邮殿后），打开与关闭**不读账户、不连服务器、不碰 DPAPI、不写设置与日志**——这条是硬约束，别在 `_show_faq()` 里加任何落盘或自检调用。旧规则「菜单栏只有两项、不开新窗口」已被这一项放宽，改菜单结构前先看规格 §6.5。设置页两栏＝左 `Listbox` 分类栏（`SETTINGS_SECTIONS` 表驱动：账户 / 备份 / 窗口与后台，固定 160px，`pack_propagate(False)`）+ 右详情（`tkraise` 切分类，进页默认落在第一个分类），**四边留白等宽**（`outer` 用 `padx=8, pady=8`：备份页的底边距由运行区自带，设置页下方没有内容，漏掉就会「三边等宽、底边贴边」）；设置页控件**不进 `_register`**。备份页则是「左账户列表栏（固定 160px，`pack(before=…)` 插到右栏左侧）+ 右详情」，右栏内部的配置区与运行区沿用同一条 8px 基线。
 - **菜单栏的客户区代价**：Windows 原生菜单栏在窗口落地前会吃掉几何高度（实测 736 → 716），`__init__` 末尾 `update()` 落地后再重设一次 `_target_geometry`（由 `_restore_window_settings()` 记录，含位置）；最大化时不再重设，避免碰坏 ADR 0008 的正常几何。
 
 相关回归：
@@ -197,6 +198,7 @@
 - `test_run_finished_in_background_only_sends_a_balloon` / `test_stopped_run_in_background_sends_the_stopped_balloon` / `test_failed_run_in_background_does_not_pop_a_dialog` / `test_visible_failure_of_the_selected_account_pops_a_dialog` / `test_hiding_while_active_never_asks` / `test_graceful_quit_polls_until_accounts_settle`
 - `test_tray_icon_is_up_from_startup` / `test_tray_state_follows_the_run` / `test_tray_show_event_restores_the_window` / `test_tray_stop_event_only_stops_a_running_backup`（停止所有） / `test_tray_quit_confirms_only_while_running` / `test_tray_host_wiring_is_available_on_windows`
 - `test_menubar_navigation_switches_pages` / `test_settings_page_lists_the_sections_and_selects_the_first` / `test_settings_page_offers_the_three_close_options` / `test_changing_the_option_lands_in_memory_then_on_disk_with_the_close`
+- `test_menubar_carries_the_pages_and_the_help_menu` / `test_faq_menu_opens_one_read_only_scrollable_window` / `test_faq_has_no_network_credential_settings_or_log_side_effects`（帮助菜单与 FAQ 单例、只读滚动、无副作用）
 
 ## 单实例与验证
 

@@ -5687,3 +5687,90 @@ def test_backup_carries_on_when_diagnostics_cannot_be_written(app, diag_env, dia
         assert sorted(str(m.get("Message-Id")) for m in mbox) == [f"<keep{uid}@x>" for uid in (1, 2, 3)]
     finally:
         mbox.close()
+
+
+# --------------------------------------------------------------------- FAQ
+
+def test_faq_menu_opens_one_read_only_scrollable_window(app):
+    """J 组：帮助 → 常见问题；Q1–Q4 文案、单例聚焦、只读可滚动、Esc/关闭都能关。"""
+    assert app.help_menu.entrycget(0, "label") == g.FAQ_TITLE
+    app.help_menu.invoke(0)
+    win = app._faq_win
+    assert win is not None and win.winfo_exists()
+    try:
+        assert win.title() == g.FAQ_TITLE
+        text = app._faq_text
+        assert text.cget("state") == "disabled"
+        content = text.get("1.0", "end-1c")
+        assert g.FAQ_INTRO in content
+        positions = [content.index(question) for question, _answer in g.FAQ_ITEMS]
+        assert positions == sorted(positions)
+        assert "35 云邮" in content
+        assert "最近 30 天" in content and "全部邮件" in content and "限速" in content
+        text.insert("1.0", "改动")              # disabled 状态的 Text 静默忽略写入
+        assert text.get("1.0", "end-1c") == content
+
+        win.geometry("420x220")                # 缩小窗口：内容必须溢出才能验证滚动
+        win.update()
+        assert text.yview()[1] < 1.0
+        text.yview_moveto(1.0)
+        assert text.yview()[1] > 0.99
+
+        first, calls = win, []
+        original_lift, original_focus = first.lift, first.focus_force
+        first.lift = lambda: calls.append("lift")
+        first.focus_force = lambda: calls.append("focus")
+        try:
+            app.help_menu.invoke(0)            # 重复点击：只聚焦，不建第二个窗口
+        finally:
+            first.lift, first.focus_force = original_lift, original_focus
+        assert app._faq_win is first
+        assert calls == ["lift", "focus"]
+
+        first.event_generate("<Escape>")
+        app.root.update()
+        assert app._faq_win is None and not first.winfo_exists()
+
+        app.help_menu.invoke(0)                # 关闭按钮：走 WM_DELETE_WINDOW
+        win = app._faq_win
+        assert win is not None and win.winfo_exists()
+        win.tk.eval(win.protocol("WM_DELETE_WINDOW"))
+        app.root.update()
+        assert app._faq_win is None and not win.winfo_exists()
+    finally:
+        app._close_faq()
+
+
+def test_faq_has_no_network_credential_settings_or_log_side_effects(
+        app, monkeypatch, tmp_path, _redirect_log_dir):
+    """J 组：打开/关闭 FAQ 不连服务器、不碰凭证、不写设置、不写日志。"""
+    settings = tmp_path / "treeview-columns.json"
+    monkeypatch.setattr(g, "COLUMN_CONFIG_PATH", settings)
+    settings.write_text('{"version": 3}\n', encoding="utf-8")
+    before_settings = (settings.read_text(encoding="utf-8"), settings.stat().st_mtime_ns)
+    before_logs = {path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+                   for path in _redirect_log_dir.iterdir()}
+
+    calls = []
+    monkeypatch.setattr(g.core, "connect_and_login", lambda *a, **k: calls.append("connect"))
+    monkeypatch.setattr(g, "_dpapi_decrypt", lambda *a, **k: calls.append("decrypt"))
+    monkeypatch.setattr(g, "_dpapi_encrypt", lambda *a, **k: calls.append("encrypt"))
+    monkeypatch.setattr(app, "_save_column_config", lambda: calls.append("save"))
+    records = []
+    log_handler = logging.Handler()
+    log_handler.emit = records.append
+    logging.getLogger().addHandler(log_handler)
+
+    try:
+        app.help_menu.invoke(0)
+        win = app._faq_win
+        assert win is not None and win.winfo_exists()
+        win.tk.eval(win.protocol("WM_DELETE_WINDOW"))
+        app.root.update()
+    finally:
+        logging.getLogger().removeHandler(log_handler)
+
+    assert calls == [] and records == []
+    assert (settings.read_text(encoding="utf-8"), settings.stat().st_mtime_ns) == before_settings
+    assert {path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+            for path in _redirect_log_dir.iterdir()} == before_logs

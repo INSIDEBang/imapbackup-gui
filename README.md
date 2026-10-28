@@ -169,6 +169,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * Recreating the tray host in the same process no longer reuses a stale Windows callback, which could lose commands or crash; closing its native window also removes the tray icon.
 * A second launch of an already-running (possibly hidden) instance now brings that instance's window to the front instead of silently exiting.
 * The window has a native menu bar with "备份" (backup) and "设置" (settings) entries that switch pages in place; the Settings page uses the usual two-pane layout — a category list on the left, the settings of the selected category on the right.
+* A third menu, 帮助 → 常见问题, opens a read-only, scrollable window of static answers: servers that only expose recent mail (with the 35 Mail (35 云邮) 30-day default and its unpublished throttling called out last), failed fetches, and local backups holding more mail than the server. It is a single window that only refocuses on repeat clicks, closes with Esc or its close button, and never reads accounts, connects, or writes settings or logs.
 
 **Windows installer**
 

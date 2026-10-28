@@ -555,9 +555,12 @@ def test_tray_quit_while_hidden_keeps_the_maximized_choice(app, tray, monkeypatc
 
 # ------------------------------------------------------------------ 页面与设置
 
-def test_menubar_carries_the_two_pages(app):
+def test_menubar_carries_the_pages_and_the_help_menu(app):
     labels = [app.menubar.entrycget(i, "label") for i in range(app.menubar.index("end") + 1)]
-    assert labels == [label for _name, label in g.PAGE_LABELS] == ["备份", "设置"]
+    assert labels == [*[label for _name, label in g.PAGE_LABELS], g.HELP_MENU_LABEL] == \
+        ["备份", "设置", "帮助"]
+    assert app.menubar.type(len(g.PAGE_LABELS)) == "cascade"
+    assert app.help_menu.entrycget(0, "label") == g.FAQ_TITLE
     assert app._page_var.get() == g.PAGE_BACKUP
 
 
