@@ -93,6 +93,12 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * `--folders` and `--exclude-folders` match on a delimiter-aware segment boundary, so `系统文件夹` selects that folder and its whole subtree while `Archived` is not caught by the prefix `Archive`. Previously only an exact full path matched, which made a Chinese leaf name silently select nothing; a selection that still matches nothing now exits non-zero and prints the folder list.
 * Mailboxes listed with `\Noselect` (QQ Mail's 其他文件夹 is one) are no longer backup targets; their children still are. QQ Mail accepts `SELECT` on that container without actually switching mailboxes, so the old code scanned the previously selected folder's messages under the container's name and left them pending forever. A folder whose `SELECT` response has no usable `UIDVALIDITY` is now skipped instead of scanned — RFC 3501 requires it, and without it the client cannot tell which mailbox was selected.
 
+**First-run throughput**
+
+* Folder scans ask for the full UID list (`UID SEARCH ALL`) and then read the `Message-Id` and size headers 500 UIDs at a time, so a folder with thousands of messages costs a handful of round trips instead of one per message. Messages without a `Message-Id` still get the same synthetic id as before, so existing backups keep matching.
+* Bodies are fetched in batches of at most 8 messages or 8 MiB (by `RFC822.SIZE`; a single larger message gets a batch of its own), and a batch is parsed in full before anything is written, so a bad response writes nothing from that batch. Each account keeps one connection with at most one request in flight, and batches follow each other with no sleep, token bucket or adaptive throttle — when a provider quietly slows down, the client keeps its fixed pace instead of guessing at a rate.
+* A batch the server rejects is retried once, then split into single-message fetches. A message that still comes back missing or malformed is counted as a fetch failure (取信失败) and left pending for the next run. A folder counts as a folder failure when it cannot be scanned or selected, when every message in a batch is refused outright, or when the server renumbers it twice in one run. Either way the rest of the account keeps going. The CLI runs the same scan, batch and reconnect code with the same flags, normal-path output and exit codes, and writes no diagnostic files.
+
 **Terminal output**
 
 * Right after connecting, the account's folders are listed as a bulleted list — one `- ` per line, parents before the folders nested under them — and the backup then runs in that same order, so the names can be read off the list and quoted in `--folders`. `--quiet` suppresses the listing.
@@ -108,6 +114,11 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * The CLI now writes a daily run log to `%LOCALAPPDATA%\imapbackup-gui\log\run-YYYY-MM-DD.log` — the same file and format as the GUI (ADR 0005). Connection, folder enumeration, per-folder sync and disconnect events are recorded; failures, unexpected exceptions and user interrupts are recorded too. An unopenable log directory degrades to a warning instead of aborting the backup, so logging is never a precondition for the backup itself.
 * Because the daily file holds both CLI and GUI runs, each run's version banner doubles as a delimiter marking where one run ends and the next begins.
 * Added `--version` for reporting the version without starting a backup. It answers before any required flag is checked and before logging is configured, so it leaves no run log entry.
+
+**Diagnostic sampling (GUI)**
+
+* While a backup runs, the GUI appends a local diagnostic sample to `%LOCALAPPDATA%\imapbackup-gui\log\diag-YYYY-MM-DD.jsonl`: one line per active account every 10 seconds, plus a line at once on every phase change and at account/run end. Each line holds phases, counts, rates, ETA, batch timings, fetch/folder failure counts, index hit/rebuild counters and reconnect counters; rates and ETA use the same 30-/60-second windows as the second status line.
+* The files never leave the machine and are never uploaded. Only a whitelist of fields is written — account address, server host, folder display names and numbers — never the account display name, subjects, senders, recipients, date headers, Message-Ids, `.eml` file names, attachment names, message bodies, passwords or tokens. Files older than 14 days are deleted on startup and at the start of each run, and only `diag-*.jsonl` is removed; `run-*.log`, settings and backups are untouched. If the file cannot be written, diagnostics are disabled for the session with one warning in the run log and the backup carries on. The CLI writes none.
 
 **Local scan index**
 

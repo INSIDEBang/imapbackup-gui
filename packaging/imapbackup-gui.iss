@@ -188,7 +188,7 @@ begin
     DeleteSettingsBox.Top := DeleteLogsBox.Top + DeleteLogsBox.Height;
     DeleteSettingsBox.Width := DeleteLogsBox.Width;
     DeleteSettingsBox.Height := DeleteLogsBox.Height;
-    DeleteSettingsBox.Caption := '同时删除界面设置与本地扫描索引（含已保存的账号与加密密码）';
+    DeleteSettingsBox.Caption := '同时删除界面设置（含已保存的账户与加密密码）与本地扫描索引';
     DeleteSettingsBox.Checked := True;
 
     HintLabel := TLabel.Create(Form);
