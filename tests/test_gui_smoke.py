@@ -130,6 +130,28 @@ def app():
             root.removeHandler(handler)
 
 
+@pytest.fixture(autouse=True)
+def _mapped_test_window(request):
+    if "app" in request.fixturenames:
+        root = request.getfixturevalue("app").root
+        if root.state() in {"iconic", "withdrawn"}:
+            root.deiconify()
+            root.update()
+
+
+@pytest.fixture
+def button_focus_requests(monkeypatch):
+    requests = []
+    original = ttk.Button.focus_set
+
+    def focus_set(button):
+        requests.append(button)
+        original(button)
+
+    monkeypatch.setattr(ttk.Button, "focus_set", focus_set)
+    return requests
+
+
 def current_account(app):
     """当前可见账户记录。"""
     return app._find_account(app._selected_account_id)
@@ -2999,7 +3021,7 @@ def test_account_row_checkbox_sits_next_to_the_name(app):
         check.winfo_rootx(), row["frame"].winfo_rootx())
 
 
-def test_account_list_scrolls_only_when_accounts_do_not_fit(app):
+def test_account_list_scrolls_only_when_accounts_do_not_fit(app, request):
     """账户列表：一屏装得下就没有滚条，装不下才挂出来；滚条贴面板内沿、滚轮一格一行。
 
     回归自：列表曾是直接打包的 Frame——账户多到装不下就被裁掉，既没有滚条也没有滚轮。
@@ -3007,6 +3029,18 @@ def test_account_list_scrolls_only_when_accounts_do_not_fit(app):
     """
     keep = list(app.accounts)
     first = current_account(app)
+
+    def restore():
+        app.accounts[:] = keep
+        app._states = {k: v for k, v in app._states.items() if k in {a["id"] for a in keep}}
+        app._selected_account_id = first["id"]
+        app._ui_settings["selected_account"] = first["id"]
+        app.root.geometry("960x736")
+        app._refresh_account_list()
+        app._render_account_detail()
+        app.root.update()
+
+    request.addfinalizer(restore)
     app.root.geometry("960x736")
     app.root.update()
     canvas = app.account_canvas
@@ -3055,13 +3089,7 @@ def test_account_list_scrolls_only_when_accounts_do_not_fit(app):
     assert app.account_scroll.winfo_ismapped(), (
         "窗口缩回去，滚条该自己冒出来", app.root.winfo_height(), canvas.winfo_height())
 
-    app.accounts[:] = keep
-    app._states = {k: v for k, v in app._states.items() if k in {a["id"] for a in keep}}
-    app._selected_account_id = first["id"]
-    app._ui_settings["selected_account"] = first["id"]
-    app._refresh_account_list()
-    app._render_account_detail()
-    app.root.update()
+    restore()
     assert app.accounts == keep
     assert not app.account_scroll.winfo_ismapped(), "行收进可视区后滚条该收起"
 
@@ -4656,11 +4684,23 @@ def test_account_save_reports_result_in_status_text(app, monkeypatch):
     assert str(app._account_save_status.cget("text")) == ""
 
 
-def test_new_account_dialog_creates_account_only_on_save(app, monkeypatch):
+def test_new_account_dialog_creates_account_only_on_save(app, monkeypatch, request, button_focus_requests):
     """新增弹窗（Q11–Q13）：叉掉/取消零副作用；校验红字留窗内，成功闪「已保存」自动关窗并选中。"""
     loaded: list[str] = []
     monkeypatch.setattr(app, "_maybe_load_folders", lambda aid: loaded.append(aid))
     main_id = app._selected_account_id
+    keep = list(app.accounts)
+
+    def restore():
+        for account in app.accounts:
+            if account not in keep:
+                app._states.pop(account["id"], None)
+        app.accounts[:] = keep
+        app._refresh_account_list()
+        app._switch_account(main_id)
+        app._refresh_edit_list(main_id)
+
+    request.addfinalizer(restore)
 
     # 取消路径（叉掉/取消同路）：零副作用
     real_ask = app._ask_new_account
@@ -4685,7 +4725,7 @@ def test_new_account_dialog_creates_account_only_on_save(app, monkeypatch):
         app.root.update()
         seen["equal_width"] = abs(save.winfo_width() - cancel.winfo_width()) <= 2   # messagebox 口径（Q4）
         seen["gap"] = cancel.winfo_rootx() - (save.winfo_rootx() + save.winfo_width())
-        seen["focus_is_save"] = dialog.focus_get() is save   # 默认按钮 = 保存（Q6/Q9）
+        seen["focus_is_save"] = button_focus_requests[-1:] == [save]   # 校验请求，不赌前台归属
         save.invoke()                              # 空表单：红字原因留在窗内
         seen["fail_text"] = str(status.cget("text"))
         seen["fail_fg"] = str(status.cget("foreground"))
@@ -4711,15 +4751,8 @@ def test_new_account_dialog_creates_account_only_on_save(app, monkeypatch):
     assert account["id"] == app._editing_account_id   # 进列表并选中（Q13）
     assert loaded and loaded[-1] == account["id"]
 
-    # 还原模块状态：删掉弹窗建的账户，选中回主账户
-    app.accounts.remove(account)
-    app._states.pop(account["id"], None)
-    app._refresh_account_list()
-    app._switch_account(main_id)
-    app._refresh_edit_list(main_id)
 
-
-def test_delete_confirm_is_a_self_drawn_centered_dialog(app):
+def test_delete_confirm_is_a_self_drawn_centered_dialog(app, button_focus_requests):
     """删除确认（Q14）：自绘弹窗居中到主窗口；X/Esc/取消不删，「删除」才删。"""
     account = g.new_account()
     account.update({"name": "待删账户", "user": "del@example.com", "server": "imap.example.com"})
@@ -4740,7 +4773,7 @@ def test_delete_confirm_is_a_self_drawn_centered_dialog(app):
                       if isinstance(w, ttk.Button) and str(w.cget("text")) == g.DELETE_DLG_CONFIRM)
         seen["equal_width"] = abs(cancel.winfo_width() - delete.winfo_width()) <= 2   # messagebox 口径（Q4）
         seen["gap"] = delete.winfo_rootx() - (cancel.winfo_rootx() + cancel.winfo_width())
-        seen["focus_is_cancel"] = dialog.focus_get() is cancel   # 默认按钮给安全侧（Q6）
+        seen["focus_is_cancel"] = button_focus_requests[-1:] == [cancel]
         dialog.destroy()   # X/Esc 同路：answer 为空 = 不删
 
     app.root.after(0, drive_cancel)

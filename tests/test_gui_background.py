@@ -7,7 +7,10 @@ Tcl 解释器（与库文件加载）反复起停，慢且脆；状态复位统�
 import contextlib
 import json
 import logging
+import os
+import subprocess
 import sys
+import textwrap
 import time
 
 import pytest
@@ -625,7 +628,7 @@ def test_invalid_close_action_falls_back_to_ask_and_warns(app, tmp_path, monkeyp
         app._ui_settings = original
 
 
-def test_tray_host_wiring_is_available_on_windows():
+def test_tray_host_wiring_is_available_on_windows(monkeypatch):
     """托盘宿主接线（ctypes 全套）：真造一个宿主，挂出图标、走通二次启动唤起通道再收掉。
 
     Note:
@@ -634,6 +637,7 @@ def test_tray_host_wiring_is_available_on_windows():
     """
     if sys.platform != "win32":
         pytest.skip("托盘只在 Windows 上可用")
+    monkeypatch.setattr(g.imapbackup_tray, "WINDOW_CLASS_NAME", f"imapbackup-tray-test-{os.getpid()}")
     host = g.imapbackup_tray.create_tray(
         icon_path=g._window_icon_path(), tooltip="tray-test",
         on_show=lambda: None, on_stop=lambda: None, on_quit=lambda: None,
@@ -646,3 +650,80 @@ def test_tray_host_wiring_is_available_on_windows():
         assert g.imapbackup_tray.request_restore()  # 找到隐藏消息窗口并投递唤起请求
     finally:
         host.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 window procedure lifetime")
+@pytest.mark.parametrize("case", ["retained", "collected", "duplicate", "create_failed", "native_close"])
+def test_tray_window_class_lifetime(case):
+    script = textwrap.dedent('''
+        import gc
+        import logging
+        import os
+        import sys
+        import threading
+        import imapbackup_tray as tray
+
+        tray.WINDOW_CLASS_NAME = "imapbackup-tray-test-" + str(os.getpid())
+
+        def make(event):
+            return tray.create_tray(icon_path=None, tooltip="tray-test",
+                                    on_show=event.set, on_stop=lambda: None,
+                                    on_quit=lambda: None, log=logging.getLogger("tray-test"))
+
+        case = sys.argv[1]
+        api = tray._get_api()
+        if case == "create_failed":
+            original = api.user32.CreateWindowExW
+            api.user32.CreateWindowExW = lambda *args: None
+            try:
+                assert make(threading.Event()) is None
+            finally:
+                api.user32.CreateWindowExW = original
+
+        previous_event, current_event = threading.Event(), threading.Event()
+        previous = make(previous_event)
+        assert previous is not None
+        if case == "duplicate":
+            assert make(threading.Event()) is None
+            assert tray.request_restore()
+            assert previous_event.wait(1)
+            previous_event.clear()
+        if case == "native_close":
+            assert previous.show("tray-test")
+            commands = []
+            original = api.shell32.Shell_NotifyIconW
+
+            def notify(command, data):
+                commands.append(command)
+                return original(command, data)
+
+            api.shell32.Shell_NotifyIconW = notify
+            assert api.user32.PostMessageW(previous._hwnd, tray.WM_CLOSE, 0, 0)
+            previous._thread.join(2)
+            assert not previous._thread.is_alive()
+            assert tray.NIM_DELETE in commands
+            api.shell32.Shell_NotifyIconW = original
+        previous.close()
+        assert not previous._thread.is_alive()
+        current = make(current_event)
+        assert current is not None
+        if case == "collected":
+            del previous
+            gc.collect()
+        try:
+            assert tray.request_restore()
+            assert current_event.wait(1), "restore used a stale window procedure"
+            assert not previous_event.is_set()
+            assert current.show("tray-test")
+        finally:
+            current.close()
+        assert not current._thread.is_alive()
+        assert not tray.request_restore()
+    ''')
+    result = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", script, case],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, encoding="utf-8", timeout=20)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Windows fatal exception" not in output, output

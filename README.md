@@ -166,6 +166,7 @@ This fork adds capabilities on top of upstream and ships as a per-user Windows i
 * The tray icon lives in the notification area for the whole session (starting with the program, removed only when it exits), so the app's presence and its right-click menu — show / stop backup / quit — are always reachable; it is also the way back in while the window is hidden. A tooltip and the greying of "stop backup" follow whether a run is in progress.
 * When a run finishes, stops or fails while the window is hidden, the window stays hidden and only a tray balloon reports the result; clicking the balloon or the icon brings the results back. Quitting from the tray while a run is in progress asks for confirmation first.
 * If the tray is unavailable (or the icon cannot be created), "hide to background" degrades to minimising to the taskbar so there is always a way back to the window.
+* Recreating the tray host in the same process no longer reuses a stale Windows callback, which could lose commands or crash; closing its native window also removes the tray icon.
 * A second launch of an already-running (possibly hidden) instance now brings that instance's window to the front instead of silently exiting.
 * The window has a native menu bar with "备份" (backup) and "设置" (settings) entries that switch pages in place; the Settings page uses the usual two-pane layout — a category list on the left, the settings of the selected category on the right.
 

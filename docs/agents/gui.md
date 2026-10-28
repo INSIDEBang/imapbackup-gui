@@ -8,7 +8,8 @@
 - 工作线程执行连接、枚举、扫描、下载和 logout，通过 `queue` 回投事件；主线程以 `after()` 轮询。工作线程不直接访问 widget。
 - GUI 通过结构化 `report` 获取进度，通过 `should_stop` 协作停止；调用核心时保持 `quiet=False`、`nospinner=True`。具体契约见 ADR 0003。
 - 停止只在下一封消息或下一个文件夹前生效，当前 I/O 可能持续到 socket 超时。界面只使用“停止”，不引入“暂停/继续”语义。
-- **已知竞态（测试基建）**：`test_gui_background` 的真托盘用例（`test_tray_host_wiring_is_available_on_windows`）收尾后，同进程再建 Tk 根可能报 `invalid command name "tcl_findLibrary"`（整个后一模块 fixture 失败）——托盘线程与解释器创建的既有竞态，与业务代码无关；分开跑两个文件或重跑即可，退出时的 access violation 打印同源。
+- **托盘回调寿命**：Win32 窗口类在窗口销毁后仍持有 WNDPROC 地址；宿主必须先销毁窗口、注销自己注册的类，再允许回调回收。重复宿主不得复用别人的窗口类。原生回归在子进程中同时检查退出码和 stderr：access violation 可能伴随零退出码。
+- **Tk 测试环境**：Windows 下默认 fd 捕获曾在跨模块重建 Tk 时触发 Tcl 库加载失败，无真托盘也可复现；`pytest.ini` 使用 sys 捕获规避，底层 Tcl 原因尚未确定。布局测试在用例开始时恢复被最小化或隐藏的共享窗口；临时账户通过 finalizer 清理，避免断言失败污染后续用例。
 
 ## 界面设置与恢复
 
