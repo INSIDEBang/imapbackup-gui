@@ -38,6 +38,7 @@ import imaplib
 import logging
 import mailbox
 import os
+import random
 import re
 import shutil
 import socket
@@ -105,6 +106,25 @@ class BackupWriteError(Exception):
     Deliberately not an OSError subclass: reconnect classification treats OSError as
     a connection-level failure, and a disk error must not look like a dropped link.
     """
+
+
+class ReconnectStopped(Exception):
+    """Stop was requested while reconnecting; not a failure and not retried."""
+
+
+class ReconnectAuthError(Exception):
+    """A reconnect reached the server but authentication failed; never retried."""
+
+
+@dataclass
+class ReconnectStats:
+    """Per-run reconnect counters; diagnostics read them, backup never depends on them."""
+
+    attempts: int = 0
+    successes: int = 0
+    exhausted: bool = False
+    uidvalidity_changes: int = 0
+    last_reason: str | None = None
 
 
 @dataclass
@@ -279,6 +299,10 @@ FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate pe
 SCAN_PAGE_UIDS = 500
 FETCH_BATCH_MAX_MESSAGES = 8
 FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
+RECONNECT_MAX_ATTEMPTS = 5
+RECONNECT_BACKOFF_BASE_S = 2.0
+RECONNECT_BACKOFF_CAP_S = 300.0
+RECONNECT_STOP_POLL_S = 0.2
 SCAN_MSGID_FETCH_ITEMS = "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
 SCAN_FALLBACK_FETCH_ITEMS = "(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])"
 BODY_FETCH_ITEMS = "(UID INTERNALDATE BODY.PEEK[])"
@@ -1660,6 +1684,78 @@ def scan_folder(server: imaplib.IMAP4, foldername: str, nospinner: bool, quiet: 
     return FolderScan(messages, uidvalidity)
 
 
+@dataclass
+class FolderDownloadState:
+    """One folder's remote snapshot across reconnect attempts (spec §5.7.6)."""
+
+    scan: FolderScan
+    pending: dict[str, tuple[int, int]]
+    uidvalidity_checked: bool = False
+
+
+def download_folder_with_reconnect(
+    server: imaplib.IMAP4,
+    connect: Callable[[], imaplib.IMAP4],
+    state: FolderDownloadState,
+    *,
+    foldername: str,
+    display: str,
+    local_mbox: dict[str, str] | None,
+    local_eml: dict[str, str] | None,
+    written: set[str],
+    download: Callable[[imaplib.IMAP4, dict[str, tuple[int, int]], bool], None],
+    rescan: Callable[[imaplib.IMAP4], FolderScan],
+    should_stop: Callable[[], bool] | None,
+    log: logging.Logger,
+    overwrite: bool = False,
+    reuse_selection: bool = False,
+    on_scan_changed: Callable[[FolderScan, dict[str, tuple[int, int]]], None] | None = None,
+    stats: ReconnectStats | None = None,
+) -> tuple[imaplib.IMAP4, FolderDownloadState]:
+    """Download one folder with bounded reconnect and UIDVALIDITY-aware resume.
+
+    Each attempt SELECTs the folder and compares UIDVALIDITY with the snapshot
+    (except a CLI first attempt on the selection its scan just made). A change
+    rescans the remote side once, reuses the local snapshots and subtracts
+    ``written`` before fetching; a second change is a folder failure. ``download``
+    receives the live connection, the messages still missing, and whether this is
+    the first attempt's overwrite, so the caller can rebuild per-attempt sinks.
+    """
+    stats = stats if stats is not None else ReconnectStats()
+    attempt = 0
+
+    def operation(conn: imaplib.IMAP4) -> None:
+        nonlocal attempt
+        reuse = attempt == 0 and reuse_selection
+        attempt += 1
+        if not reuse:
+            typ, data = conn.select(f'"{foldername}"', readonly=True)
+            if typ != "OK":
+                raise SkipFolderException(f"SELECT failed: {data}")
+            uidvalidity = _read_uidvalidity(conn, display, log)
+            if uidvalidity is None:
+                raise SkipFolderException("server did not report a usable UIDVALIDITY")
+            if uidvalidity != state.scan.uidvalidity:
+                if state.uidvalidity_checked:
+                    raise FolderFetchError("UIDVALIDITY changed twice during one folder run")
+                state.scan = rescan(conn)
+                state.uidvalidity_checked = True
+                stats.uidvalidity_changes += 1
+                state.pending = {msg_id: item for msg_id, item in
+                                 pending_messages(state.scan.messages, local_mbox, local_eml).items()
+                                 if msg_id not in written}
+                log.warning("%s: UIDVALIDITY changed; rescanned the folder", display)
+                if on_scan_changed is not None:
+                    on_scan_changed(state.scan, state.pending)
+        remaining = {msg_id: item for msg_id, item in state.pending.items()
+                     if msg_id not in written}
+        download(conn, remaining, attempt == 1 and overwrite)
+
+    _, live = run_with_reconnect(server, connect, operation, should_stop=should_stop,
+                                 log=log, stats=stats)
+    return live, state
+
+
 type ParenItem = str | list[ParenItem]
 
 
@@ -1944,6 +2040,142 @@ def connect_and_login(cfg: Config, log: logging.Logger) -> imaplib.IMAP4:
         raise SystemExit(f"IMAP authentication failed: {e}") from e
 
 
+def connect_for_reconnect(cfg: Config, log: logging.Logger) -> imaplib.IMAP4:
+    """Fresh connection for a reconnect attempt, with auth failures separated out.
+
+    ``connect_and_login`` reports every failure as SystemExit; only DNS/connection
+    failures are worth retrying, and a bad password must stop the budget at once
+    instead of burning five attempts.
+    """
+    try:
+        return connect_and_login(cfg, log)
+    except SystemExit as exc:
+        message = str(exc)
+        if message.startswith("IMAP authentication failed"):
+            raise ReconnectAuthError(message) from exc
+        if message.startswith(("DNS lookup failed", "Connection to '")):
+            raise ConnectionError(message) from exc
+        raise
+
+
+def _connection_error_reason(exc: BaseException) -> str | None:
+    """Classify one exception as retryable connection loss (spec §5.7.3)."""
+    if isinstance(exc, BackupWriteError):
+        return None
+    if isinstance(exc, imaplib.IMAP4.abort):
+        return "abort"
+    if isinstance(exc, OSError):
+        return "oserror"
+    if isinstance(exc, imaplib.IMAP4.error) and "bye" in str(exc).lower():
+        return "bye"
+    return None
+
+
+def _close_connection(server: imaplib.IMAP4) -> None:
+    with contextlib.suppress(Exception):
+        server.shutdown()
+
+
+def _wait_before_reconnect(delay: float, should_stop: Callable[[], bool] | None) -> bool:
+    """Sleep in 0.2 s slices; True means the user asked to stop."""
+    deadline = time.monotonic() + delay
+    while True:
+        if should_stop is not None and should_stop():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(RECONNECT_STOP_POLL_S, remaining))
+
+
+def run_with_reconnect[T](
+    server: imaplib.IMAP4,
+    connect: Callable[[], imaplib.IMAP4],
+    operation: Callable[[imaplib.IMAP4], T],
+    *,
+    should_stop: Callable[[], bool] | None,
+    log: logging.Logger,
+    stats: ReconnectStats | None = None,
+) -> tuple[T, imaplib.IMAP4]:
+    """Run one operation, rebuilding the connection after a dropped link (spec §5.7).
+
+    ``operation`` receives a usable connection and owns its SELECT, UIDVALIDITY
+    check and resume. Only abort/OSError/BYE are retried; every other exception
+    (write errors, folder failures, auth failures, stop) propagates unchanged.
+    A successful operation returns the live connection so the caller can keep
+    using it; the consecutive-failure budget belongs to this call, so the next
+    operation starts fresh. Stop wins over the next retry and over exhaustion.
+    """
+    stats = stats if stats is not None else ReconnectStats()
+    current = server
+    failures = 0
+    last_error: Exception | None = None
+    while True:
+        if should_stop is not None and should_stop():
+            _close_connection(current)
+            raise ReconnectStopped("stopped before the next request")
+        try:
+            if getattr(current, "state", None) == "LOGOUT":
+                # 上一次调用把新连接也关掉后，调用方手里只剩已注销的旧连接；
+                # 直接发命令只会得到不可重试的 IMAP4.error("illegal in state LOGOUT")
+                raise imaplib.IMAP4.abort("connection is already closed")
+            result = operation(current)
+        except ReconnectStopped:
+            _close_connection(current)
+            raise
+        except Exception as exc:
+            reason = _connection_error_reason(exc)
+            if reason is None:
+                if current is not server:
+                    _close_connection(current)   # do not leak a replacement link
+                raise
+            last_error = exc
+            stats.last_reason = reason
+            log.warning("Connection lost (%s); reconnecting", reason)
+            _close_connection(current)
+        else:
+            if failures:
+                log.info("Reconnected; resuming after %d failed attempt(s)", failures)
+            return result, current
+
+        while True:
+            # 停止优先于耗尽：最后一跳失败后用户已点停止时，按停止收口而不是记一次失败
+            if should_stop is not None and should_stop():
+                raise ReconnectStopped("stopped before the next reconnect attempt")
+            failures += 1
+            if failures > RECONNECT_MAX_ATTEMPTS:
+                stats.exhausted = True
+                log.error("Reconnect exhausted after %d attempts (%s)",
+                          RECONNECT_MAX_ATTEMPTS, stats.last_reason)
+                assert last_error is not None
+                raise last_error
+            stats.attempts += 1
+            cap = min(RECONNECT_BACKOFF_CAP_S, RECONNECT_BACKOFF_BASE_S * 4 ** (failures - 1))
+            delay = random.uniform(0.0, cap)
+            log.info("Reconnect attempt %d/%d in %.1fs (%s)", failures,
+                     RECONNECT_MAX_ATTEMPTS, delay, stats.last_reason)
+            if _wait_before_reconnect(delay, should_stop):
+                raise ReconnectStopped("stopped while waiting to reconnect")
+            try:
+                fresh = connect()
+            except ReconnectAuthError:
+                raise
+            except Exception as exc:
+                reason = _connection_error_reason(exc)
+                if reason is None:
+                    raise
+                last_error = exc
+                stats.last_reason = reason
+                log.warning("Reconnect attempt %d failed (%s)", failures, reason)
+                continue
+            if should_stop is not None and should_stop():
+                _close_connection(fresh)
+                raise ReconnectStopped("stopped after reconnecting")
+            stats.successes += 1
+            current = fresh
+            break
+
+
 def ensure_basedir(path: Path) -> None: path.mkdir(parents=True, exist_ok=True)
 
 
@@ -1962,12 +2194,20 @@ def main(argv: list[str] | None = None) -> int:
     # log, which now holds both CLI and GUI runs.
     log.info("imapbackup v%s starting", __version__)
     scan_index: ScanIndex | None = None
+    reconnect_stats = ReconnectStats()
+
+    def reconnect() -> imaplib.IMAP4:
+        return connect_for_reconnect(cfg, log)
+
     # Starts before connect_and_login so connection and authentication
     # failures reach the run log too; argparse failures still happen earlier,
     # before any handler exists (see ADR 0005).
     try:
         server = connect_and_login(cfg, log)
-        names = get_names(server, cfg.thunderbird, cfg.nospinner, quiet=cfg.quiet, log=log)
+        names, server = run_with_reconnect(
+            server, reconnect,
+            lambda s: get_names(s, cfg.thunderbird, cfg.nospinner, quiet=cfg.quiet, log=log),
+            should_stop=None, log=log, stats=reconnect_stats)
         # `--folders ""` must fail loudly, not be read as "no filter"
         include = cfg.parsed_folders() if cfg.folders is not None else None
         exclude = cfg.parsed_excludes() if cfg.exclude_folders else []
@@ -1992,6 +2232,54 @@ def main(argv: list[str] | None = None) -> int:
         total_folders = len(names)
         total_backed = total_skipped = total_fetch_failed = folder_failures = 0
         run_t0 = time.monotonic()
+
+        def backup_folder(folder: str, filename: str, eml_relpath: str, display: str,
+                          progress: DownloadProgress,
+                          current: imaplib.IMAP4) -> tuple[imaplib.IMAP4, FolderScan, dict[str, tuple[int, int]]]:
+            remote, live = run_with_reconnect(
+                current, reconnect,
+                lambda s: scan_folder(s, folder, cfg.nospinner, quiet=cfg.quiet, log=log, display=display),
+                should_stop=None, log=log, stats=reconnect_stats)
+            mbox_relpath = f"{account}/{filename}"
+            eml_rel = f"{account}/{eml_relpath}"
+            # per-format incremental: pending iff any selected format lacks the message;
+            # download_messages then writes only the sinks that still lack it
+            local_mbox, local_eml = local_snapshots(
+                scan_index, cfg.basedir, cfg.eml_dir, account, display,
+                mbox_relpath, eml_rel, overwrite=cfg.overwrite,
+                nospinner=cfg.nospinner, quiet=cfg.quiet, log=log)
+            eml_folder_dir = cfg.eml_dir / eml_rel if cfg.eml_dir is not None else None
+            new_messages = pending_messages(remote.messages, local_mbox, local_eml)
+            label = mbox_relpath if cfg.basedir is not None else eml_rel
+            written: set[str] = set()
+
+            def do_download(conn: imaplib.IMAP4, messages: dict[str, tuple[int, int]],
+                            overwrite_now: bool) -> None:
+                # a new writer per attempt: abort() closes the previous one
+                index_mbox = (scan_index.writer("mbox", cfg.basedir, account, display,
+                                                mbox_relpath, overwrite_now)
+                              if scan_index is not None and cfg.basedir is not None else None)
+                index_eml = (scan_index.writer("eml", cfg.eml_dir, account, display,
+                                               eml_rel, overwrite_now)
+                             if scan_index is not None and cfg.eml_dir is not None else None)
+                download_messages(conn, label, messages, overwrite_now, cfg.nospinner,
+                                  cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
+                                  eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
+                                  foldername=display, verbose=cfg.verbose, compact=cfg.compact,
+                                  written=written, progress=progress,
+                                  index_mbox=index_mbox, index_eml=index_eml)
+
+            def rescan(conn: imaplib.IMAP4) -> FolderScan:
+                return scan_folder(conn, folder, cfg.nospinner, quiet=cfg.quiet, log=log, display=display)
+
+            state = FolderDownloadState(remote, new_messages)
+            live, state = download_folder_with_reconnect(
+                live, reconnect, state, foldername=folder, display=display,
+                local_mbox=local_mbox, local_eml=local_eml, written=written,
+                download=do_download, rescan=rescan, should_stop=None, log=log,
+                overwrite=cfg.overwrite, reuse_selection=True, stats=reconnect_stats)
+            return live, state.scan, state.pending
+
         for folder_idx, (foldername, filename, eml_relpath, display_name) in enumerate(names, start=1):
             if not cfg.quiet:
                 folder_separator(folder_idx, total_folders, display_name)
@@ -1999,29 +2287,8 @@ def main(argv: list[str] | None = None) -> int:
             remote: FolderScan | None = None
             new_messages: dict[str, tuple[int, int]] = {}
             try:
-                remote = scan_folder(server, foldername, cfg.nospinner, quiet=cfg.quiet, log=log, display=display_name)
-                # per-format incremental: pending iff any selected format lacks the message;
-                # download_messages then writes only the sinks that still lack it
-                mbox_relpath = f"{account}/{filename}"
-                eml_rel = f"{account}/{eml_relpath}"
-                local_mbox, local_eml = local_snapshots(
-                    scan_index, cfg.basedir, cfg.eml_dir, account, display_name,
-                    mbox_relpath, eml_rel, overwrite=cfg.overwrite,
-                    nospinner=cfg.nospinner, quiet=cfg.quiet, log=log)
-                eml_folder_dir = cfg.eml_dir / eml_rel if cfg.eml_dir is not None else None
-                new_messages = pending_messages(remote.messages, local_mbox, local_eml)
-                label = mbox_relpath if cfg.basedir is not None else eml_rel
-                index_mbox = (scan_index.writer("mbox", cfg.basedir, account, display_name,
-                                                mbox_relpath, cfg.overwrite)
-                              if scan_index is not None and cfg.basedir is not None else None)
-                index_eml = (scan_index.writer("eml", cfg.eml_dir, account, display_name,
-                                               eml_rel, cfg.overwrite)
-                             if scan_index is not None and cfg.eml_dir is not None else None)
-                download_messages(server, label, new_messages, cfg.overwrite, cfg.nospinner,
-                                  cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
-                                  eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
-                                  foldername=display_name, verbose=cfg.verbose, compact=cfg.compact,
-                                  progress=progress, index_mbox=index_mbox, index_eml=index_eml)
+                server, remote, new_messages = backup_folder(foldername, filename, eml_relpath,
+                                                             display_name, progress, server)
             except SkipFolderException as e:
                 folder_failures += 1
                 if not cfg.quiet:
