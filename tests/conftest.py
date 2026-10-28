@@ -56,6 +56,17 @@ def isolate_index(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def isolate_log_dir(tmp_path, monkeypatch):
+    """把运行日志目录（含诊断采样 diag-*.jsonl）重定向到测试自己的临时目录，返回该目录。
+
+    只改核心模块属性：诊断写入与轮转每次都读 core.LOG_DIR，不依赖 GUI 模块导入时拷贝的那份。
+    """
+    log_dir = tmp_path / "log"
+    monkeypatch.setattr(core, "LOG_DIR", log_dir)
+    return log_dir
+
+
+@pytest.fixture
 def clean_logging():
     """根 logger 回到「没有当日运行日志」的状态，像新起一个进程。
 

@@ -13,10 +13,12 @@ winfo_rootx 等）在异 DPI / 异主题的机器上可能不成立。无显示�
 `pytest -m "not gui"` 跳过。
 """
 import imaplib
+import itertools
 import json
 import logging
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -28,6 +30,8 @@ import tkinter.font as tkfont
 import tkinter.ttk as ttk
 
 import imapbackup_gui as g
+from diag_helpers import FIELDS as DIAG_FIELDS
+from diag_helpers import read_rows as read_diag_rows
 from fakes import UidFetchServer, imap_utf7_encode
 
 pytestmark = pytest.mark.gui
@@ -71,6 +75,9 @@ def _redirect_log_dir(tmp_path_factory):
     """
     patch = MonkeyPatch()
     log_dir = tmp_path_factory.mktemp("log")
+    # 预置一份过期诊断文件与一份同龄运行日志：程序启动时只应清掉前者（见诊断小节）
+    (log_dir / "diag-2000-01-01.jsonl").write_text("{}\n", encoding="utf-8")
+    (log_dir / "run-2000-01-01.log").write_text("old run log\n", encoding="utf-8")
     patch.setattr(g.core, "LOG_DIR", log_dir)
     patch.setattr(g, "LOG_DIR", log_dir)
     yield log_dir
@@ -5111,3 +5118,539 @@ def test_folder_toolbar_buttons_follow_list_content(app):
 
     load_folders(app, SHORT_FOLDERS)   # 还原有清单的状态
     assert all(not is_disabled(b) for b in app._folder_tool_btns)
+
+
+# ----------------------------------------------------------------------------------------------
+# 诊断采样 JSONL（规格 §7、§12.2 I 组）
+#
+# 被测接缝是「事件队列 → diag-YYYY-MM-DD.jsonl」：往 app.events 投 worker 会投的事件、泵一轮、
+# 必要时走 1 秒 tick，再读私有日志目录里的文件断言；worker 一侧的统计（索引/重连/批次）用真实
+# _backup_account 对假服务器跑出来。写入器自身（落盘、轮转、写失败）见 test_diagnostics.py。
+# 这些用例与其余用例共用同一个 app：diag_env 夹具把账户/选中项/阶段/周期记账原样还原。
+# ----------------------------------------------------------------------------------------------
+
+STALE_DIAG = "diag-2000-01-01.jsonl"
+STALE_RUN_LOG = "run-2000-01-01.log"
+
+
+class _DiagClock:
+    """GUI 模块私有的假单调时钟：只替换 imapbackup_gui.time，核心模块与线程调度仍用真时钟。"""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@pytest.fixture
+def diag_clock(monkeypatch):
+    fake = _DiagClock()
+    monkeypatch.setattr(g, "time", fake)
+    return fake
+
+
+@pytest.fixture
+def diag_env(app, isolate_log_dir):
+    """诊断用例的隔离：私有日志目录、全新的写入器与周期记账；用完把共享 app 原样还原。
+
+    前序用例可能把主账户留在活动态：先全部收回空闲，否则活动集合永远排不空、run_end 不会写。
+    """
+    saved_phases = {aid: (state["run_phase"], state["phase_kind"]) for aid, state in app._states.items()}
+    saved = (list(app.accounts), app._selected_account_id, app._cycle, app._diag, app._stopping_all)
+    for account_id in saved_phases:
+        set_phase(app, account_id, g.PHASE_IDLE)
+    app._cycle = {"t0": 0.0, "backed": 0, "skipped": 0, "fetch_failed": 0,
+                  "folder_failures": 0, "failures": [], "stopped": False, "ids": set()}
+    app._diag = g.Diagnostics(app.log)
+    app._stopping_all = False
+    yield isolate_log_dir
+    original_ids = {account["id"] for account in saved[0]}
+    added = [account["id"] for account in app.accounts if account["id"] not in original_ids]
+    app.accounts[:] = saved[0]
+    for account_id in added:
+        app._states.pop(account_id, None)
+        app._stop_events.pop(account_id, None)
+        app._account_stats.pop(account_id, None)
+    app._selected_account_id, app._cycle, app._diag, app._stopping_all = (
+        saved[1], saved[2], saved[3], saved[4])
+    for account_id, (run_phase, phase_kind) in saved_phases.items():
+        app._states[account_id]["run_phase"] = run_phase
+        app._states[account_id]["phase_kind"] = phase_kind
+    app._clear_message_rows()
+    visible = app._visible_state()
+    if visible is not None:
+        app._render_messages(visible)
+        app._restore_run_state(visible)
+    app._on_active_set_changed()
+
+
+def _diag_account(app, tag: str, **extra) -> dict:
+    """登记一个最小账户（只备份 INBOX 到 mbox），显示名刻意不同于邮箱地址。"""
+    account = {"id": f"acc-diag-{tag}", "name": f"名称-{tag}", "user": f"{tag}@example.com",
+               "server": "imap.example.com", "ssl": True, "port": "993", "password": "p",
+               "folders": ["INBOX"], "mbox": True, "eml": False}
+    account.update(extra)
+    app.accounts.append(account)
+    app._state(account["id"])
+    return account
+
+
+def _diag_tick(app) -> None:
+    """走一次 1 秒 tick，并撤掉它排的下一次（用例自己控制时间）。"""
+    app._status_tick()
+    app.root.after_cancel(app._status_job)
+    app._status_job = None
+
+
+def _diag_begin(app, account: dict, kind: str = "scanning", text: str = "扫描 1/1：INBOX") -> None:
+    """一个账户开跑：account_begin + 首个 phase 事件（与 _launch_accounts 和 worker 投的顺序一致）。"""
+    app.events.put(("account_begin", account["id"]))
+    app.events.put(("phase", account["id"], kind, text))
+    pump(app)
+
+
+def _diag_rows(log_dir, event: str, account: dict | None = None) -> list[dict]:
+    return [row for row in read_diag_rows(log_dir)
+            if row["event"] == event and (account is None or row["account"] == account["user"])]
+
+
+def _diag_done(account: dict, **overrides) -> tuple:
+    """worker 投的 account_done 事件（字段顺序见 BackupApp._on_account_done）。"""
+    fields = {"backed": 3, "skipped": 0, "seconds": 4.0, "stopped": False, "pending": 3,
+              "fetch_failed": 0, "missing": 0, "no_bad": 0, "malformed": 0, "folder_failures": 0}
+    fields.update(overrides)
+    return ("account_done", account["id"], *fields.values())
+
+
+# 账户一次运行的各种结局 → (事件构造, account_end.result)。completed 对应界面的 done，含「已是最新」。
+DIAG_OUTCOMES = {
+    "completed": (lambda a: _diag_done(a), "completed"),
+    "up_to_date": (lambda a: _diag_done(a, backed=0, skipped=5, pending=0), "completed"),
+    "partial_fetch": (lambda a: _diag_done(a, fetch_failed=2, missing=2), "partial"),
+    "partial_folder": (lambda a: _diag_done(a, folder_failures=1), "partial"),
+    "stopped": (lambda a: _diag_done(a, stopped=True, fetch_failed=2, missing=2, folder_failures=1), "stopped"),
+    "failed": (lambda a: ("account_failed", a["id"], "boom"), "failed"),
+}
+
+
+def _diag_run_worker(app, account: dict, root, stop_event=None) -> None:
+    """在当前线程跑完一个账户 worker（含失败收口），再把它投的事件交给事件泵——与 _launch_accounts 一样先投 account_begin。"""
+    app.events.put(("account_begin", account["id"]))
+    app._backup_account_thread(account, str(root), app.events, logging.getLogger("test.diag"),
+                               stop_event or g.threading.Event())
+    pump(app, 5)
+
+
+def test_a_phase_event_writes_one_row_with_the_full_schema(app, diag_env):
+    """phase 立即写一行；所有行共用规格 §7.3 的同一套字段，字段顺序也固定。"""
+    account = _diag_account(app, "tracer")
+    app.events.put(("account_begin", account["id"]))
+    app.events.put(("phase", account["id"], "scanning", "扫描 1/1：INBOX"))
+    pump(app)
+
+    assert [f.name for f in diag_env.glob("diag-*.jsonl")] == [f"diag-{datetime.now():%Y-%m-%d}.jsonl"]
+    (row,) = read_diag_rows(diag_env)
+    assert list(row) == DIAG_FIELDS
+    assert (row["event"], row["account"], row["host"], row["phase"]) == (
+        "phase", "tracer@example.com", "imap.example.com", "scanning")
+    assert abs(datetime.fromisoformat(row["ts"]) - datetime.now().astimezone()) < timedelta(seconds=30)
+
+
+def test_every_active_account_gets_a_sample_every_ten_seconds(app, diag_env, diag_clock):
+    """每个活动账户每 10 秒一条 sample；不到点不写，节拍不随 1 秒 tick 的抖动漂移。"""
+    first, second = _diag_account(app, "s1"), _diag_account(app, "s2")
+    _diag_begin(app, first)
+    _diag_begin(app, second)
+
+    def samples() -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in _diag_rows(diag_env, "sample"):
+            counts[row["account"]] = counts.get(row["account"], 0) + 1
+        return counts
+
+    for at in (1001.0, 1009.9):
+        diag_clock.now = at
+        _diag_tick(app)
+    assert samples() == {}
+    diag_clock.now = 1010.4                  # 第一个到点的 tick 晚了 0.4 秒
+    _diag_tick(app)
+    assert samples() == {"s1@example.com": 1, "s2@example.com": 1}
+    diag_clock.now = 1011.0
+    _diag_tick(app)
+    assert samples() == {"s1@example.com": 1, "s2@example.com": 1}
+    diag_clock.now = 1019.9                  # 下一个节拍是 1020，不是 1020.4
+    _diag_tick(app)
+    assert samples() == {"s1@example.com": 1, "s2@example.com": 1}
+    diag_clock.now = 1020.2
+    _diag_tick(app)
+    assert samples() == {"s1@example.com": 2, "s2@example.com": 2}
+    assert len({row["run"] for row in read_diag_rows(diag_env)}) == 1
+
+
+def test_a_phase_row_replaces_the_sample_due_at_the_same_moment_and_resets_the_timer(app, diag_env, diag_clock):
+    """phase 与 sample 同时到点只写 phase，该账户的 10 秒从 phase 起重新算。"""
+    account = _diag_account(app, "conflict")
+    _diag_begin(app, account)                # t=1000，下一个 sample 本来在 1010
+    diag_clock.now = 1010.0
+    app.events.put(("phase", account["id"], "download", "备份 INBOX（3 封）"))
+    pump(app)
+    _diag_tick(app)
+    assert [row["event"] for row in read_diag_rows(diag_env)] == ["phase", "phase"]
+    diag_clock.now = 1019.9
+    _diag_tick(app)
+    assert _diag_rows(diag_env, "sample") == []
+    diag_clock.now = 1020.0
+    _diag_tick(app)
+    assert len(_diag_rows(diag_env, "sample")) == 1
+
+
+def test_account_end_and_run_end_are_written_at_once_and_share_one_run(app, diag_env, diag_clock):
+    """account_end 带终态和用时；追加的账户不换 run；run_end 在最后一个账户收尾时才写。"""
+    first, second = _diag_account(app, "e1"), _diag_account(app, "e2")
+    app._cycle["t0"] = diag_clock.now
+    _diag_begin(app, first)
+    diag_clock.now = 1004.0
+    _diag_begin(app, second)                 # 运行中追加：同一个 run
+    diag_clock.now = 1007.0
+    app.events.put(_diag_done(first, seconds=7.0))
+    pump(app)
+
+    (end,) = _diag_rows(diag_env, "account_end")
+    assert (end["account"], end["result"], end["duration_s"], end["phase"]) == (
+        "e1@example.com", "completed", 7.0, "idle")
+    assert _diag_rows(diag_env, "run_end") == []   # 第二个账户还在跑
+
+    diag_clock.now = 1009.0
+    app.events.put(_diag_done(second, seconds=5.0))
+    pump(app)
+    (run_end,) = _diag_rows(diag_env, "run_end")
+    assert (run_end["account"], run_end["host"], run_end["folder"]) == (None, None, None)
+    assert (run_end["result"], run_end["duration_s"]) == ("completed", 9.0)
+    assert list(run_end) == DIAG_FIELDS
+    assert len({row["run"] for row in read_diag_rows(diag_env)}) == 1
+    assert [row["event"] for row in read_diag_rows(diag_env)][-1] == "run_end"
+
+    _diag_begin(app, first)                  # 活动集合排空后再开跑：新的一次运行
+    runs = [row["run"] for row in read_diag_rows(diag_env)]
+    assert runs[-1] != runs[0] and re.fullmatch(r"[0-9a-f]{8}", runs[-1])
+
+
+@pytest.mark.parametrize(("outcomes", "expected_run_result"), [
+    (["completed"], "completed"),
+    (["up_to_date"], "completed"),
+    (["completed", "partial_fetch"], "partial"),
+    (["partial_folder", "completed"], "partial"),
+    (["partial_fetch", "stopped"], "stopped"),
+    (["stopped", "failed"], "failed"),
+    (["failed", "completed"], "failed"),
+])
+def test_results_follow_the_failed_stopped_partial_completed_priority(app, diag_env, diag_clock, outcomes,
+                                                                     expected_run_result):
+    accounts = [_diag_account(app, f"r{i}") for i in range(len(outcomes))]
+    app._cycle["t0"] = diag_clock.now
+    for account in accounts:
+        _diag_begin(app, account)
+    for account, outcome in zip(accounts, outcomes, strict=True):
+        app.events.put(DIAG_OUTCOMES[outcome][0](account))
+        pump(app)
+    ends = {row["account"]: row["result"] for row in _diag_rows(diag_env, "account_end")}
+    assert ends == {account["user"]: DIAG_OUTCOMES[outcome][1]
+                    for account, outcome in zip(accounts, outcomes, strict=True)}
+    (run_end,) = _diag_rows(diag_env, "run_end")
+    assert run_end["result"] == expected_run_result
+
+
+def test_stopping_accounts_writes_a_stopping_phase_row_once_per_account(app, diag_env, diag_clock):
+    """用户停止（单账户或停止所有）把账户切进 stopping：立即写 phase 行，重复点击不重复写。"""
+    first, second = _diag_account(app, "p1"), _diag_account(app, "p2")
+    app._cycle["t0"] = diag_clock.now
+    _diag_begin(app, first, "download", "备份 INBOX（3 封）")
+    _diag_begin(app, second, "download", "备份 INBOX（3 封）")
+    app._selected_account_id = first["id"]
+    app._on_stop()
+    app._on_stop()
+    stopping = [row for row in _diag_rows(diag_env, "phase") if row["phase"] == "stopping"]
+    assert [row["account"] for row in stopping] == ["p1@example.com"]
+    app._on_stop_all()
+    stopping = [row for row in _diag_rows(diag_env, "phase") if row["phase"] == "stopping"]
+    assert [row["account"] for row in stopping] == ["p1@example.com", "p2@example.com"]
+    assert all(row["rate_msgs_per_min"] is None for row in stopping)
+
+
+def test_sample_rates_match_the_second_line_and_exist_only_while_downloading(app, diag_env, diag_clock):
+    """速率/ETA 与第二行同一口径；连接/扫描/重连退避与账户结束时不给速率（写 null）。"""
+    account = _diag_account(app, "rate")
+    aid = account["id"]
+    app._selected_account_id = aid
+    app._cycle["t0"] = diag_clock.now = 100.0
+    app.events.put(("account_begin", aid))
+    app.events.put(("phase", aid, "download", "备份 INBOX（3 封）"))
+    app.events.put(("totals", aid, 3, 3, 12000))
+    pump(app)
+    for index, at in enumerate((100.0, 105.0, 110.0), 1):
+        diag_clock.now = at
+        app.events.put(("message", aid, _message(index=index), 1000))
+        pump(app)
+    _diag_tick(app)                          # 110 秒：第二行重算，同一次 tick 到点写 sample
+
+    assert app._status_full == "备份 INBOX（3 封） · 本账户 18.0 封/分 · 300 bytes/s · 预计剩余 <1 分钟"
+    sample = _diag_rows(diag_env, "sample")[-1]
+    assert (sample["phase"], sample["rate_msgs_per_min"], sample["rate_bytes_per_s"]) == ("download", 18.0, 300.0)
+    assert sample["eta_s"] == 30                  # (12000 - 3000) / 300
+    assert (sample["pending_msgs"], sample["pending_bytes"]) == (3, 12000)
+
+    for kind, text in (("backoff", "连接中断，8 秒后重连（第 2/5 次）"), ("connecting", "正在连接…"),
+                       ("scanning", "扫描 1/1：INBOX")):
+        diag_clock.now += 10.0
+        app.events.put(("phase", aid, kind, text))
+        pump(app)
+        diag_clock.now += 10.0
+        _diag_tick(app)
+        rows = [_diag_rows(diag_env, "phase")[-1], _diag_rows(diag_env, "sample")[-1]]
+        for row in rows:
+            assert row["phase"] == kind
+            assert (row["rate_msgs_per_min"], row["rate_bytes_per_s"], row["eta_s"]) == (None, None, None), row
+    app.events.put(_diag_done(account))
+    pump(app)
+    (end,) = _diag_rows(diag_env, "account_end")
+    assert (end["rate_msgs_per_min"], end["rate_bytes_per_s"], end["eta_s"]) == (None, None, None)
+
+
+def test_account_end_carries_the_workers_final_statistics(app, diag_env, diag_clock, monkeypatch, tmp_path):
+    """失败计数、重连、批次、索引与远端扫描耗时都来自 worker 发布的快照，且与备份结果一致。"""
+    raws = _fake_mailbox("w", 4)[0]
+    dropped = []
+
+    def drop_once_then_lose_uid_3(server, _uids):
+        # 头部扫描已成功，正文阶段才出事：首次正文请求断连，重连后 UID 3 的正文缺失
+        if not dropped:
+            dropped.append(True)
+            raise imaplib.IMAP4.abort("socket error: EOF")
+        server.missing_uids.add(3)
+
+    monkeypatch.setattr(g.core, "connect_and_login", lambda _cfg, _log: UidFetchServer(
+        raws, body_hook=drop_once_then_lose_uid_3))
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)   # 退避不等
+    ticks = itertools.count()
+    diag_clock.perf_counter = lambda: next(ticks) * 0.005                    # 每次调用前进 5 ms
+    account = _diag_account(app, "worker")
+    app._cycle["t0"] = diag_clock.now
+
+    _diag_run_worker(app, account, tmp_path)
+
+    (end,) = _diag_rows(diag_env, "account_end")
+    assert end["result"] == "partial"
+    assert (end["phase"], end["folder"]) == ("idle", "INBOX")
+    assert (end["done_msgs"], end["done_bytes"]) == (3, sum(len(raws[uid]) for uid in (1, 2, 4)))
+    assert (end["pending_msgs"], end["pending_bytes"]) == (4, sum(len(raw) for raw in raws.values()))
+    assert (end["fetch_failed"], end["fetch_failed_missing"], end["fetch_failed_no_bad"],
+            end["fetch_failed_malformed"], end["folder_failures"]) == (1, 1, 0, 0, 0)
+    assert (end["reconnect_attempts"], end["reconnect_successes"], end["reconnect_exhausted"],
+            end["uidvalidity_changes"], end["reconnect_reason"]) == (1, 1, False, 0, "abort")
+    assert (end["batch_msgs"], end["batch_bytes"]) == (4, sum(len(raw) for raw in raws.values()))
+    assert end["fetch_ms_avg"] is not None and end["fetch_ms_p95"] is not None
+    assert (end["index_hits"], end["index_misses"], end["index_disabled"]) == (0, 1, False)
+    assert isinstance(end["scan_local_ms"], int) and end["scan_local_ms"] >= 0
+    assert end["scan_remote_ms"] == 5                                       # 一次远端扫描 = 5 ms
+    assert (end["rate_msgs_per_min"], end["eta_s"]) == (None, None)
+
+
+def test_a_sample_taken_mid_download_reads_what_the_running_worker_published(app, diag_env, diag_clock,
+                                                                              monkeypatch, tmp_path):
+    """真线程 worker 卡在第 2 批正文请求上：主线程的 sample 读到第 1 批完成后的进度、批次与速率。"""
+    raws = _fake_mailbox("live", 12)[0]                          # 第 1 批 8 封，第 2 批 4 封
+    gates = [(g.threading.Event(), g.threading.Event()) for _ in range(2)]   # (已到达, 放行)
+    requests: list[list[int]] = []
+
+    def hold_each_batch(_server, uids):
+        index = len(requests)
+        requests.append(list(uids))
+        if index < len(gates):
+            reached, go = gates[index]
+            reached.set()
+            assert go.wait(10)
+
+    monkeypatch.setattr(g.core, "connect_and_login",
+                        lambda _cfg, _log: UidFetchServer(raws, body_hook=hold_each_batch))
+    account = _diag_account(app, "live")
+    app._cycle["t0"] = diag_clock.now
+    app.events.put(("account_begin", account["id"]))
+    thread = g.threading.Thread(target=app._backup_account_thread, daemon=True, args=(
+        account, str(tmp_path), app.events, logging.getLogger("test.diag.live"), g.threading.Event()))
+    thread.start()
+    try:
+        assert gates[0][0].wait(10)
+        pump(app)                                                # t=1000：连接/扫描/下载阶段与 totals
+        diag_clock.now = 1005.0
+        gates[0][1].set()                                        # 第 1 批在 t=1005 完成
+        assert gates[1][0].wait(10)
+        pump(app)
+        diag_clock.now = 1010.0
+        _diag_tick(app)
+        (sample,) = _diag_rows(diag_env, "sample")
+    finally:
+        for _, go in gates:
+            go.set()
+        thread.join(10)
+    assert not thread.is_alive()
+
+    first_batch = sum(len(raws[uid]) for uid in range(1, 9))
+    assert (sample["phase"], sample["folder"], sample["account"]) == ("download", "INBOX", "live@example.com")
+    assert (sample["done_msgs"], sample["done_bytes"]) == (8, first_batch)
+    assert (sample["pending_msgs"], sample["pending_bytes"]) == (12, sum(len(raw) for raw in raws.values()))
+    assert (sample["batch_msgs"], sample["batch_bytes"]) == (8, first_batch)
+    assert sample["fetch_ms_avg"] is not None and sample["fetch_ms_p95"] is not None
+    assert sample["rate_msgs_per_min"] == pytest.approx(96.0)    # 8 封 / 5 秒
+    assert sample["rate_bytes_per_s"] == pytest.approx(first_batch / 5, abs=0.1)
+    assert sample["eta_s"] is None                               # 距首封完成不足 10 秒
+    pump(app, 5)
+    (end,) = _diag_rows(diag_env, "account_end")
+    assert (end["result"], end["done_msgs"], end["batch_msgs"]) == ("completed", 12, 4)
+
+
+def test_batch_timings_cover_only_the_last_ten_seconds(app, diag_env, diag_clock):
+    """fetch_ms_avg/p95 只统计最近 10 秒完成的批次；窗内没有批次就是 null。"""
+    account = _diag_account(app, "timing")
+    app._cycle["t0"] = diag_clock.now
+    _diag_begin(app, account, "download", "备份 INBOX（若干封）")
+    # (完成时刻, 取信耗时 ms)：1000 的那批在 1010 正落在窗口边界上（计入），1020.5 时全部出窗
+    batches = tuple((1000.0 + offset, ms) for offset, ms in ((0.0, 9000.0), (2.0, 100.0), (4.0, 200.0), (6.0, 300.0),
+                                                           (8.0, 400.0), (9.0, 500.0)))
+    app._publish_account_stats(account["id"], g.AccountStats(folder="INBOX", batches=batches))
+    diag_clock.now = 1010.0
+    _diag_tick(app)
+    sample = _diag_rows(diag_env, "sample")[-1]
+    assert sample["fetch_ms_avg"] == pytest.approx((9000 + 100 + 200 + 300 + 400 + 500) / 6, abs=0.1)
+    assert sample["fetch_ms_p95"] == 9000.0                      # 最近邻法：6 个样本的 p95 是最大值
+    diag_clock.now = 1020.5
+    _diag_tick(app)
+    assert _diag_rows(diag_env, "sample")[-1]["fetch_ms_avg"] is None
+    assert _diag_rows(diag_env, "sample")[-1]["fetch_ms_p95"] is None
+
+
+SECRET_RAW = ("From: boss-secret@corp.example\r\nTo: rcpt-secret@corp.example\r\n"
+              "Date: Sun, 12 May 2024 02:15:30 +0000\r\nSubject: 机密主题-XYZ\r\n"
+              "Message-Id: <msgid-secret-42@corp.example>\r\n"
+              "Content-Type: text/plain\r\nContent-Disposition: attachment; filename=\"attachment-secret.pdf\"\r\n"
+              "\r\nbody-secret-words\r\n").encode()
+DIAG_SECRETS = ["绝密显示名称", "p@ss-SECRET-123", "boss-secret", "rcpt-secret", "机密主题", "msgid-secret", "corp.example",
+                "attachment-secret", "body-secret", ".eml", "EOF-secret-banner", "secret-detail-777", "2024"]
+
+
+def _assert_diag_privacy(text: str, rows: list[dict], allowed_strings: set[str]) -> None:
+    for secret in DIAG_SECRETS:
+        assert secret not in text, f"诊断文件泄露了 {secret!r}"
+    for row in rows:
+        assert list(row) == DIAG_FIELDS
+        for key, value in row.items():
+            if isinstance(value, str) and key not in ("ts", "run"):
+                assert value in allowed_strings, (key, value)
+
+
+def test_diagnostics_never_contain_mail_content_names_credentials_or_raw_errors(app, diag_env, diag_clock,
+                                                                              monkeypatch, tmp_path):
+    """隐私白名单：真实 worker 跑一遍带「敏感」内容的邮件（mbox + eml），诊断里只能有白名单字段和值。"""
+    dropped = []
+
+    def drop_once(_server, _uids):
+        if not dropped:
+            dropped.append(True)
+            raise imaplib.IMAP4.abort("socket error: EOF-secret-banner")
+
+    monkeypatch.setattr(g.core, "connect_and_login",
+                        lambda _cfg, _log: UidFetchServer({1: SECRET_RAW}, body_hook=drop_once))
+    monkeypatch.setattr(g.core.random, "uniform", lambda _low, _high: 0.0)
+    account = _diag_account(app, "priv", name="绝密显示名称", password="p@ss-SECRET-123", eml=True)
+    app._cycle["t0"] = diag_clock.now
+
+    _diag_run_worker(app, account, tmp_path)
+
+    (path,) = diag_env.glob("diag-*.jsonl")
+    rows = read_diag_rows(diag_env)
+    assert {row["event"] for row in rows} >= {"phase", "account_end", "run_end"}
+    assert [row["result"] for row in rows if row["event"] == "account_end"] == ["completed"]
+    assert _diag_rows(diag_env, "account_end")[0]["reconnect_reason"] == "abort"   # 只有类别，没有异常文本
+    allowed = {"imapbackup-gui", "priv@example.com", "imap.example.com", "INBOX", "abort",
+               "phase", "sample", "account_end", "run_end", "completed",
+               "connecting", "scanning", "download", "backoff", "stopping", "idle"}
+    _assert_diag_privacy(path.read_text(encoding="utf-8"), rows, allowed)
+    assert any(tmp_path.rglob("*.eml"))      # 证明敏感邮件确实被写盘过（不是空跑）
+
+
+def test_a_failed_account_records_the_category_and_duration_but_not_the_error_text(
+        app, diag_env, diag_clock, monkeypatch, tmp_path):
+    """account_failed 的原始错误文本只进运行日志，诊断只留 result=failed 与用时。"""
+    def refuse(_cfg, _log):
+        raise SystemExit("IMAP authentication failed: secret-detail-777")
+
+    monkeypatch.setattr(g.core, "connect_and_login", refuse)
+    account = _diag_account(app, "priv2", name="绝密显示名称")
+    app._cycle["t0"] = diag_clock.now
+    app.events.put(("account_begin", account["id"]))
+    pump(app)
+    diag_clock.now = 1003.0                  # 账户开跑 3 秒后才被拒绝
+    app._backup_account_thread(account, str(tmp_path), app.events, logging.getLogger("test.diag"),
+                               g.threading.Event())
+    pump(app, 5)
+
+    (path,) = diag_env.glob("diag-*.jsonl")
+    rows = read_diag_rows(diag_env)
+    (end,) = _diag_rows(diag_env, "account_end")
+    assert (end["result"], end["duration_s"], end["folder"]) == ("failed", 3.0, None)
+    assert _diag_rows(diag_env, "run_end")[0]["result"] == "failed"
+    allowed = {"imapbackup-gui", "priv2@example.com", "imap.example.com", "account_end", "run_end", "failed", "idle"}
+    _assert_diag_privacy(path.read_text(encoding="utf-8"), rows, allowed)
+
+
+def test_stale_diagnostics_are_cleaned_when_the_application_starts(app, _redirect_log_dir):
+    """程序启动时清过期诊断文件（模块级日志目录在建 app 之前已预置了一份过期文件）。"""
+    assert not (_redirect_log_dir / STALE_DIAG).exists()
+    assert (_redirect_log_dir / STALE_RUN_LOG).exists()
+
+
+def test_stale_diagnostics_are_cleaned_when_a_run_begins_but_not_when_one_is_appended_to(
+        app, diag_env, monkeypatch):
+    """每次运行开始时清理；运行中追加账户不算新一次运行，不再清。"""
+    diag_env.mkdir()
+    (diag_env / STALE_DIAG).write_text("{}\n", encoding="utf-8")
+    (diag_env / STALE_RUN_LOG).write_text("old run log\n", encoding="utf-8")
+    first, second = _diag_account(app, "launch1"), _diag_account(app, "launch2")
+    monkeypatch.setattr(g.threading, "Thread", lambda *a, **k: sync_thread(*a, **k))
+    monkeypatch.setattr(app, "_backup_account", lambda *_args: None)
+    monkeypatch.setattr(app, "backup_root_var", tk.StringVar(value=str(diag_env.parent / "out")))
+
+    app._launch_accounts([first["id"]])
+    assert not (diag_env / STALE_DIAG).exists()
+    assert (diag_env / STALE_RUN_LOG).exists()
+    (diag_env / STALE_DIAG).write_text("{}\n", encoding="utf-8")
+    app._launch_accounts([second["id"]])     # 第一个账户仍在活动集合里：追加，不算新一次运行
+    assert (diag_env / STALE_DIAG).exists()
+
+
+def test_backup_carries_on_when_diagnostics_cannot_be_written(app, diag_env, diag_clock, monkeypatch, tmp_path,
+                                                              caplog):
+    """诊断写失败：备份照常完成、邮件落盘、账户结果不受影响，只记一次 WARNING。"""
+    diag_env.write_text("not a directory", encoding="utf-8")
+    raws = _fake_mailbox("keep", 3)[0]
+    monkeypatch.setattr(g.core, "connect_and_login", lambda _cfg, _log: UidFetchServer(raws))
+    account = _diag_account(app, "keep")
+    app._cycle["t0"] = diag_clock.now
+
+    with caplog.at_level(logging.WARNING, logger="gui"):
+        _diag_run_worker(app, account, tmp_path)
+        diag_clock.now += 30.0
+        _diag_tick(app)
+
+    assert app._diag.disabled
+    assert len([r for r in caplog.records if "诊断采样写入失败" in r.getMessage()]) == 1
+    assert not app._has_active_accounts()
+    assert app._cycle["backed"] == 3 and app._cycle["failures"] == []
+    mbox = g.core.mailbox.mbox(tmp_path / account["user"] / "INBOX.mbox")
+    try:
+        assert sorted(str(m.get("Message-Id")) for m in mbox) == [f"<keep{uid}@x>" for uid in (1, 2, 3)]
+    finally:
+        mbox.close()

@@ -145,6 +145,18 @@ def test_successful_run_writes_a_formatted_daily_log(run_main):
     assert (res.mbox_dir / "x@y.com").exists()
 
 
+def test_cli_never_writes_diagnostic_samples(run_main, capsys):
+    """诊断采样只属于 GUI（规格 §7.6）：CLI 照常写运行日志，但不创建 diag-*.jsonl，也没有对应参数。"""
+    res = run_main(connect_like(MainServer(messages=3)), "--folders", "INBOX")
+
+    assert res.outcome == "returned" and res.code == 0, f"{res.outcome} {res.code}"
+    assert any("Disconnecting" in p["msg"] for p in records(log_lines(res.log_dir)))
+    assert [p.name for p in res.log_dir.iterdir()] == [f"run-{datetime.now():%Y-%m-%d}.log"]
+    with pytest.raises(SystemExit):
+        core.get_config(["--help"])
+    assert "diag" not in capsys.readouterr().out.lower()
+
+
 def test_quiet_silences_stderr_but_the_file_still_gets_info(run_main):
     res = run_main(connect_like(MainServer()), "--quiet", "--folders", "INBOX")
     parsed = records(log_lines(res.log_dir))

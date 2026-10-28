@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -48,10 +49,11 @@ import tkinter.font as tkfont
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
 
 import imapbackup312 as core
 import imapbackup_tray
@@ -657,6 +659,191 @@ class SpeedTracker:
         return remaining / rate[1]
 
 
+def account_rates(state: dict, now: float) -> tuple[float, float, float | None] | None:
+    """账户当前的（封/分, 字节/秒, 预计剩余秒数）；速率尚不可计算时为 None。
+
+    Note:
+        第二行与诊断采样共用这一个口径；零字节速率不估 ETA（None）。调用方负责只在
+        下载阶段取用：别的阶段不显示速率。
+    """
+    rates = state["speed"].rates(now)
+    if rates is None:
+        return None
+    messages, byte_rate = rates
+    eta = state["speed"].eta_seconds(now, state["pending_bytes"], state["done_bytes"])
+    return messages, byte_rate, eta if byte_rate > 0 else None
+
+
+# ---------------------------------------------------------------- 诊断采样（规格 §7）
+
+DIAG_SCHEMA_VERSION = 1
+DIAG_APP_NAME = "imapbackup-gui"
+DIAG_SAMPLE_INTERVAL_S = 10.0   # 每个活动账户的 sample 间隔；phase 行写出后重新计时
+DIAG_BATCH_WINDOW_S = 10.0      # fetch_ms_avg/p95 只统计最近这么久完成的批次
+DIAG_RETENTION_DAYS = 14        # 诊断文件保留天数：日期早于它的 diag-*.jsonl 被清理
+DIAG_FILE_RE = re.compile(r"diag-(\d{4}-\d{2}-\d{2})\.jsonl")
+DIAG_REASONS = frozenset({"abort", "oserror", "bye"})   # reconnect_reason 只认核心的三个类别
+# 每一行的完整字段表（顺序即写出顺序）：不适用的字段写 null，保持 schema 稳定。
+# 它同时是隐私白名单——不在表里的键 Diagnostics.write 一律拒收（规格 §7.4）。
+DIAG_FIELDS = (
+    "ts", "schema", "app", "run", "event", "account", "host", "folder", "phase",
+    "done_msgs", "done_bytes", "pending_msgs", "pending_bytes",
+    "rate_msgs_per_min", "rate_bytes_per_s", "eta_s",
+    "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95",
+    "fetch_failed", "fetch_failed_missing", "fetch_failed_no_bad", "fetch_failed_malformed",
+    "folder_failures",
+    "index_hits", "index_misses", "index_rebuilds", "index_disabled", "scan_local_ms", "scan_remote_ms",
+    "reconnect_attempts", "reconnect_successes", "reconnect_exhausted", "uidvalidity_changes",
+    "reconnect_reason",
+    "result", "duration_s",
+)
+_DIAG_IDENTITY_FIELDS = frozenset({"ts", "schema", "app", "run"})
+
+
+@dataclass(frozen=True)
+class AccountStats:
+    """worker 在检查点发布、主线程只读的账户统计快照（规格 §5.9）。
+
+    Note:
+        每次发布都是一份全新的不可变快照（内部计数器是浅拷贝），主线程只读引用、不遍历
+        worker 的可变对象；一个快照内的各计数来自同一个检查点，彼此一致。
+    """
+
+    folder: str | None = None                  # 正在扫描/下载的文件夹显示名
+    folder_failures: int = 0
+    scan_remote_ms: float = 0.0                # 远端扫描总耗时（含重连后的重扫）
+    progress: core.DownloadProgress = field(default_factory=core.DownloadProgress)
+    index: core.IndexStats = field(default_factory=core.IndexStats)
+    reconnect: core.ReconnectStats = field(default_factory=core.ReconnectStats)
+    batches: tuple[tuple[float, float], ...] = ()   # (完成时刻 monotonic, 取信耗时 ms)，只留最近一个窗口
+
+
+def _p95(values: list[float]) -> float:
+    """最近邻法的 95 分位（样本是少量批次耗时，不做插值）。"""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+class Diagnostics:
+    """诊断采样 JSONL 写入器（规格 §7）：按天追加、立即刷盘、14 天轮转，失败只禁用自己。
+
+    Note:
+        只写计数、速率、耗时与错误类别：字段集由 DIAG_FIELDS 固定，白名单外的键拒收。
+        诊断是附加品，不得影响备份——任何写入异常都禁用本次进程的诊断并记一次 WARNING。
+        目录每次现取 core.LOG_DIR（测试可重定向），文件名取写入当刻的本地日期。
+        节奏状态（run ID、每账户的 10 秒计时）也放在这里，由 GUI 的 1 秒 tick 驱动。
+    """
+
+    def __init__(self, log: logging.Logger,
+                 clock: Callable[[], datetime] = lambda: datetime.now().astimezone()) -> None:
+        self._log = log
+        self._clock = clock
+        self.disabled = False
+        self._run_id: str | None = None
+        self._started: dict[str, float] = {}
+        self._due: dict[str, float] = {}
+
+    # -------------------------------------------------------------- run 与节奏
+
+    @property
+    def run(self) -> str:
+        """本次备份运行的 8 位十六进制 ID：活动集合排空前一直是同一个，追加账户不换。"""
+        if self._run_id is None:
+            self._run_id = uuid.uuid4().hex[:8]
+        return self._run_id
+
+    def end_run(self) -> None:
+        """一次运行结束（或开新一轮前丢弃残留）：下次写入换新 ID，清空所有账户计时。"""
+        self._run_id = None
+        self._started.clear()
+        self._due.clear()
+
+    def begin_account(self, account_id: str, now: float) -> None:
+        self._started[account_id] = now
+        self._due[account_id] = now + DIAG_SAMPLE_INTERVAL_S
+
+    def reset_timer(self, account_id: str, now: float) -> None:
+        """phase 行已写：该账户的 10 秒重新计时（同一时刻 phase 与 sample 冲突只留 phase）。"""
+        if account_id in self._due:
+            self._due[account_id] = now + DIAG_SAMPLE_INTERVAL_S
+
+    def is_due(self, account_id: str, now: float) -> bool:
+        due = self._due.get(account_id)
+        return due is not None and now >= due
+
+    def advance_timer(self, account_id: str, now: float) -> None:
+        """sample 已写：按固定节拍顺延，tick 抖动不累积漂移；停摆太久则从现在重新算。"""
+        following = self._due[account_id] + DIAG_SAMPLE_INTERVAL_S
+        self._due[account_id] = following if following > now else now + DIAG_SAMPLE_INTERVAL_S
+
+    def elapsed(self, account_id: str, now: float) -> float | None:
+        started = self._started.get(account_id)
+        return None if started is None else now - started
+
+    def end_account(self, account_id: str) -> None:
+        self._started.pop(account_id, None)
+        self._due.pop(account_id, None)
+
+    # -------------------------------------------------------------- 文件
+
+    def write(self, event: str, **fields: object) -> None:
+        """追加一行：身份字段（ts/schema/app/run）由这里补，其余按 DIAG_FIELDS 补 null。"""
+        if self.disabled:
+            return
+        try:
+            unknown = set(fields) - (set(DIAG_FIELDS) - _DIAG_IDENTITY_FIELDS)
+            if unknown:
+                raise ValueError(f"诊断字段不在白名单内：{sorted(unknown)}")
+            now = self._clock()
+            row: dict[str, Any] = dict.fromkeys(DIAG_FIELDS)
+            row.update(ts=now.isoformat(timespec="milliseconds"), schema=DIAG_SCHEMA_VERSION,
+                       app=DIAG_APP_NAME, run=self.run, event=event)
+            row.update(fields)
+            line = json.dumps(row, ensure_ascii=False) + "\n"
+            path = core.LOG_DIR / f"diag-{now:%Y-%m-%d}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line)
+                handle.flush()
+        except Exception as exc:
+            self.disable(exc)
+
+    def disable(self, exc: BaseException) -> None:
+        """本次进程不再写诊断，只记一次 WARNING；备份照常。"""
+        if self.disabled:
+            return
+        self.disabled = True
+        self._log.warning("诊断采样写入失败，本次运行不再记录诊断：%s: %s", type(exc).__name__, exc)
+
+    def rotate(self) -> None:
+        """删除日期早于保留期的 diag-YYYY-MM-DD.jsonl；别的文件一概不碰，失败只记 WARNING。"""
+        if self.disabled:
+            return
+        cutoff = self._clock().date() - timedelta(days=DIAG_RETENTION_DAYS)
+        try:
+            entries = list(core.LOG_DIR.iterdir())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            self._log.warning("无法列出日志目录以清理旧诊断文件：%s", exc)
+            return
+        for path in entries:
+            match = DIAG_FILE_RE.fullmatch(path.name)
+            if match is None:
+                continue
+            try:
+                stale = date.fromisoformat(match.group(1)) < cutoff
+            except ValueError:
+                continue   # 形如 diag-2026-13-99.jsonl：不是我们写的，不删
+            if not stale:
+                continue
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError as exc:
+                self._log.warning("清理旧诊断文件失败：%s（%s）", path.name, exc)
+
+
 @dataclass
 class _FolderPlan:
     """pass 1 得到的单个文件夹快照；重连重扫时 scan/pending 会被原地替换。"""
@@ -971,6 +1158,11 @@ class BackupApp:
         # 本周期（活动集合「空→非空」到再次排空）的汇总记账，供结束日志与后台气泡
         self._cycle = {"t0": 0.0, "backed": 0, "skipped": 0, "fetch_failed": 0,
                        "folder_failures": 0, "failures": [], "stopped": False, "ids": set()}
+        # 诊断采样（规格 §7）：写入器，以及 worker 发布、主线程只读的每账户统计快照
+        self._diag = Diagnostics(self.log)
+        self._diag.rotate()   # 启动时清一次过期诊断文件，每次运行开始时再清
+        self._account_stats: dict[str, AccountStats] = {}
+        self._account_stats_lock = threading.Lock()
         # 左栏勾选（「备份所选」跑哪些账户）：纯界面态，不落盘；新建/读入的账户默认勾上
         self._checked_accounts: set[str] = {account["id"] for account in self.accounts}
         self._account_rows: dict[str, dict] = {}
@@ -4367,6 +4559,8 @@ class BackupApp:
                            "fetch_failed": 0, "folder_failures": 0,
                            "failures": [], "stopped": False, "ids": set()}
             self.log.info("开始备份运行：输出 %s", outdir)
+            self._diag.end_run()    # 新一轮：丢弃上一轮的残留，换新 run ID
+            self._diag.rotate()     # 每次运行开始时清一次过期诊断文件
         for account_id in account_ids:
             state = self._state(account_id)
             state["messages"] = []
@@ -4444,13 +4638,36 @@ class BackupApp:
         backed = 0
         folder_failures = 0
         progress = core.DownloadProgress()
+        index_stats = core.IndexStats()
+        reconnect_stats = core.ReconnectStats()
+        current_folder: str | None = None
+        scan_remote_ms = 0.0
+        batch_log: deque[tuple[float, float]] = deque()   # (完成时刻, 取信耗时 ms)，只留最近一个窗口
         wanted = {name for name in account.get("folders", []) if isinstance(name, str) and name} or {"INBOX"}
         sizes: dict[str, int] = {}
+
+        def publish() -> None:
+            """把本账户当前统计换成一份新快照供主线程读取（诊断采样，规格 §5.9）。
+
+            Note:
+                只在 worker 自己的检查点调用（阶段切换、每封写完、每批结束、收尾），此刻核心没在
+                改这些计数，快照内部因此互相一致。
+            """
+            cutoff = time.monotonic() - DIAG_BATCH_WINDOW_S
+            while batch_log and batch_log[0][0] < cutoff:
+                batch_log.popleft()
+            self._publish_account_stats(account_id, AccountStats(
+                folder=current_folder, folder_failures=folder_failures, scan_remote_ms=scan_remote_ms,
+                progress=replace(progress), index=replace(index_stats),
+                reconnect=replace(reconnect_stats), batches=tuple(batch_log)))
+
+        publish()   # 先把上一轮的残留快照换掉
 
         def report(d: dict) -> None:
             nonlocal backed
             backed += 1
             log.debug("已备份 %s：%s", d["folder"], d["msg_id"])
+            publish()
             eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
         v = {"user": account["user"], "server": account["server"], "password": account["password"],
@@ -4466,13 +4683,26 @@ class BackupApp:
         server = core.connect_and_login(cfg, log)
         account_dir = core.sanitize_segment(v["user"], core.EML_SEGMENT_MAX)
         # 每个账户线程用自己的连接（规格 §5.6.6）；打不开就整轮退回内容扫描
-        scan_index = core.ScanIndex.open(log) if basedir is not None or eml_root is not None else None
-        reconnect_stats = core.ReconnectStats()
+        scan_index = (core.ScanIndex.open(log, stats=index_stats)
+                      if basedir is not None or eml_root is not None else None)
 
         def reconnect():
             return core.connect_for_reconnect(cfg, log)
 
-        def emit_phase(kind: str, text: str) -> None:
+        def timed_scan(conn, folder: str, shown: str) -> core.FolderScan:
+            """远端扫描一个文件夹，并把耗时计入诊断的 scan_remote_ms（含重连后的重扫）。"""
+            nonlocal scan_remote_ms
+            started = time.perf_counter()
+            try:
+                return core.scan_folder(conn, folder, True, quiet=False, log=log, display=shown)
+            finally:
+                scan_remote_ms += (time.perf_counter() - started) * 1000.0
+
+        def emit_phase(kind: str, text: str, folder: str | None = None) -> None:
+            nonlocal current_folder
+            if folder is not None:
+                current_folder = folder
+            publish()
             parts = [text]
             if progress.fetch_failed:
                 parts.append(f"取信失败 {progress.fetch_failed} 封")
@@ -4509,12 +4739,15 @@ class BackupApp:
 
             def report_batch(_stats) -> None:
                 nonlocal reported_failures
+                if progress.last_batch is not None:
+                    batch_log.append((time.monotonic(), progress.last_batch.fetch_ms))
+                publish()
                 if progress.fetch_failed != reported_failures:
                     reported_failures = progress.fetch_failed
                     emit_phase("download", download_text)
 
             def do_download(conn, messages, overwrite_now):
-                emit_phase("download", download_text)
+                emit_phase("download", download_text, display)
                 # abort() 会关掉 writer：每次重连尝试都用新的 writer
                 index_mbox = (scan_index.writer("mbox", basedir, account_dir, display, mbox_relpath,
                                                 overwrite=overwrite_now)
@@ -4531,7 +4764,7 @@ class BackupApp:
                                        index_mbox=index_mbox, index_eml=index_eml)
 
             def rescan(conn):
-                return core.scan_folder(conn, foldername, True, quiet=False, log=log, display=display)
+                return timed_scan(conn, foldername, display)
 
             def scan_changed(scan, pending):
                 nonlocal sizes
@@ -4568,8 +4801,8 @@ class BackupApp:
                 foldername, filename, eml_relpath, display = n
 
                 def scan_attempt(conn, folder=foldername, shown=display, ordinal=i):
-                    emit_phase("scanning", f"扫描 {ordinal}/{len(selected)}：{shown}")
-                    return core.scan_folder(conn, folder, True, quiet=False, log=log, display=shown)
+                    emit_phase("scanning", f"扫描 {ordinal}/{len(selected)}：{shown}", shown)
+                    return timed_scan(conn, folder, shown)
 
                 try:
                     scan, server = core.run_with_reconnect(
@@ -4617,6 +4850,7 @@ class BackupApp:
                         continue
                 server_total, pending_total, _ = totals()
         finally:
+            publish()   # 最终统计先于 account_done/account_failed 事件到达主线程
             if scan_index is not None:
                 scan_index.close()
             with contextlib.suppress(Exception):
@@ -4652,8 +4886,11 @@ class BackupApp:
         if state is None or state["run_phase"] not in ACTIVE_PHASES:
             return
         self._stop_events.setdefault(account_id, threading.Event()).set()
+        newly_stopping = state["run_phase"] != PHASE_STOPPING
         state["run_phase"] = PHASE_STOPPING
         state["phase_kind"] = "stopping"
+        if newly_stopping:
+            self._diag_phase(account_id)
         self.stop_btn.configure(state="disabled", image=self.blank_icon)
         self._restore_start_button()
         self._stop_run_spinner()  # 取消挂起的那一帧，立即按新目标重画第 0 帧：点下去当刻就见反馈
@@ -4681,6 +4918,7 @@ class BackupApp:
                 state["run_phase"] = PHASE_STOPPING
                 state["phase_kind"] = "stopping"
                 self._apply_account_icon(account_id)
+                self._diag_phase(account_id)
         self._stopping_all = True
         self.stop_all_btn.configure(state="disabled", image=self.blank_icon)
         self._update_start_state()                 # 可见账户若在活动，右下停止钮同步进停止态
@@ -4770,6 +5008,7 @@ class BackupApp:
         state["status_text"] = CONNECTING_STATUS_TEXT
         state["status_error"] = False
         state["count_text"] = "正在统计…"
+        self._diag.begin_account(account_id, time.monotonic())
         if state["run_phase"] != PHASE_STOPPING:
             state["run_phase"] = PHASE_CONNECTING
             state["phase_kind"] = "connecting"
@@ -4795,6 +5034,7 @@ class BackupApp:
             state["run_phase"] = {"connecting": PHASE_CONNECTING, "scanning": PHASE_SCANNING,
                                   "download": PHASE_BACKING, "stopping": PHASE_STOPPING}[kind]
         self._apply_account_icon(account_id)
+        self._diag_phase(account_id)
         if account_id == self._selected_account_id:
             self._set_status(text, error=False)
             self._refresh_status_line()
@@ -4857,6 +5097,7 @@ class BackupApp:
         kind = "stopped" if stopped else "partial" if partial else "done"
         state["run_phase"] = PHASE_IDLE
         state["phase_kind"] = PHASE_IDLE
+        self._diag_account_end(account_id, "completed" if kind == "done" else kind, seconds)
         if stopped:
             state["status_text"] = f"已停止：本次备份 {backed} 封"
             if failure_text:
@@ -4912,6 +5153,7 @@ class BackupApp:
         name = account_display(failed_account) if failed_account is not None else account_id
         state["run_phase"] = PHASE_IDLE
         state["phase_kind"] = PHASE_IDLE
+        self._diag_account_end(account_id, "failed", None)
         state["result"] = ("failed", message)
         state["result_at"] = time.monotonic()
         state["status_text"] = "备份失败，详见运行日志"
@@ -4933,6 +5175,8 @@ class BackupApp:
         """一个账户到终态后的统一收口：刷界面；若活动集合就此排空，记汇总日志/发后台气泡。"""
         still_active = self._has_active_accounts()
         self._on_active_set_changed()
+        if not still_active:
+            self._diag_run_end()
         if still_active or self._preflight_active():
             return
         elapsed = time.monotonic() - self._cycle["t0"]
@@ -4994,15 +5238,14 @@ class BackupApp:
                 text = " · ".join(part for part in segments if part not in failures)
             now = time.monotonic()
             parts = [text]
-            rates = state["speed"].rates(now)
-            if rates is None:
+            view = account_rates(state, now)
+            if view is None:
                 parts.append("本账户 —")
             else:
-                messages, byte_rate = rates
+                messages, byte_rate, eta = view
                 parts.append(f"本账户 {messages:.1f} 封/分")
                 parts.append(f"{core.pretty_byte_count(int(byte_rate))}/s")
-                eta = state["speed"].eta_seconds(now, state["pending_bytes"], state["done_bytes"])
-                if eta is not None and byte_rate > 0:
+                if eta is not None:
                     parts.append(f"预计剩余 {_format_eta(eta)}")
             downloading = [item for item in self._states.values() if item["phase_kind"] == "download"]
             if len(downloading) >= 2:
@@ -5017,9 +5260,120 @@ class BackupApp:
         self._paint_status(text, state["status_error"])
 
     def _status_tick(self) -> None:
-        """每秒只重算第二行；邮件列表与滚动位置不在这个刷新路径上。"""
+        """每秒只重算第二行并推进诊断节奏；邮件列表与滚动位置不在这个刷新路径上。"""
         self._refresh_status_line()
+        self._diag_tick()
         self._status_job = self.root.after(1000, self._status_tick)
+
+    # ------------------------------------------------------- 诊断采样（规格 §7）
+
+    def _publish_account_stats(self, account_id: str, snapshot: AccountStats) -> None:
+        """worker 线程调用：换上一份新的统计快照（不可变，主线程只读引用）。"""
+        with self._account_stats_lock:
+            self._account_stats[account_id] = snapshot
+
+    def _diag_row_fields(self, account_id: str, now: float) -> dict[str, object]:
+        """一个账户当前的诊断字段：界面侧状态 + worker 发布的统计快照。
+
+        Note:
+            只取白名单内的值：账户用邮箱地址（不是显示名）、服务器主机、文件夹显示名、阶段类别与计数。
+            速率/ETA 与第二行同口径（account_rates），且与它一样只在下载阶段给值。
+        """
+        state = self._state(account_id)
+        account = self._find_account(account_id)
+        with self._account_stats_lock:
+            stats = self._account_stats.get(account_id)
+        if stats is None:
+            stats = AccountStats()
+        progress, index, reconnect = stats.progress, stats.index, stats.reconnect
+        phase = state["phase_kind"]
+        view = account_rates(state, now) if phase == "download" else None
+        recent = [ms for at, ms in stats.batches if at >= now - DIAG_BATCH_WINDOW_S]
+        batch = progress.last_batch
+        reason = reconnect.last_reason
+        return {
+            "account": account.get("user") if account else None,
+            "host": account.get("server") if account else None,
+            "folder": stats.folder, "phase": phase,
+            "done_msgs": progress.backed, "done_bytes": progress.done_bytes,
+            "pending_msgs": state["pending_total"], "pending_bytes": state["pending_bytes"],
+            "rate_msgs_per_min": round(view[0], 1) if view else None,
+            "rate_bytes_per_s": round(view[1], 1) if view else None,
+            "eta_s": round(view[2]) if view and view[2] is not None else None,
+            "batch_msgs": batch.msgs if batch else None,
+            "batch_bytes": batch.bytes if batch else None,
+            "fetch_ms_avg": round(sum(recent) / len(recent), 1) if recent else None,
+            "fetch_ms_p95": round(_p95(recent), 1) if recent else None,
+            "fetch_failed": progress.fetch_failed,
+            "fetch_failed_missing": progress.fetch_failed_missing,
+            "fetch_failed_no_bad": progress.fetch_failed_no_bad,
+            "fetch_failed_malformed": progress.fetch_failed_malformed,
+            "folder_failures": stats.folder_failures,
+            "index_hits": index.hits, "index_misses": index.misses, "index_rebuilds": index.rebuilds,
+            "index_disabled": index.disabled, "scan_local_ms": round(index.local_ms),
+            "scan_remote_ms": round(stats.scan_remote_ms),
+            "reconnect_attempts": reconnect.attempts, "reconnect_successes": reconnect.successes,
+            "reconnect_exhausted": reconnect.exhausted, "uidvalidity_changes": reconnect.uidvalidity_changes,
+            "reconnect_reason": reason if reason in DIAG_REASONS else None,
+        }
+
+    def _diag_emit(self, event: str, account_id: str | None, *, result: str | None = None,
+                   duration: float | None = None) -> None:
+        """写一行诊断；任何异常只禁用诊断，绝不外溢到备份与事件泵。"""
+        diag = self._diag
+        if diag.disabled:
+            return
+        try:
+            fields: dict[str, object] = {"result": result,
+                                         "duration_s": None if duration is None else round(duration, 3)}
+            if account_id is not None:
+                fields.update(self._diag_row_fields(account_id, time.monotonic()))
+            diag.write(event, **fields)
+        except Exception as exc:
+            diag.disable(exc)
+
+    def _diag_phase(self, account_id: str) -> None:
+        """阶段切换：立即写 phase 行，并把该账户的 10 秒 sample 重新计时。"""
+        self._diag_emit("phase", account_id)
+        self._diag.reset_timer(account_id, time.monotonic())
+
+    def _diag_tick(self) -> None:
+        """1 秒 tick：到点的活动账户各写一条 sample。"""
+        if self._diag.disabled:
+            return
+        now = time.monotonic()
+        for account_id in self._active_account_ids():
+            if self._diag.is_due(account_id, now):
+                self._diag_emit("sample", account_id)
+                self._diag.advance_timer(account_id, now)
+
+    def _diag_account_end(self, account_id: str, result: str, duration: float | None) -> None:
+        """账户到终态：立即写 account_end（带最终统计），再放掉该账户的计时与快照。"""
+        if duration is None:
+            duration = self._diag.elapsed(account_id, time.monotonic())
+        self._diag_emit("account_end", account_id, result=result, duration=duration)
+        self._diag.end_account(account_id)
+        with self._account_stats_lock:
+            self._account_stats.pop(account_id, None)
+
+    def _diag_run_end(self) -> None:
+        """活动集合排空：写一条 run_end（账户/主机/文件夹为 null），下次运行换新 run ID。
+
+        Note:
+            结果优先级 failed > stopped > partial > completed，直接由本周期记账算出（与结束日志/
+            后台气泡同一份事实）；已停止的账户即使带失败计数也按 stopped 计，故不会误报 partial。
+        """
+        cycle = self._cycle
+        if cycle["failures"]:
+            result = "failed"
+        elif cycle["stopped"]:
+            result = "stopped"
+        elif cycle["fetch_failed"] or cycle["folder_failures"]:
+            result = "partial"
+        else:
+            result = "completed"
+        self._diag_emit("run_end", None, result=result, duration=time.monotonic() - cycle["t0"])
+        self._diag.end_run()
 
     def _set_counts(self, text: str) -> None:
         """写计数行（截断显示），并同步进可见账户的状态字典。"""
