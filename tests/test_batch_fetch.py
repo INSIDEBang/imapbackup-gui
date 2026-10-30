@@ -33,12 +33,13 @@ def make_messages(uids, sizes=None) -> dict[str, tuple[int, int]]:
     return {f"<{uid}@x>": (uid, sizes.get(uid, len(raw_message(uid)))) for uid in uids}
 
 
-def run(tmp_path, server, messages, progress=None, reports=None, log=None, report=None, **kwargs):
+def run(tmp_path, server, messages, progress=None, reports=None, log=None, report=None,
+        filename="INBOX.mbox", foldername="INBOX", **kwargs):
     progress = progress if progress is not None else core.DownloadProgress()
     reports = reports if reports is not None else []
     batches: list[core.BatchStats] = []
-    core.download_messages(server, "INBOX.mbox", messages, False, True, False,
-                           tmp_path, False, False, log or NullLog(), foldername="INBOX",
+    core.download_messages(server, filename, messages, False, True, False,
+                           tmp_path, False, False, log or NullLog(), foldername=foldername,
                            report=report or reports.append, progress=progress,
                            on_batch=batches.append, **kwargs)
     return progress, reports, batches
@@ -251,6 +252,113 @@ def test_mixed_isolation_buckets_do_not_escalate_to_a_folder_failure(tmp_path):
     assert progress.fetch_failed_no_bad == 1 and progress.fetch_failed_missing == 1
     assert [rec["msg_id"] for rec in reports] == ["<1@x>"]
     assert server.body_fetches == [[1, 2, 3], [1, 2, 3], [1], [2], [3]], server.body_fetches
+
+
+def test_a_folder_warning_reports_only_the_failures_that_call_added(tmp_path, caplog):
+    log = logging.getLogger("test.batch.failure_delta")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    progress = core.DownloadProgress()          # GUI shares one per account
+    server = make_server([1, 2, 3], missing_uids={2, 3})
+
+    run(tmp_path / "inbox", server, make_messages([1, 2]), progress=progress, log=log,
+        filename="INBOX.mbox", foldername="INBOX")
+    run(tmp_path / "sent", server, make_messages([1, 3]), progress=progress, log=log,
+        filename="Sent.mbox", foldername="Sent")
+    run(tmp_path / "sent-retry", server, make_messages([1, 3]), progress=progress, log=log,
+        filename="Sent.mbox", foldername="Sent")
+
+    warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
+    assert warnings == [
+        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+        "Sent: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+    ], warnings
+    assert progress.fetch_failed == 2
+
+
+def test_a_retried_failure_that_succeeds_is_removed_from_the_count(tmp_path):
+    progress = core.DownloadProgress()
+    server = make_server([1, 2], missing_uids={2})
+    messages = make_messages([1, 2])
+
+    run(tmp_path / "first", server, messages, progress=progress)
+    assert (progress.fetch_failed, progress.fetch_failed_missing) == (1, 1)
+
+    server.missing_uids.clear()
+    _, _, batches = run(tmp_path / "retry", server, messages, progress=progress,
+                        written={"<1@x>"})
+
+    assert progress.backed == 2
+    assert progress.fetch_failed == 0
+    assert progress.fetch_failed_missing == 0
+    assert batches[-1].fetch_failed == 0
+
+
+def test_a_retried_failure_moves_to_its_new_bucket_without_double_counting(tmp_path):
+    progress = core.DownloadProgress()
+    server = make_server([1, 2], missing_uids={2})
+    messages = make_messages([1, 2])
+
+    run(tmp_path / "first", server, messages, progress=progress)
+    assert (progress.fetch_failed, progress.fetch_failed_missing) == (1, 1)
+
+    server.missing_uids.clear()
+    server.no_bad_uids = {2}
+    _, _, batches = run(tmp_path / "retry", server, messages, progress=progress,
+                        written={"<1@x>"})
+
+    assert progress.fetch_failed == 1
+    assert progress.fetch_failed_missing == 0
+    assert progress.fetch_failed_no_bad == 1
+    assert batches[-1].fetch_failed == 0   # 换桶不算本批新增失败
+
+
+def test_an_aborted_attempts_failures_are_reported_once_by_the_retry(tmp_path, caplog):
+    log = logging.getLogger("test.batch.aborted_warning")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    progress = core.DownloadProgress()
+    aborted = False
+
+    def drop_second_batch(_server, uids):
+        nonlocal aborted
+        if 9 in uids and not aborted:
+            aborted = True
+            raise imaplib.IMAP4.abort("connection lost")
+
+    server = make_server(range(1, 10), missing_uids={1}, body_hook=drop_second_batch)
+    messages = make_messages(range(1, 10))
+
+    with pytest.raises(imaplib.IMAP4.abort):
+        run(tmp_path / "first", server, messages, progress=progress, log=log)
+    assert progress.fetch_failed == 1
+
+    written = {f"<{uid}@x>" for uid in range(2, 9)}
+    run(tmp_path / "retry", server, messages, progress=progress, log=log, written=written)
+
+    warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
+    assert warnings == [
+        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+    ], warnings
+    assert progress.fetch_failed == 1 and progress.backed == 8
+
+
+def test_folders_sharing_an_output_name_count_their_failures_separately(tmp_path, caplog):
+    """A/B 与 A.B 都输出 A.B.mbox，但失败按文件夹身份计，不互相掩盖。"""
+    log = logging.getLogger("test.batch.folder_identity")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    progress = core.DownloadProgress()
+    server = make_server([1, 2], missing_uids={2})
+
+    run(tmp_path / "a", server, make_messages([1, 2]), progress=progress, log=log,
+        filename="A.B.mbox", foldername="A/B")
+    run(tmp_path / "b", server, make_messages([1, 2]), progress=progress, log=log,
+        filename="A.B.mbox", foldername="A.B")
+
+    warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
+    assert warnings == [
+        "A/B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+        "A.B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+    ], warnings
+    assert progress.fetch_failed == 2
 
 
 @pytest.mark.parametrize("exc_type", [imaplib.IMAP4.abort, OSError])

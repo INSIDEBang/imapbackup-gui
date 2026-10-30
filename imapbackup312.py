@@ -148,7 +148,7 @@ class BatchStats:
 
 @dataclass
 class DownloadProgress:
-    """Mutable per-folder accumulator; a reconnect keeps adding to the same instance."""
+    """Mutable accumulator; the GUI shares one per account and a reconnect keeps adding to it."""
 
     backed: int = 0
     fetch_failed: int = 0
@@ -159,6 +159,8 @@ class DownloadProgress:
     batches: int = 0
     last_batch: BatchStats | None = None
     stopped: bool = False
+    failures: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
+    unreported_failures: set[tuple[str, str]] = field(default_factory=set, repr=False)
 
 
 @dataclass
@@ -730,6 +732,15 @@ def _write_message(raw_bytes: bytes, meta_text: str, msg_id: str, *,
     return _MessageOutput(timestamp, from_value, subject_value, size, wrote, wrote_mbox, eml_relpath)
 
 
+def _bump_failure_bucket(progress: DownloadProgress, failure: str, delta: int) -> None:
+    if failure == "missing":
+        progress.fetch_failed_missing += delta
+    elif failure == "no_bad":
+        progress.fetch_failed_no_bad += delta
+    else:
+        progress.fetch_failed_malformed += delta
+
+
 def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, tuple[int, int]],
                       overwrite: bool, nospinner: bool, thunderbird: bool,
                       basedir: Path | None, icloud: bool, quiet: bool, log: logging.Logger,
@@ -815,24 +826,33 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                     log.info("%s: stopped by request; discarding fetched batch", display)
                 break
             backed_before = progress.backed
-            failed_before = progress.fetch_failed
+            batch_new_failures = 0
             for msg_id, uid, size in batch:
                 if msg_id in written:
                     continue
                 failure = failures.get(uid)
+                key = (display, msg_id)
                 if failure is not None:
-                    progress.fetch_failed += 1
-                    if failure == "missing":
-                        progress.fetch_failed_missing += 1
-                    elif failure == "no_bad":
-                        progress.fetch_failed_no_bad += 1
-                    else:
-                        progress.fetch_failed_malformed += 1
+                    previous = progress.failures.get(key)
+                    if previous != failure:
+                        if previous is None:
+                            progress.fetch_failed += 1
+                            batch_new_failures += 1
+                        else:
+                            _bump_failure_bucket(progress, previous, -1)
+                        progress.failures[key] = failure
+                        progress.unreported_failures.add(key)
+                        _bump_failure_bucket(progress, failure, 1)
                     log.debug("%s: could not fetch %s (%s)", display, msg_id, failure)
                     continue
                 entry = fetched.get(uid)
                 if entry is None:
                     continue
+                previous = progress.failures.pop(key, None)
+                if previous is not None:
+                    progress.fetch_failed -= 1
+                    progress.unreported_failures.discard(key)
+                    _bump_failure_bucket(progress, previous, -1)
                 meta, raw_bytes = entry
                 output = _write_message(raw_bytes, str(meta, "utf-8", "replace"), msg_id,
                                         mbox=mbox, eml_dir=eml_dir, skip_mbox=skip_mbox,
@@ -870,7 +890,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
             stats = BatchStats(msgs=len(batch), bytes=sum(size for _, _, size in batch),
                                fetch_ms=fetch_ms,
                                backed=progress.backed - backed_before,
-                               fetch_failed=progress.fetch_failed - failed_before)
+                               fetch_failed=batch_new_failures)
             progress.batches += 1
             progress.last_batch = stats
             if mbox is not None:
@@ -903,10 +923,14 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
         spinner.stop()
     if not quiet:
         log.info("%s: %s total, %s largest", filename, pretty_byte_count(output_bytes), pretty_byte_count(biggest))
-        if progress.fetch_failed:
+        pending = {key for key in progress.unreported_failures if key[0] == display}
+        if pending:
+            buckets = [progress.failures[key] for key in pending]
+            missing = buckets.count("missing")
+            no_bad = buckets.count("no_bad")
             log.warning("%s: %d message(s) could not be fetched (missing=%d, no_bad=%d, malformed=%d)",
-                        display, progress.fetch_failed, progress.fetch_failed_missing,
-                        progress.fetch_failed_no_bad, progress.fetch_failed_malformed)
+                        display, len(buckets), missing, no_bad, len(buckets) - missing - no_bad)
+            progress.unreported_failures -= pending
     return progress
 
 

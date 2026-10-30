@@ -4736,7 +4736,8 @@ class BackupApp:
                 batch_log.popleft()
             self._publish_account_stats(account_id, AccountStats(
                 folder=current_folder, folder_failures=folder_failures, scan_remote_ms=scan_remote_ms,
-                progress=replace(progress), index=replace(index_stats),
+                progress=replace(progress, failures={}, unreported_failures=set()),
+                index=replace(index_stats),
                 reconnect=replace(reconnect_stats), batches=tuple(batch_log)))
 
         publish()   # 先把上一轮的残留快照换掉

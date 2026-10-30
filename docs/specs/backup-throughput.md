@@ -176,6 +176,10 @@ class DownloadProgress:
     batches: int = 0
     last_batch: "BatchStats | None" = None
     stopped: bool = False
+    failures: dict[tuple[str, str], str] = field(default_factory=dict)
+                                         # 已计失败的 (文件夹显示名, Message-Id) → 桶；重连重试去重
+    unreported_failures: set[tuple[str, str]] = field(default_factory=set)
+                                         # 还没被文件夹结束 WARNING 报过的失败
 
 @dataclass(frozen=True)
 class BatchStats:
@@ -183,7 +187,7 @@ class BatchStats:
     bytes: int
     fetch_ms: float
     backed: int
-    fetch_failed: int
+    fetch_failed: int                    # 本批新增的失败数；失败换桶不计
 
 @dataclass
 class FolderPlan:
@@ -350,6 +354,8 @@ def download_messages(
 | 连接 abort/OSError/BYE | 不在 `download_messages` 内重试；本批不写半批；交给 5.7 重连 |
 | 认证/SELECT NO | 不重试；SELECT NO 算文件夹失败，认证失败按账户失败 |
 | 本地写盘错误 | `BackupWriteError`；不算已备份；不触发重连；向上抛 |
+
+`fetch_failed` 按 `(文件夹显示名, Message-Id)` 去重：同一文件夹内重连重试后同一封只计一次；补取成功后从计数和对应桶中移除；失败类别变化只在桶之间移动，总数不变。以 abort 结束的调用不打印文件夹警告，未报告的失败留给同一文件夹的下一次调用。
 
 `FolderFetchError` 是文件夹级异常，不是账户级异常。CLI 捕获后记录并继续下一个文件夹，退出码不变；GUI 计入 `folder_failures` 并继续。
 
@@ -898,7 +904,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | | `batch_bytes` | int/null | 最近完成批的请求字节 |
 | | `fetch_ms_avg` | float/null | 最近 10 秒批次的平均取信耗时 |
 | | `fetch_ms_p95` | float/null | 最近 10 秒批次的 p95 |
-| 失败 | `fetch_failed` | int | 总取信失败 |
+| 失败 | `fetch_failed` | int | 当前取信失败总数（补取成功会减少） |
 | | `fetch_failed_missing` | int | 缺失 UID |
 | | `fetch_failed_no_bad` | int | 单封 NO/BAD |
 | | `fetch_failed_malformed` | int | 畸形响应 |
@@ -959,6 +965,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
   - 索引重建/禁用：WARNING。
   - 重连：断线 WARNING、重试 INFO、成功 INFO、耗尽 ERROR。
   - 文件夹失败：WARNING，含文件夹显示名与类别。
+  - 文件夹结束的取信失败 WARNING 只报该文件夹尚未报告过的失败（含桶）；没有则不打。GUI 的账户级 `DownloadProgress` 跨文件夹与重连重试共享：abort 未及打印的失败由重试补报，已报过的不重复刷屏。
   - 账户结束：现有行扩展为 `备份 N 封，跳过 M 封，取信失败 K 封，文件夹失败 F 个，用时 ...`。
   - 运行结束：现有行扩展聚合失败计数。
 - 不新增 35 专用日志行；不把服务端原始响应写入运行日志（现有异常消息可能含状态文本，保持现状）。
@@ -1110,7 +1117,7 @@ basedpyright imapbackup312.py imapbackup_gui.py
 |---|---|
 | A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
 | B 批量 | 8 封/8 MiB 边界；第 9 封新批；单封 8 MiB+ 独占；size 0 独占；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
-| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试 |
+| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告 |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
 | E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连 |
 | F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；单账户停止不影响其他账户；停止优先于重连 |
