@@ -54,7 +54,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from functools import cache
 from pathlib import Path
-from typing import IO
+from typing import IO, NoReturn
 
 # Daily run log shared with the Tkinter GUI: both entry points append to one
 # file per day under the app data directory, which the uninstaller deletes whole.
@@ -98,6 +98,15 @@ class SkipFolderException(Exception):
 
 class FolderFetchError(Exception):
     """A whole body-fetch batch was rejected per UID: one folder failure, not an account failure."""
+
+
+class BatchStalled(OSError):
+    """A body-fetch batch hit the socket read timeout; the link is rebuilt on purpose.
+
+    Retryable like any OSError, but run_with_reconnect must not spend the
+    consecutive-failure budget on it: a couple of unreadable messages would
+    otherwise exhaust the budget and fail a folder that can still back up the rest.
+    """
 
 
 class BackupWriteError(Exception):
@@ -155,12 +164,25 @@ class DownloadProgress:
     fetch_failed_missing: int = 0
     fetch_failed_no_bad: int = 0
     fetch_failed_malformed: int = 0
+    fetch_failed_timeout: int = 0
     done_bytes: int = 0
     batches: int = 0
     last_batch: BatchStats | None = None
     stopped: bool = False
     failures: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
     unreported_failures: set[tuple[str, str]] = field(default_factory=set, repr=False)
+
+
+@dataclass
+class BatchStall:
+    """One folder run's memory of body-fetch batches that hit the read timeout.
+
+    ``split`` messages are fetched alone on the next attempt; a message that
+    times out even alone moves to ``skipped`` and is given up for this run.
+    """
+
+    split: set[str] = field(default_factory=set)
+    skipped: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -592,18 +614,20 @@ def _fetch_one(server: imaplib.IMAP4, uid: int, items: str) -> tuple[str, tuple[
     return "ok", (entry[0], entry[1])
 
 
-def _plan_batches(items: list[tuple[str, int, int]]) -> list[list[tuple[str, int, int]]]:
+def _plan_batches(items: list[tuple[str, int, int]],
+                  singles: Container[str]) -> list[list[tuple[str, int, int]]]:
     """Split UID-sorted (Message-Id, UID, size) into <=8 messages / <=8 MiB batches.
 
-    Unknown (size <= 0) and oversized messages take a batch of their own, so a
-    single huge message never drags neighbours over the byte cap.
+    Unknown (size <= 0), oversized and ``singles`` messages take a batch of
+    their own, so one huge message never drags neighbours over the byte cap and
+    a message that stalled a batch is retried on its own.
     """
     batches: list[list[tuple[str, int, int]]] = []
     current: list[tuple[str, int, int]] = []
     current_bytes = 0
     for item in items:
         size = item[2]
-        if size <= 0 or size > FETCH_BATCH_MAX_BYTES:
+        if size <= 0 or size > FETCH_BATCH_MAX_BYTES or item[0] in singles:
             if current:
                 batches.append(current)
                 current = []
@@ -680,6 +704,33 @@ def _fetch_batch(server: imaplib.IMAP4, batch: list[tuple[str, int, int]], log: 
     return fetched, failures
 
 
+def _handle_batch_timeout(exc: TimeoutError, batch: list[tuple[str, int, int]],
+                          stall: BatchStall | None, progress: DownloadProgress,
+                          log: logging.Logger, display: str) -> NoReturn:
+    """Split a timed-out batch for a per-UID retry, or give up one lone message.
+
+    Always raises: the original timeout when the caller keeps no stall tracker
+    (old behavior), else BatchStalled so the link is rebuilt. The batch was not
+    written, and imaplib cannot be trusted after a read timeout.
+    """
+    if stall is None:
+        raise exc
+    total_bytes = sum(size for _, _, size in batch)
+    if len(batch) > 1 or batch[0][0] not in stall.split:
+        stall.split |= {msg_id for msg_id, _, _ in batch}
+        log.warning("%s: body fetch of %d message(s), %s, timed out; retrying them one by one",
+                    display, len(batch), pretty_byte_count(total_bytes))
+        raise BatchStalled(
+            f"body fetch timed out ({len(batch)} message(s), {total_bytes} bytes)") from exc
+    msg_id, uid, size = batch[0]
+    stall.split.discard(msg_id)
+    stall.skipped.add(msg_id)
+    _record_failure(progress, (display, msg_id), "timeout")
+    log.warning("%s: giving up on %s (UID %d, %s) after it timed out alone; skipping it for this run",
+                display, msg_id, uid, pretty_byte_count(size))
+    raise BatchStalled(f"single message fetch timed out (UID {uid})") from exc
+
+
 @dataclass(frozen=True)
 class _MessageOutput:
     timestamp: datetime
@@ -737,8 +788,29 @@ def _bump_failure_bucket(progress: DownloadProgress, failure: str, delta: int) -
         progress.fetch_failed_missing += delta
     elif failure == "no_bad":
         progress.fetch_failed_no_bad += delta
+    elif failure == "timeout":
+        progress.fetch_failed_timeout += delta
     else:
         progress.fetch_failed_malformed += delta
+
+
+def _record_failure(progress: DownloadProgress, key: tuple[str, str], failure: str) -> bool:
+    """Book one fetch failure, moving the bucket when the reason changed.
+
+    Returns True when the key was not already failing, so batch callers can
+    tell a new failure from a re-classified one.
+    """
+    previous = progress.failures.get(key)
+    if previous == failure:
+        return False
+    if previous is None:
+        progress.fetch_failed += 1
+    else:
+        _bump_failure_bucket(progress, previous, -1)
+    progress.failures[key] = failure
+    progress.unreported_failures.add(key)
+    _bump_failure_bucket(progress, failure, 1)
+    return previous is None
 
 
 def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, tuple[int, int]],
@@ -752,6 +824,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                       *, written: set[str] | None = None,
                       progress: DownloadProgress | None = None,
                       on_batch: Callable[[BatchStats], None] | None = None,
+                      stall: BatchStall | None = None,
                       index_mbox: IndexWriter | None = None,
                       index_eml: IndexWriter | None = None) -> DownloadProgress:
     """Fetch pending messages in UID batches, writing only the formats each one lacks.
@@ -759,6 +832,11 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     Messages are fetched once each as `(UID, RFC822.SIZE)` pairs; a batch is fully
     parsed before any byte is written, failed UIDs are counted per bucket and never
     counted as backed, and a stop discards the rest of the in-flight batch.
+
+    A read timeout on a batch raises BatchStalled (when ``stall`` is tracked) so
+    the caller rebuilds the link: the batch is fetched one message at a time, and
+    a message that still times out alone is counted in the timeout bucket and
+    skipped for the rest of the run (spec §5.7.9).
     """
     if skip_mbox is None:
         skip_mbox = frozenset()
@@ -796,8 +874,10 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     count = len(messages)
     ordered = sorted(((msg_id, uid, size) for msg_id, (uid, size) in messages.items()),
                      key=lambda item: item[1])
+    if stall is not None and stall.skipped:
+        ordered = [item for item in ordered if item[0] not in stall.skipped]
     index_of = {msg_id: idx for idx, msg_id in enumerate(messages, start=1)}
-    batches = _plan_batches(ordered)
+    batches = _plan_batches(ordered, stall.split if stall is not None else frozenset())
     spinner = Spinner(f"Downloading {count} new messages to {display}", nospinner, quiet=quiet)
     biggest = 0
     output_bytes = 0
@@ -818,7 +898,10 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                     log.info("%s: stopped by request before next batch", display)
                 break
             batch_t0 = time.monotonic()
-            fetched, failures = _fetch_batch(server, batch, log, display)
+            try:
+                fetched, failures = _fetch_batch(server, batch, log, display)
+            except TimeoutError as exc:
+                _handle_batch_timeout(exc, batch, stall, progress, log, display)
             fetch_ms = (time.monotonic() - batch_t0) * 1000.0
             if should_stop is not None and should_stop():
                 progress.stopped = True
@@ -833,16 +916,8 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                 failure = failures.get(uid)
                 key = (display, msg_id)
                 if failure is not None:
-                    previous = progress.failures.get(key)
-                    if previous != failure:
-                        if previous is None:
-                            progress.fetch_failed += 1
-                            batch_new_failures += 1
-                        else:
-                            _bump_failure_bucket(progress, previous, -1)
-                        progress.failures[key] = failure
-                        progress.unreported_failures.add(key)
-                        _bump_failure_bucket(progress, failure, 1)
+                    if _record_failure(progress, key, failure):
+                        batch_new_failures += 1
                     log.debug("%s: could not fetch %s (%s)", display, msg_id, failure)
                     continue
                 entry = fetched.get(uid)
@@ -928,8 +1003,11 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
             buckets = [progress.failures[key] for key in pending]
             missing = buckets.count("missing")
             no_bad = buckets.count("no_bad")
-            log.warning("%s: %d message(s) could not be fetched (missing=%d, no_bad=%d, malformed=%d)",
-                        display, len(buckets), missing, no_bad, len(buckets) - missing - no_bad)
+            malformed = buckets.count("malformed")
+            timeout = buckets.count("timeout")
+            log.warning("%s: %d message(s) could not be fetched "
+                        "(missing=%d, no_bad=%d, malformed=%d, timeout=%d)",
+                        display, len(buckets), missing, no_bad, malformed, timeout)
             progress.unreported_failures -= pending
     return progress
 
@@ -2128,6 +2206,9 @@ def run_with_reconnect[T](
     ``operation`` receives a usable connection and owns its SELECT, UIDVALIDITY
     check and resume. Only abort/OSError/BYE are retried; every other exception
     (write errors, folder failures, auth failures, stop) propagates unchanged.
+    A BatchStalled rebuilds the link immediately without spending the
+    consecutive-failure budget and without ``on_backoff``; a dial failure that
+    follows is charged normally.
     A successful operation returns the live connection so the caller can keep
     using it; the consecutive-failure budget belongs to this call, so the next
     operation starts fresh. Stop wins over the next retry and over exhaustion.
@@ -2135,6 +2216,7 @@ def run_with_reconnect[T](
     stats = stats if stats is not None else ReconnectStats()
     current = server
     failures = 0
+    exempt = False                    # 下一跳是正文超时后的刻意重建：不占预算、不退避
     last_error: Exception | None = None
     while True:
         if should_stop is not None and should_stop():
@@ -2157,7 +2239,13 @@ def run_with_reconnect[T](
                 raise
             last_error = exc
             stats.last_reason = reason
-            log.warning("Connection lost (%s); reconnecting", reason)
+            exempt = isinstance(exc, BatchStalled)
+            if exempt:
+                # 取信超时是刻意重建链路：不烧连续失败预算，也不再叠加退避，
+                # 否则几封读不动的邮件就能把整个文件夹判失败（规格 §5.7.9）
+                log.info("Body fetch timed out; reconnecting to continue")
+            else:
+                log.warning("Connection lost (%s); reconnecting", reason)
             _close_connection(current)
         else:
             if failures:
@@ -2168,20 +2256,28 @@ def run_with_reconnect[T](
             # 停止优先于耗尽：最后一跳失败后用户已点停止时，按停止收口而不是记一次失败
             if should_stop is not None and should_stop():
                 raise ReconnectStopped("stopped before the next reconnect attempt")
-            failures += 1
-            if failures > RECONNECT_MAX_ATTEMPTS:
-                stats.exhausted = True
-                log.error("Reconnect exhausted after %d attempts (%s)",
-                          RECONNECT_MAX_ATTEMPTS, stats.last_reason)
-                assert last_error is not None
-                raise last_error
+            exempt_dial = exempt
+            exempt = False
+            delay = 0.0
+            if not exempt_dial:
+                failures += 1
+                if failures > RECONNECT_MAX_ATTEMPTS:
+                    stats.exhausted = True
+                    log.error("Reconnect exhausted after %d attempts (%s)",
+                              RECONNECT_MAX_ATTEMPTS, stats.last_reason)
+                    assert last_error is not None
+                    raise last_error
+                cap = min(RECONNECT_BACKOFF_CAP_S, RECONNECT_BACKOFF_BASE_S * 4 ** (failures - 1))
+                delay = random.uniform(0.0, cap)
             stats.attempts += 1
-            cap = min(RECONNECT_BACKOFF_CAP_S, RECONNECT_BACKOFF_BASE_S * 4 ** (failures - 1))
-            delay = random.uniform(0.0, cap)
-            log.info("Reconnect attempt %d/%d in %.1fs (%s)", failures,
-                     RECONNECT_MAX_ATTEMPTS, delay, stats.last_reason)
-            if on_backoff is not None:
-                on_backoff(failures, delay)
+            if exempt_dial:
+                log.info("Reconnecting immediately after the timed-out body fetch (%s)",
+                         stats.last_reason)
+            else:
+                log.info("Reconnect attempt %d/%d in %.1fs (%s)", failures,
+                         RECONNECT_MAX_ATTEMPTS, delay, stats.last_reason)
+                if on_backoff is not None:
+                    on_backoff(failures, delay)
             if _wait_before_reconnect(delay, should_stop):
                 raise ReconnectStopped("stopped while waiting to reconnect")
             try:
@@ -2194,7 +2290,11 @@ def run_with_reconnect[T](
                     raise
                 last_error = exc
                 stats.last_reason = reason
-                log.warning("Reconnect attempt %d failed (%s)", failures, reason)
+                if exempt_dial:
+                    log.warning("Immediate reconnect after the timed-out body fetch failed (%s)",
+                                reason)
+                else:
+                    log.warning("Reconnect attempt %d failed (%s)", failures, reason)
                 continue
             if should_stop is not None and should_stop():
                 _close_connection(fresh)
@@ -2280,6 +2380,7 @@ def main(argv: list[str] | None = None) -> int:
             new_messages = pending_messages(remote.messages, local_mbox, local_eml)
             label = mbox_relpath if cfg.basedir is not None else eml_rel
             written: set[str] = set()
+            stall = BatchStall()
 
             def do_download(conn: imaplib.IMAP4, messages: dict[str, tuple[int, int]],
                             overwrite_now: bool) -> None:
@@ -2294,7 +2395,7 @@ def main(argv: list[str] | None = None) -> int:
                                   cfg.thunderbird, cfg.basedir, cfg.icloud, quiet=cfg.quiet, log=log,
                                   eml_dir=eml_folder_dir, skip_mbox=local_mbox, skip_eml=local_eml,
                                   foldername=display, verbose=cfg.verbose, compact=cfg.compact,
-                                  written=written, progress=progress,
+                                  written=written, progress=progress, stall=stall,
                                   index_mbox=index_mbox, index_eml=index_eml)
 
             def rescan(conn: imaplib.IMAP4) -> FolderScan:

@@ -9,6 +9,7 @@ FIELDS = [
     "rate_msgs_per_min", "rate_bytes_per_s", "eta_s",
     "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95",
     "fetch_failed", "fetch_failed_missing", "fetch_failed_no_bad", "fetch_failed_malformed",
+    "fetch_failed_timeout",
     "folder_failures",
     "index_hits", "index_misses", "index_rebuilds", "index_disabled", "scan_local_ms", "scan_remote_ms",
     "reconnect_attempts", "reconnect_successes", "reconnect_exhausted", "uidvalidity_changes",

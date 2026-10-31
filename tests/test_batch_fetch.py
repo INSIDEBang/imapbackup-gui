@@ -1,8 +1,9 @@
 """UID 批量正文取信与失败矩阵（规格 §12.2 B、C 组）。
 
 正文按 UID 升序切批（≤8 封、≤8 MiB，超限/未知大小独占一批），每批解析完才写盘；
-失败按 missing / no_bad / malformed 三桶计数，绝不冲抵已备份；批次 NO/BAD 整批重试
-一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败。假服务器，不需要凭证。
+失败按 missing / no_bad / malformed / timeout 四桶计数，绝不冲抵已备份；批次 NO/BAD 整批重试
+一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败；正文读超时先拆批再放弃单封。
+假服务器，不需要凭证。
 """
 import imaplib
 import inspect
@@ -54,6 +55,34 @@ def mbox_ids(path):
         return [msg.get("Message-Id") for msg in mb]
     finally:
         mb.close()
+
+
+def timeout_on(uids):
+    """正文请求只要含这些 UID 就抛 TimeoutError，模拟 socket 读超时。"""
+    wanted = set(uids)
+
+    def hook(_server, batch):
+        if wanted & set(batch):
+            return TimeoutError("The read operation timed out")
+        return None
+
+    return hook
+
+
+def run_until_stable(tmp_path, server, messages, stall, progress=None, log=None):
+    """按 download_folder_with_reconnect 的语义重跑：每轮只传剩余消息，直到不再抛 BatchStalled。"""
+    progress = progress if progress is not None else core.DownloadProgress()
+    log = log if log is not None else NullLog()
+    written: set[str] = set()
+    for _ in range(6):
+        remaining = {msg_id: item for msg_id, item in messages.items() if msg_id not in written}
+        try:
+            run(tmp_path, server, remaining, progress=progress, log=log,
+                written=written, stall=stall)
+            return progress, written
+        except core.BatchStalled:
+            continue
+    pytest.fail("BatchStalled kept repeating; the stall bookkeeping never converged")
 
 
 # --- B 组：切批 -----------------------------------------------------------------
@@ -269,8 +298,8 @@ def test_a_folder_warning_reports_only_the_failures_that_call_added(tmp_path, ca
 
     warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
     assert warnings == [
-        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
-        "Sent: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
+        "Sent: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
     ], warnings
     assert progress.fetch_failed == 2
 
@@ -336,7 +365,7 @@ def test_an_aborted_attempts_failures_are_reported_once_by_the_retry(tmp_path, c
 
     warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
     assert warnings == [
-        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+        "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
     ], warnings
     assert progress.fetch_failed == 1 and progress.backed == 8
 
@@ -355,10 +384,95 @@ def test_folders_sharing_an_output_name_count_their_failures_separately(tmp_path
 
     warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
     assert warnings == [
-        "A/B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
-        "A.B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0)",
+        "A/B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
+        "A.B: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
     ], warnings
     assert progress.fetch_failed == 2
+
+
+# --- C 组补充：正文取信超时（socket 读超时）--------------------------------------
+
+def test_a_timed_out_multi_message_batch_is_split_for_the_next_attempt(tmp_path):
+    """整批超时先拆成单封：不写半批，记住这批 UID 下一轮逐封取。"""
+    server = make_server([1, 2], raise_body_hook=timeout_on([2]))
+    stall = core.BatchStall()
+    progress = core.DownloadProgress()
+
+    with pytest.raises(core.BatchStalled):
+        run(tmp_path, server, make_messages([1, 2]), progress=progress, stall=stall)
+
+    assert server.body_fetches == [[1, 2]], server.body_fetches
+    assert stall.split == {"<1@x>", "<2@x>"} and stall.skipped == set()
+    assert progress.backed == 0 and progress.fetch_failed == 0
+    assert mbox_ids(tmp_path) == []
+
+
+def test_a_lone_message_that_stalls_is_abandoned_and_counted_as_timeout(tmp_path, caplog):
+    """拆开后仍超时的那封记 timeout 跳过；其余照常写完，文件夹不判失败。"""
+    log = logging.getLogger("test.batch.stall_give_up")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    messages = make_messages([1, 2])
+    server = make_server([1, 2], raise_body_hook=timeout_on([2]))
+    stall = core.BatchStall()
+
+    progress, written = run_until_stable(tmp_path, server, messages, stall, log=log)
+
+    assert server.body_fetches == [[1, 2], [1], [2]], server.body_fetches
+    assert written == {"<1@x>"} and mbox_ids(tmp_path) == ["<1@x>"]
+    assert (progress.backed, progress.fetch_failed) == (1, 1)
+    assert progress.fetch_failed_timeout == 1
+    assert progress.failures == {("INBOX", "<2@x>"): "timeout"}
+    assert stall.skipped == {"<2@x>"}
+    warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
+    assert warnings == [
+        "INBOX: 1 message(s) could not be fetched (missing=0, no_bad=0, malformed=0, timeout=1)",
+    ], warnings
+
+
+def test_a_single_message_batch_that_stalls_gets_one_more_attempt(tmp_path):
+    """独占一批的大邮件先单独重试一次，不把一次超时直接当放弃。"""
+    sizes = {1: 8 * MIB + 1}
+    calls = []
+
+    def timeout_once(_server, batch):
+        calls.append(list(batch))
+        return TimeoutError("The read operation timed out") if len(calls) == 1 else None
+
+    server = make_server([1], sizes=sizes, raise_body_hook=timeout_once)
+    stall = core.BatchStall()
+    progress, written = run_until_stable(tmp_path, server, make_messages([1], sizes), stall)
+
+    assert server.body_fetches == [[1], [1]], server.body_fetches
+    assert written == {"<1@x>"}
+    assert (progress.backed, progress.fetch_failed) == (1, 0)
+    assert stall.split == {"<1@x>"} and stall.skipped == set()
+
+
+def test_a_stall_without_a_tracker_propagates_the_timeout(tmp_path):
+    """不传 BatchStall（旧调用方）时保持原行为：TimeoutError 原样上抛。"""
+    server = make_server([1, 2], raise_body_hook=timeout_on([2]))
+
+    with pytest.raises(TimeoutError):
+        run(tmp_path, server, make_messages([1, 2]))
+
+    assert server.body_fetches == [[1, 2]], server.body_fetches
+
+
+def test_an_abandoned_message_that_succeeds_in_a_later_run_clears_the_timeout_bucket(tmp_path):
+    progress = core.DownloadProgress()
+    messages = make_messages([1, 2])
+    server = make_server([1, 2], raise_body_hook=timeout_on([2]))
+
+    run_until_stable(tmp_path / "first", server, messages, core.BatchStall(), progress)
+    assert (progress.fetch_failed, progress.fetch_failed_timeout) == (1, 1)
+
+    server.raise_body_hook = None
+    pending = {"<2@x>": messages["<2@x>"]}      # 下次运行按本地快照只算缺的那封
+    _, written = run_until_stable(tmp_path / "retry", server, pending, core.BatchStall(), progress)
+
+    assert written == {"<2@x>"}
+    assert progress.backed == 2
+    assert (progress.fetch_failed, progress.fetch_failed_timeout) == (0, 0)
 
 
 @pytest.mark.parametrize("exc_type", [imaplib.IMAP4.abort, OSError])

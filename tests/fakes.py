@@ -80,6 +80,8 @@ class UidFetchServer(imaplib.IMAP4):
     - reverse_responses：故意逆序返回，验证按请求顺序处理。
     - body_hook：正文请求读取后、应答前调用 body_hook(self, uids)，可用来模拟停止。
     - raise_body：正文请求直接抛出该异常（abort/OSError 传播）。
+    - raise_body_hook：按批次返回要抛出的异常；返回 None 表示正常应答。用来让
+      指定 UID 或指定批次的正文请求超时，而不影响其余请求。
     - select_ok=False / uidvalidity=None：SELECT 失败、缺 UIDVALIDITY。
     """
     def __init__(self, raws, *, sizes=None, uidvalidity: int | str | None = 777, select_ok=True,
@@ -88,7 +90,7 @@ class UidFetchServer(imaplib.IMAP4):
                  fail_search_times=0, fail_header_times=0, fail_body_times=0,
                  duplicate_uids=(), folders=("INBOX",), select_fail_folders=(),
                  reverse_responses=False, body_hook=None, raise_body=None,
-                 internaldate=DEFAULT_INTERNALDATE):
+                 raise_body_hook=None, internaldate=DEFAULT_INTERNALDATE):
         self.raws = dict(raws)
         self.sizes = dict(sizes or {})
         self.uidvalidity = uidvalidity
@@ -109,6 +111,7 @@ class UidFetchServer(imaplib.IMAP4):
         self.reverse_responses = reverse_responses
         self.body_hook = body_hook
         self.raise_body = raise_body
+        self.raise_body_hook = raise_body_hook
         self.internaldate = internaldate
         self.current_mailbox: str | None = None
         self.untagged_responses: dict[str, _list] = {}
@@ -163,6 +166,10 @@ class UidFetchServer(imaplib.IMAP4):
                 return "NO", [b"folder rejected"]
             if self.raise_body is not None:
                 raise self.raise_body
+            if self.raise_body_hook is not None:
+                raised = self.raise_body_hook(self, uids)
+                if raised is not None:
+                    raise raised
             if self.fail_body_times:
                 self.fail_body_times -= 1
                 return "NO", [b"body failed"]

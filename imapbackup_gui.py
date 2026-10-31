@@ -720,6 +720,7 @@ DIAG_FIELDS = (
     "rate_msgs_per_min", "rate_bytes_per_s", "eta_s",
     "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95",
     "fetch_failed", "fetch_failed_missing", "fetch_failed_no_bad", "fetch_failed_malformed",
+    "fetch_failed_timeout",
     "folder_failures",
     "index_hits", "index_misses", "index_rebuilds", "index_disabled", "scan_local_ms", "scan_remote_ms",
     "reconnect_attempts", "reconnect_successes", "reconnect_exhausted", "uidvalidity_changes",
@@ -4813,6 +4814,7 @@ class BackupApp:
             label = mbox_relpath if basedir is not None else eml_rel
             eml_folder_dir = eml_root / eml_rel if eml_root is not None else None
             written: set[str] = set()
+            stall = core.BatchStall()
             download_text = f"备份 {display}（{len(plan.pending)} 封）"
             reported_failures = progress.fetch_failed
 
@@ -4839,7 +4841,8 @@ class BackupApp:
                                        eml_dir=eml_folder_dir, skip_mbox=plan.local_mbox,
                                        skip_eml=plan.local_eml, foldername=display,
                                        report=report, should_stop=stop_event.is_set,
-                                       written=written, progress=progress, on_batch=report_batch,
+                                       written=written, progress=progress, stall=stall,
+                                       on_batch=report_batch,
                                        index_mbox=index_mbox, index_eml=index_eml)
 
             def rescan(conn):
@@ -4938,7 +4941,8 @@ class BackupApp:
         eq.put(("account_done", account_id, backed, server_total - pending_total, seconds,
                 stop_event.is_set(), pending_total, progress.fetch_failed,
                 progress.fetch_failed_missing, progress.fetch_failed_no_bad,
-                progress.fetch_failed_malformed, folder_failures))
+                progress.fetch_failed_malformed, folder_failures,
+                progress.fetch_failed_timeout))
 
     def _is_account_active(self, account_id: str | None) -> bool:
         """该账户是否处于备份活动态（连接/统计/下载/停止中）。"""
@@ -5161,7 +5165,8 @@ class BackupApp:
     def _on_account_done(self, account_id: str, backed: int, skipped: int, seconds: float,
                          stopped: bool, pending: int, fetch_failed: int,
                          fetch_failed_missing: int, fetch_failed_no_bad: int,
-                         fetch_failed_malformed: int, folder_failures: int) -> None:
+                         fetch_failed_malformed: int, folder_failures: int,
+                         fetch_failed_timeout: int = 0) -> None:
         """单个账户跑完：结果文案（停止/已是最新/部分完成/完成）+ 行尾终态图标。"""
         state = self._states.get(account_id)
         if state is None:
@@ -5198,9 +5203,10 @@ class BackupApp:
                       account_display(account) if account else account_id, summary,
                       _fmt_duration(seconds), "（用户停止）" if stopped else "")
         if fetch_failed:
-            self.log.debug("账户 %s 取信失败明细：缺失 %d，NO/BAD %d，畸形 %d",
+            self.log.debug("账户 %s 取信失败明细：缺失 %d，NO/BAD %d，畸形 %d，超时 %d",
                            account_display(account) if account else account_id,
-                           fetch_failed_missing, fetch_failed_no_bad, fetch_failed_malformed)
+                           fetch_failed_missing, fetch_failed_no_bad, fetch_failed_malformed,
+                           fetch_failed_timeout)
         # 终态图标只挂给仍勾选（仍有备份意愿）的账户：脱钩即意愿移除，不挂结果也不进冷却
         if account_id in self._checked_accounts:
             if stopped:
@@ -5387,6 +5393,7 @@ class BackupApp:
             "fetch_failed_missing": progress.fetch_failed_missing,
             "fetch_failed_no_bad": progress.fetch_failed_no_bad,
             "fetch_failed_malformed": progress.fetch_failed_malformed,
+            "fetch_failed_timeout": progress.fetch_failed_timeout,
             "folder_failures": stats.folder_failures,
             "index_hits": index.hits, "index_misses": index.misses, "index_rebuilds": index.rebuilds,
             "index_disabled": index.disabled, "scan_local_ms": round(index.local_ms),

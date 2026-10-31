@@ -124,6 +124,57 @@ def test_authentication_failure_stops_the_budget_immediately():
     assert len(connects) == 1
 
 
+def test_deliberate_stalls_do_not_consume_the_reconnect_budget(monkeypatch):
+    """取信超时后的重建连接不烧 5 次预算，也不做抖动退避（规格 §5.7.9）。"""
+    waits = []
+    monkeypatch.setattr(core, "_wait_before_reconnect",
+                        lambda delay, should_stop: waits.append(delay) or False)
+    monkeypatch.setattr(core.random, "uniform", lambda _low, high: high)
+    calls = []
+
+    def op(_conn):
+        calls.append(1)
+        if len(calls) <= 6:
+            raise core.BatchStalled("body fetch timed out")
+        return "ok"
+
+    stats = core.ReconnectStats()
+    result, _live = core.run_with_reconnect(_Conn(), lambda: _Conn(), op, should_stop=None,
+                                            log=NullLog(), stats=stats)
+    assert result == "ok" and len(calls) == 7
+    assert stats.exhausted is False
+    assert (stats.attempts, stats.successes) == (6, 6)
+    assert waits == [0.0] * 6                # 超时已耗掉整个读超时，不再叠加退避
+
+
+def test_a_stall_neither_resets_nor_spends_the_genuine_failure_budget(monkeypatch):
+    """4 次真实断线后再超时：既有计数保留、超时不占名额，随后仍只有 1 次真实重试。"""
+    waits = []
+    backs = []
+    monkeypatch.setattr(core, "_wait_before_reconnect",
+                        lambda delay, should_stop: waits.append(delay) or False)
+    monkeypatch.setattr(core.random, "uniform", lambda _low, high: high)
+    outcomes: list[object] = [imaplib.IMAP4.abort("socket error: EOF")] * 4
+    outcomes.append(core.BatchStalled("body fetch timed out"))
+    outcomes += [imaplib.IMAP4.abort("socket error: EOF")] * 2
+
+    def op(_conn):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return "ok"
+
+    stats = core.ReconnectStats()
+    with pytest.raises(imaplib.IMAP4.abort):
+        core.run_with_reconnect(_Conn(), lambda: _Conn(), op, should_stop=None,
+                                log=NullLog(), stats=stats,
+                                on_backoff=lambda attempt, delay: backs.append((attempt, delay)))
+    assert waits == [2.0, 8.0, 32.0, 128.0, 0.0, 300.0]
+    assert backs == [(1, 2.0), (2, 8.0), (3, 32.0), (4, 128.0), (5, 300.0)]  # 超时不显示重连文案
+    assert stats.exhausted is True
+    assert (stats.attempts, stats.successes) == (6, 6)
+
+
 def test_sixth_consecutive_failure_is_not_retried():
     """一次连续失败最多重试 5 次；第 6 次失败原样上抛并标记耗尽。"""
     calls = []
@@ -362,6 +413,48 @@ def test_download_resumes_after_abort_without_rewriting(tmp_path):
     finally:
         box.close()
     assert ids == sorted(f"<m{uid}@x>" for uid in range(1, 11))
+
+
+def test_download_resumes_after_a_body_timeout_without_failing_the_folder(tmp_path):
+    """一批取信超时：拆成单封重取，仍超时那封记 timeout 跳过，其余写完（规格 §5.7.9）。"""
+    log = NullLog()
+    raws = {uid: _raw(uid) for uid in range(1, 4)}
+    server1, server2 = UidFetchServer(dict(raws)), UidFetchServer(dict(raws))
+
+    def timeout_on_uid2(_server, uids):
+        return TimeoutError("The read operation timed out") if 2 in uids else None
+
+    server1.raise_body_hook = timeout_on_uid2
+    server2.raise_body_hook = timeout_on_uid2
+    scan = core.scan_folder(server1, "INBOX", True, quiet=True, log=log)
+    state = core.FolderDownloadState(scan, core.pending_messages(scan.messages, {}, None))
+    written: set[str] = set()
+    progress = core.DownloadProgress()
+    stall = core.BatchStall()
+    stats = core.ReconnectStats()
+    attempts = []
+
+    def download(conn, messages, overwrite_now):
+        attempts.append(sorted(uid for uid, _size in messages.values()))
+        core.download_messages(conn, "INBOX.mbox", messages, overwrite_now, True, False,
+                               tmp_path, False, quiet=True, log=log,
+                               written=written, progress=progress, stall=stall)
+
+    live, _state = core.download_folder_with_reconnect(
+        server1, lambda: server2, state, foldername="INBOX", display="INBOX",
+        local_mbox=None, local_eml=None, written=written, download=download,
+        rescan=lambda conn: core.scan_folder(conn, "INBOX", True, quiet=True, log=log),
+        should_stop=None, log=log, stats=stats)
+
+    assert live is server2
+    assert attempts == [[1, 2, 3], [1, 2, 3], [2, 3]]  # 最后一轮只剩没写的（2 已跳过但未写）
+    assert server1.body_fetches == [[1, 2, 3]]
+    assert server2.body_fetches == [[1], [2], [3]]
+    assert written == {"<m1@x>", "<m3@x>"}
+    assert progress.backed == 2
+    assert (progress.fetch_failed, progress.fetch_failed_timeout) == (1, 1)
+    assert stall.skipped == {"<m2@x>"}
+    assert (stats.attempts, stats.successes, stats.exhausted) == (2, 2, False)
 
 
 def test_uidvalidity_change_rescans_once_reuses_local_and_subtracts_written():

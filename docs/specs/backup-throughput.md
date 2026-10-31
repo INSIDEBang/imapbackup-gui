@@ -172,6 +172,7 @@ class DownloadProgress:
     fetch_failed_missing: int = 0
     fetch_failed_no_bad: int = 0
     fetch_failed_malformed: int = 0
+    fetch_failed_timeout: int = 0       # 单封仍读超时、本轮放弃的消息
     done_bytes: int = 0                  # 已备份消息的 RFC822.SIZE 之和
     batches: int = 0
     last_batch: "BatchStats | None" = None
@@ -324,6 +325,7 @@ def download_messages(
     *,
     written: set[str] | None = None,
     progress: DownloadProgress | None = None,
+    stall: "BatchStall | None" = None,
     index_writer: "IndexWriter | None" = None,
     on_batch: Callable[[BatchStats], None] | None = None,
 ) -> DownloadProgress:
@@ -332,6 +334,7 @@ def download_messages(
 
 - `written`：调用方为每个文件夹维护的已写完集合；重连续跑用，不持久化。
 - `progress`：调用方传入的可变累计器；重连后继续累加，不因异常丢失已完成的计数。
+- `stall`：调用方为每个文件夹运行维护的正文超时记忆（5.7.9）；`None` 表示不处理读超时（旧行为）。
 - `index_writer`：索引写入器；`None` 表示索引禁用。
 - `on_batch`：每批完成后回调，用于诊断采样与 UI 批次统计。
 - 返回传入的 `progress`；未传入时内部新建并返回。
@@ -352,6 +355,7 @@ def download_messages(
 | 整批每封都是「缺失 UID」 | 全部记 `fetch_failed(missing)`；**不是**文件夹失败 |
 | 隔离结果混合 missing/malformed/NO-BAD | 各按其桶计数；只要存在 missing 或 malformed，就不升级为 `FolderFetchError`，文件夹继续 |
 | 连接 abort/OSError/BYE | 不在 `download_messages` 内重试；本批不写半批；交给 5.7 重连 |
+| 正文 FETCH 读超时（`TimeoutError`） | 多封批次：不写盘，下一轮把整批拆成单封取；单封仍超时：记 `fetch_failed(timeout)` 并跳过该封；刻意的重建连接不占重连预算（5.7.9） |
 | 认证/SELECT NO | 不重试；SELECT NO 算文件夹失败，认证失败按账户失败 |
 | 本地写盘错误 | `BackupWriteError`；不算已备份；不触发重连；向上抛 |
 
@@ -593,6 +597,7 @@ def run_with_reconnect(
 |---|---|
 | `imaplib.IMAP4.abort` | 可重试；`reason=abort` |
 | `OSError`（非 `BackupWriteError`） | 可重试；`reason=oserror` |
+| `BatchStalled`（正文读超时后的刻意重建） | 可重试；`reason=oserror`；**不占**连续失败预算、不退避（5.7.9） |
 | `imaplib.IMAP4.error` 文本含 `BYE`（不区分大小写） | 可重试；`reason=bye` |
 | `imaplib.IMAP4.error` 其他（NO/BAD/认证） | 不重试 |
 | `ReconnectAuthError` | 不重试 |
@@ -617,6 +622,7 @@ def run_with_reconnect(
 - 退避期间每 0.2 秒检查 `should_stop()`；停止立即抛 `ReconnectStopped`。
 - 退避期间 UI 显示 6.2.2 节的重连文案；CLI 只写运行日志。
 - 5 次耗尽：`stats.exhausted=True`，把最后一次异常原样抛给调用方。
+- 例外：`BatchStalled` 不增加连续失败计数，且延迟取 0（由 5.7.9 触发），也不推送 `on_backoff`（UI 不显示「第 n/5 次」重连文案）；随后的拨号失败仍按上表计数与退避。
 - 日志：断线 WARNING、每次重试 INFO、耗尽 ERROR；不含邮件内容。
 
 #### 5.7.5 扫描阶段续跑
@@ -659,6 +665,31 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
 - 停止信号到达时：关闭旧连接，抛 `ReconnectStopped`；调用方按停止处理。
 - 停止不触发第 6 次重试，也不把剩余 pending 计为失败。
 
+#### 5.7.9 正文取信读超时
+
+只有 `TimeoutError`（socket 读超时）进入这条路径；abort/OSError/BYE 仍按 5.7.3–5.7.4 处理。
+
+调用方为**每个文件夹运行**创建一个 `BatchStall`，跨重连尝试保留：
+
+```python
+@dataclass
+class BatchStall:
+    split: set[str]      # 下一轮单封取信的 Message-Id
+    skipped: set[str]    # 本轮放弃的 Message-Id
+```
+
+`download_messages(..., stall=...)`：
+
+1. 规划批次时排除 `stall.skipped`，并让 `stall.split` 里的消息独占一批（与超大/未知大小同样的单封批）。`stall=None` 时不做任何处理。
+2. `_fetch_batch` 抛 `TimeoutError`：
+   - `stall is None`：原样上抛（旧行为）。
+   - 多封批次：本批不写盘；把批内 Message-Id 全部记入 `split`；记 WARNING（几封、合计字节）；抛 `BatchStalled`。
+   - 单封批次且该封不在 `split`：记入 `split`；抛 `BatchStalled`（独占一批的邮件也先单独重试一次）。
+   - 单封批次且该封已在 `split`：单独取仍读不动——从 `split` 移除、记入 `skipped`、计入 `fetch_failed(timeout)`、记 WARNING（Message-Id、UID、大小）；抛 `BatchStalled`。本轮不再请求该封，下一轮运行自然重试。
+3. `run_with_reconnect` 把 `BatchStalled` 当作可重试的连接级错误：关闭旧连接、立即重连（无退避），但**不增加**连续失败计数；`reauth`/拨号失败仍按 5.7.4 计数。
+4. 重连后 `download_folder_with_reconnect` 照常按 `pending − written` 续跑；被放弃的消息仍在 pending，末尾文件夹警告带 `timeout=N`。
+5. 日志只写批次大小与 Message-Id/UID/大小，不写邮件内容。
+
 ### 5.8 停止
 
 - 每批开始前、每封写完后检查（沿用现有检查点，ADR 0012）。
@@ -676,7 +707,7 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
 | `phase` | `(account_id, kind, text)` | `kind ∈ {connecting, scanning, download, backoff, stopping}`；`text` 是第二行阶段文案 |
 | `totals` | `(account_id, server_total, pending_total, pending_bytes)` | 新增 `pending_bytes` |
 | `message` | `(account_id, report_dict, fetch_size)` | `fetch_size` 是 `RFC822.SIZE`，供速度/ETA 用 |
-| `account_done` | `(account_id, backed, skipped, seconds, stopped, pending_total, fetch_failed, fetch_failed_missing, fetch_failed_no_bad, fetch_failed_malformed, folder_failures)` | 新增失败计数 |
+| `account_done` | `(account_id, backed, skipped, seconds, stopped, pending_total, fetch_failed, fetch_failed_missing, fetch_failed_no_bad, fetch_failed_malformed, folder_failures, fetch_failed_timeout)` | 末尾追加超时桶；旧事件省略末位时按 0 处理 |
 | `account_failed` | `(account_id, message)` | 不变 |
 | `batch` | 无独立事件 | 批次统计通过线程安全的 `AccountStats` 快照共享，避免事件队列膨胀 |
 
@@ -908,6 +939,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | | `fetch_failed_missing` | int | 缺失 UID |
 | | `fetch_failed_no_bad` | int | 单封 NO/BAD |
 | | `fetch_failed_malformed` | int | 畸形响应 |
+| | `fetch_failed_timeout` | int | 单封仍读超时、本轮放弃 |
 | | `folder_failures` | int | 文件夹失败数 |
 | 索引 | `index_hits` | int | 命中次数 |
 | | `index_misses` | int | 未命中次数 |
@@ -926,7 +958,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 示例（虚构数据）：
 
 ```json
-{"ts":"2026-10-26T14:03:22.123+08:00","schema":1,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
+{"ts":"2026-10-26T14:03:22.123+08:00","schema":1,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"fetch_failed_timeout":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
 ```
 
 ### 7.4 隐私白名单
@@ -1020,9 +1052,10 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
 ## 10. ADR
 
-本 effort 新增一份 ADR：
+本 effort 新增两份 ADR：
 
 - [ADR 0013：固定批量、无客户端自适应限速](../adr/0013-fixed-batching-no-adaptive-throttle.md)。
+- [ADR 0014：正文取信超时先拆单封，仍超时只放弃该封](../adr/0014-body-fetch-timeout-split-and-give-up.md)（5.7.9 与 timeout 桶的取舍）。
 
 理由：早期设计最初选择自适应闭环 + 同主机共享总速率；一次离散事件仿真证明常规模型下闭环更慢，后续架构决策进一步取消共享控制器。这是一个**硬反转**、**未来读者会问为什么**、**有真实取舍**的决策，必须留下 ADR。其他决策（索引、重连、诊断、FAQ）已在相关 ADR 与本文中有上下文，不另开 ADR。
 
@@ -1037,7 +1070,7 @@ ADR 需要说明：
 ### 11.1 核心 `imapbackup312.py`
 
 - 新增常量：`SCAN_PAGE_UIDS`、`FETCH_BATCH_MAX_MESSAGES`、`FETCH_BATCH_MAX_BYTES`、`INDEX_DIR`、`DB_NAME`。
-- 新增：`FolderScan`、`DownloadProgress`、`BatchStats`、`ReconnectStats`、`ReconnectStopped`、`ReconnectAuthError`、`BackupWriteError`、`FolderFetchError`、`ScanIndex`、`IndexWriter`、`IndexStats`、`run_with_reconnect`、`connect_for_reconnect`。
+- 新增：`FolderScan`、`DownloadProgress`、`BatchStats`、`ReconnectStats`、`ReconnectStopped`、`ReconnectAuthError`、`BackupWriteError`、`FolderFetchError`、`BatchStall`、`BatchStalled`、`ScanIndex`、`IndexWriter`、`IndexStats`、`run_with_reconnect`、`connect_for_reconnect`。
 - 修改：`scan_folder` 返回 `FolderScan`；`download_messages` 改为 UID 批量、返回值/进度/索引/批次回调；CLI `main` 的文件夹循环接入索引与重连；`configure_logging` 不变。
 - 保持：`report_message` 字段不变；`MSGID_RE`/`UUID` 不变；CLI 参数与退出码不变。
 
@@ -1059,9 +1092,9 @@ ADR 需要说明：
   - 新增 `isolate_log_dir`（按需）：把 `core.LOG_DIR` 指向 `tmp_path/log`。
 - 新增/更新测试文件（名称可调整，覆盖必须存在）：
   - `tests/test_uid_scan.py`：SEARCH 分页、500 边界、合成 ID、畸形、SELECT NO。
-  - `tests/test_batch_fetch.py`：8/8MiB、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止。
+  - `tests/test_batch_fetch.py`：8/8MiB、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）。
   - `tests/test_scan_index.py`：schema、命中/未命中、失效矩阵、损坏、锁、并发、overwrite、格式保留、索引失败不影响下载。
-  - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI。
+  - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI；`BatchStalled` 不消耗预算且不等待、正文超时后重连续跑并使文件夹成功。
   - `tests/test_gui_backup_flow.py`：部分完成、文件夹失败、account_done、图标、事件契约。
   - `tests/test_speed_eta.py`：窗口、阈值、格式、ETA、合计。
   - `tests/test_list_scroll.py`：底部跟随/上移不抢/切换账户。
@@ -1075,12 +1108,12 @@ ADR 需要说明：
   - 首量吞吐：UID 扫描、8 封 / 8 MiB、每账户单请求在途、无客户端限速。
   - 中断恢复：本地扫描索引位置、可删除、卸载行为。
   - 断线重连：有界重试、UIDVALIDITY、停止优先。
-  - 部分完成：取信失败/文件夹失败含义；第二行速率/ETA。
+  - 部分完成：取信失败/文件夹失败含义；正文读超时的拆批与放弃（不计入重连预算、下一轮补取）；第二行速率/ETA。
   - 诊断：`diag-*.jsonl` 位置、10 秒、14 天、隐私、仅 GUI。
   - 常见问题：菜单入口；通用原因 + 35 特例。
   - CLI：参数/输出/退出码不变；CLI 不写诊断。
-- `GLOSSARY.md`：已有术语足够，不新增；若实现中引入新领域词，先走 domain-modeling。
-- ADR 0013：新增；ADR 目录无需索引文件（与现状一致）。
+- `GLOSSARY.md`：不新增术语；「取信失败消息」补充正文读超时的口径；若实现中引入新领域词，先走 domain-modeling。
+- ADR 0013（固定批量、无自适应限速）、ADR 0014（正文读超时先拆后弃、不耗重连预算）：新增；ADR 目录无需索引文件（与现状一致）。
 
 ### 11.5 安装程序 `packaging/imapbackup-gui.iss`
 
@@ -1117,9 +1150,9 @@ basedpyright imapbackup312.py imapbackup_gui.py
 |---|---|
 | A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
 | B 批量 | 8 封/8 MiB 边界；第 9 封新批；单封 8 MiB+ 独占；size 0 独占；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
-| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告 |
+| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告；正文读超时 → 整批拆单封；单封仍超时 → `fetch_failed(timeout)` 且本轮不再请求；`stall=None` 原样抛 `TimeoutError`；警告带 `timeout=N` |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
-| E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连 |
+| E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连；`BatchStalled` 不占预算、不退避，超时后文件夹继续完成 |
 | F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；单账户停止不影响其他账户；停止优先于重连 |
 | G 并发 | 6–7 个假账户并发；每账户同一时刻至多 1 个在途请求；无共享锁/等待；停止一个不影响其余；无跨账户限速状态 |
 | H UI | 第二行格式与顺序；30 秒窗口；60 秒 ETA；`—` 阈值；0 如实显示；合计 ≥2 下载账户；扫描/连接/重连/停止无速率；部分完成黄色常驻；停止图标优先；冷却含 partial；列表底部跟随/上移不抢 |

@@ -3335,7 +3335,7 @@ def test_backup_account_continues_after_a_folder_fetch_failure(app, monkeypatch,
 
 
 def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path):
-    """Worker 把三桶取信失败和文件夹失败一起送进 account_done（规格 §5.3.1）。"""
+    """Worker 把四桶取信失败和文件夹失败一起送进 account_done（规格 §5.3.1）。"""
     while not app.events.empty():
         app.events.get_nowait()
     account = {"id": "acc-buckets", "name": "工作邮箱", "user": "b@example.com", "server": "imap.example.com",
@@ -3370,7 +3370,8 @@ def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path
         progress = _k["progress"]
         if label.endswith("INBOX.mbox"):
             progress.fetch_failed += 2
-            progress.fetch_failed_no_bad += 2
+            progress.fetch_failed_no_bad += 1
+            progress.fetch_failed_timeout += 1
             _k["on_batch"](None)
         else:
             progress.fetch_failed += 1
@@ -3387,7 +3388,7 @@ def test_backup_account_reports_fetch_failure_buckets(app, monkeypatch, tmp_path
         events.append(app.events.get_nowait())
     done = [e for e in events if e[0] == "account_done"][-1]
     assert done[2:7] == (0, 0, done[4], False, 2), done
-    assert done[7:12] == (3, 0, 2, 1, 1), done
+    assert done[7:13] == (3, 0, 1, 1, 1, 1), done
     assert scan_calls == ["INBOX", "ZZ"], scan_calls
     assert [(event[2], event[3]) for event in events if event[0] == "phase"] == [
         ("connecting", "正在连接…"),
@@ -5481,7 +5482,8 @@ def test_account_end_carries_the_workers_final_statistics(app, diag_env, diag_cl
     assert (end["done_msgs"], end["done_bytes"]) == (3, sum(len(raws[uid]) for uid in (1, 2, 4)))
     assert (end["pending_msgs"], end["pending_bytes"]) == (4, sum(len(raw) for raw in raws.values()))
     assert (end["fetch_failed"], end["fetch_failed_missing"], end["fetch_failed_no_bad"],
-            end["fetch_failed_malformed"], end["folder_failures"]) == (1, 1, 0, 0, 0)
+            end["fetch_failed_malformed"], end["fetch_failed_timeout"],
+            end["folder_failures"]) == (1, 1, 0, 0, 0, 0)
     assert (end["reconnect_attempts"], end["reconnect_successes"], end["reconnect_exhausted"],
             end["uidvalidity_changes"], end["reconnect_reason"]) == (1, 1, False, 0, "abort")
     assert (end["batch_msgs"], end["batch_bytes"]) == (4, sum(len(raw) for raw in raws.values()))
