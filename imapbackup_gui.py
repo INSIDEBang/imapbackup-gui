@@ -647,8 +647,11 @@ def _format_eta(seconds: float) -> str:
     return f"{minutes // 60} 小时 {minutes % 60} 分钟"
 
 
+SPEED_WINDOW_S = 120.0   # 速率/ETA 的读数窗：要宽到能跨过一批下载之间的空档，否则整窗只剩零星样本
+
+
 class SpeedTracker:
-    """单账户的完成消息样本，提供 30 秒速率与 60 秒 ETA 口径。"""
+    """单账户的完成消息样本，提供 SPEED_WINDOW_S 读数窗的速率与 ETA 口径。"""
 
     def __init__(self) -> None:
         self._samples: deque[tuple[float, int]] = deque()
@@ -661,27 +664,27 @@ class SpeedTracker:
             self._first_completed_at = at
         self._completed_count += 1
         self._samples.append((at, max(0, size)))
-        cutoff = at - 60.0
+        cutoff = at - SPEED_WINDOW_S
         while self._samples and self._samples[0][0] < cutoff:
             self._samples.popleft()
 
-    def _rate(self, now: float, window: float) -> tuple[float, float, float] | None:
+    def _rate(self, now: float) -> tuple[float, float, float] | None:
         if self._first_completed_at is None or self._completed_count < 3:
             return None
-        elapsed = min(window, now - self._first_completed_at)
+        elapsed = min(SPEED_WINDOW_S, now - self._first_completed_at)
         if elapsed < 5.0:
             return None
-        samples = [sample for sample in self._samples if sample[0] >= now - window]
+        samples = [sample for sample in self._samples if sample[0] >= now - SPEED_WINDOW_S]
         return len(samples) / elapsed * 60.0, sum(size for _, size in samples) / elapsed, elapsed
 
     def rates(self, now: float) -> tuple[float, float] | None:
-        """返回近 30 秒的（封/分, 字节/秒）；样本不足时返回 None。"""
-        rate = self._rate(now, 30.0)
+        """返回读数窗内的（封/分, 字节/秒）；样本不足时返回 None。"""
+        rate = self._rate(now)
         return rate[:2] if rate is not None else None
 
     def eta_seconds(self, now: float, pending_bytes: int, done_bytes: int) -> float | None:
-        """按近 60 秒字节速率估算剩余秒数；样本不足或零速率时返回 None。"""
-        rate = self._rate(now, 60.0)
+        """按读数窗内的字节速率估算剩余秒数；样本不足或零速率时返回 None。"""
+        rate = self._rate(now)
         if rate is None or rate[2] < 10.0 or rate[1] == 0:
             return None
         remaining = max(0, pending_bytes - done_bytes)
@@ -705,7 +708,7 @@ def account_rates(state: dict, now: float) -> tuple[float, float, float | None] 
 
 # ---------------------------------------------------------------- 诊断采样（规格 §7）
 
-DIAG_SCHEMA_VERSION = 1
+DIAG_SCHEMA_VERSION = 2
 DIAG_APP_NAME = "imapbackup-gui"
 DIAG_SAMPLE_INTERVAL_S = 10.0   # 每个活动账户的 sample 间隔；phase 行写出后重新计时
 DIAG_BATCH_WINDOW_S = 10.0      # fetch_ms_avg/p95 只统计最近这么久完成的批次
@@ -718,7 +721,8 @@ DIAG_FIELDS = (
     "ts", "schema", "app", "run", "event", "account", "host", "folder", "phase",
     "done_msgs", "done_bytes", "pending_msgs", "pending_bytes",
     "rate_msgs_per_min", "rate_bytes_per_s", "eta_s",
-    "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95",
+    "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95", "fetch_ms_max",
+    "inflight_msgs", "inflight_bytes", "inflight_elapsed_s",
     "fetch_failed", "fetch_failed_missing", "fetch_failed_no_bad", "fetch_failed_malformed",
     "fetch_failed_timeout",
     "folder_failures",
@@ -4729,7 +4733,7 @@ class BackupApp:
             """把本账户当前统计换成一份新快照供主线程读取（诊断采样，规格 §5.9）。
 
             Note:
-                只在 worker 自己的检查点调用（阶段切换、每封写完、每批结束、收尾），此刻核心没在
+                只在 worker 自己的检查点调用（阶段切换、每封写完、每批发出前、每批结束、收尾），此刻核心没在
                 改这些计数，快照内部因此互相一致。
             """
             cutoff = time.monotonic() - DIAG_BATCH_WINDOW_S
@@ -4843,6 +4847,7 @@ class BackupApp:
                                        report=report, should_stop=stop_event.is_set,
                                        written=written, progress=progress, stall=stall,
                                        on_batch=report_batch,
+                                       on_batch_start=lambda _inflight: publish(),
                                        index_mbox=index_mbox, index_eml=index_eml)
 
             def rescan(conn):
@@ -5375,6 +5380,7 @@ class BackupApp:
         view = account_rates(state, now) if phase == "download" else None
         recent = [ms for at, ms in stats.batches if at >= now - DIAG_BATCH_WINDOW_S]
         batch = progress.last_batch
+        inflight = progress.inflight
         reason = reconnect.last_reason
         return {
             "account": account.get("user") if account else None,
@@ -5389,6 +5395,10 @@ class BackupApp:
             "batch_bytes": batch.bytes if batch else None,
             "fetch_ms_avg": round(sum(recent) / len(recent), 1) if recent else None,
             "fetch_ms_p95": round(_p95(recent), 1) if recent else None,
+            "fetch_ms_max": round(progress.max_fetch_ms, 1) if progress.max_fetch_ms is not None else None,
+            "inflight_msgs": inflight.msgs if inflight else None,
+            "inflight_bytes": inflight.bytes if inflight else None,
+            "inflight_elapsed_s": round(now - inflight.started_at, 1) if inflight else None,
             "fetch_failed": progress.fetch_failed,
             "fetch_failed_missing": progress.fetch_failed_missing,
             "fetch_failed_no_bad": progress.fetch_failed_no_bad,

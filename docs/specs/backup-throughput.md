@@ -284,6 +284,7 @@ typ, data = server.uid("FETCH", "101,102,...",
 - 重复 UID 取第一份并记 WARNING。
 - 缺 UID、缺字面量、UID 不在请求集合中 → 畸形处理。
 - 整批解析完成后才开始写盘；解析阶段出错不会写半批。
+- 发出请求前把本批写进 `DownloadProgress.inflight`（封数、声明的 `RFC822.SIZE` 之和、起始时刻）并回调 `on_batch_start`；请求结束（成功、超时或异常）后置回 `None`。同一账户同一时刻至多一个在途批次。本批耗时在同一个收尾里并入 `DownloadProgress.max_fetch_ms`（本账户本次运行的最长单批，超时那批也算——它正是想看的那类）。
 
 #### 5.2.4 写盘与报告
 
@@ -328,6 +329,7 @@ def download_messages(
     stall: "BatchStall | None" = None,
     index_writer: "IndexWriter | None" = None,
     on_batch: Callable[[BatchStats], None] | None = None,
+    on_batch_start: Callable[[InflightBatch], None] | None = None,
 ) -> DownloadProgress:
     ...
 ```
@@ -337,6 +339,7 @@ def download_messages(
 - `stall`：调用方为每个文件夹运行维护的正文超时记忆（5.7.9）；`None` 表示不处理读超时（旧行为）。
 - `index_writer`：索引写入器；`None` 表示索引禁用。
 - `on_batch`：每批完成后回调，用于诊断采样与 UI 批次统计。
+- `on_batch_start`：每批**发出前**回调，用于把在途批次换进调用方的快照；`None` 表示调用方不采样（CLI）。
 - 返回传入的 `progress`；未传入时内部新建并返回。
 - 现有 `download_messages` 的 `messages` 值从 `int` 改为 `(UID, size)`；所有调用点与测试同步迁移。
 
@@ -736,7 +739,9 @@ class AccountStats:
     last_batch: BatchStats | None
 ```
 
-worker 在每批/每封/每次重连后更新；主线程的 1 秒 tick 只读快照，不阻塞 worker。读写共用同一把 `threading.Lock`，主线程取一份浅拷贝后再计算，不直接遍历 worker 的可变容器。
+worker 在阶段切换、每封写完、每批发出前、每批结束、收尾时更新；主线程的 1 秒 tick 只读快照，不阻塞 worker。读写共用同一把 `threading.Lock`，主线程取一份浅拷贝后再计算，不直接遍历 worker 的可变容器。
+
+「每批发出前」这个检查点是新增的：工作线程发出正文请求后就埋进 socket 读，几分钟内没有别的检查点，不先发快照，采样永远看不到在途批次。在途批次与本批耗时的口径见 5.2.3。
 
 ## 6. GUI 设计
 
@@ -811,29 +816,30 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
 #### 6.2.3 速率窗口
 
-- 本账户消息/字节速率：30 秒滑动窗口。
+- 本账户消息/字节速率：120 秒滑动窗口。速率与 ETA 共用同一个窗口常数（`SPEED_WINDOW_S`），样本保留时长也按它裁剪。
 - 样本来自每封完成事件 `(monotonic, fetch_size)`；`fetch_size` 是 `RFC822.SIZE`。
 - 重新进入 `download`（从连接/扫描/重连/停止切回）时清空窗口；**文件夹切换不清空**。
 - 计算：
 
   ```text
-  cutoff = now - 30
+  cutoff = now - 120
   samples = 窗口内样本
-  elapsed = min(30, now - 本段下载第一封完成时间)
+  elapsed = min(120, now - 本段下载第一封完成时间)
   rate_msgs = len(samples) / elapsed * 60
   rate_bytes = sum(size) / elapsed
   ```
 
 - 首次预热：距本段下载第一封完成不足 5 秒，或本段累计完成不足 3 封 → 显示 `—`，不显示字节速率与 ETA。
-- 预热完成后，窗口内不足 3 封仍按实际完成量计算；空窗口显示 `0.0 封/分 · 0 bytes/s`。旧样本出窗不重置预热，下一封完成后立即恢复数值；成熟窗口的分母固定为 30 秒，包含等待中的时间。
+- 预热完成后，窗口内不足 3 封仍按实际完成量计算；空窗口显示 `0.0 封/分 · 0 bytes/s`。旧样本出窗不重置预热，下一封完成后立即恢复数值；成熟窗口的分母固定为 120 秒，包含等待中的时间。
+- 窗口从 30 秒放宽到 120 秒的原因：单批载荷放大后成批到账，两批之间的空档会让 30 秒窗口只剩零星样本、读数长期归零。
 - 合计速率 = 各下载中账户的当前速率之和；若没有任何账户的速率可计算，显示 `全部 —`。
 
 #### 6.2.4 预计剩余
 
 - `remaining_bytes = max(0, pending_bytes - done_bytes)`。
 - `done_bytes` 只累加已备份消息的 `RFC822.SIZE`；`size=0` 按 0。
-- 使用 60 秒字节速率 `rate60`（同窗口口径，距本段首封完成不足 10 秒或首次预热未完成 → 不显示 ETA）。
-- `eta_s = remaining_bytes / rate60`；`rate60 == 0` 或当前 30 秒字节速率为零 → 不显示。
+- 使用 120 秒字节速率 `rate120`（与速率同窗口口径，距本段首封完成不足 10 秒或首次预热未完成 → 不显示 ETA）。
+- `eta_s = remaining_bytes / rate120`；`rate120 == 0` → 不显示。
 - 显示：`<1 分钟`、`N 分钟`（向上取整）、`N 小时 M 分钟`（≥60 分钟）。
 - 不做向下钳制：速率下降时 ETA 可以变长；不要为了「看起来好」强行单调递减。
 - `size` 未知的邮件不进入字节口径；若未知占比高，ETA 只作参考。
@@ -903,6 +909,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 ### 7.2 节奏
 
 - 每个活动账户每 10 秒一条 `sample`。
+- 在途批次字段读的是工作线程「每批发出前」发布的那份快照：批次跑几分钟不结束，后续每条 `sample` 仍给出它的封数与声明字节，`inflight_elapsed_s` 按采样时刻递增——这是「跑了 96 分钟的批次」不再成为测量盲区的依据。
 - `phase`、`account_end`、`run_end` 立即写。
 - 同一时刻 phase 与 sample 冲突：只写 phase，重置该账户的 10 秒计时。
 - `run` 是 8 位十六进制，每个备份运行（ADR 0012 的活动集合周期）共享；追加账户不换 run。
@@ -916,7 +923,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | 分组 | 字段 | 类型 | 说明 |
 |---|---|---|---|
 | 身份 | `ts` | string | 本地时间 ISO 8601，带时区，毫秒 |
-| | `schema` | int | 1 |
+| | `schema` | int | 2 |
 | | `app` | string | `imapbackup-gui` |
 | | `run` | string | 8 位十六进制 |
 | | `event` | string | `sample` / `phase` / `account_end` / `run_end` |
@@ -928,13 +935,17 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | | `done_bytes` | int | 已备份消息的 `RFC822.SIZE` 之和 |
 | | `pending_msgs` | int | 统计时的待备份总数 |
 | | `pending_bytes` | int | 统计时的待备份字节总数 |
-| 速度 | `rate_msgs_per_min` | float/null | 30 秒窗口；不可计算为 null |
-| | `rate_bytes_per_s` | float/null | 30 秒窗口；不可计算为 null |
-| | `eta_s` | int/null | 60 秒窗口；不可计算为 null |
+| 速度 | `rate_msgs_per_min` | float/null | 120 秒窗口；不可计算为 null |
+| | `rate_bytes_per_s` | float/null | 120 秒窗口；不可计算为 null |
+| | `eta_s` | int/null | 120 秒窗口；不可计算为 null |
 | 批次 | `batch_msgs` | int/null | 最近完成批的消息数 |
 | | `batch_bytes` | int/null | 最近完成批的请求字节 |
 | | `fetch_ms_avg` | float/null | 最近 10 秒批次的平均取信耗时 |
 | | `fetch_ms_p95` | float/null | 最近 10 秒批次的 p95 |
+| | `fetch_ms_max` | float/null | 本账户本次运行的最长单批取信耗时（超时那批也算）；尚无任何批次时为 null |
+| 在途 | `inflight_msgs` | int/null | 正在请求中的正文批次封数；不在请求中为 null |
+| | `inflight_bytes` | int/null | 该批次声明的 `RFC822.SIZE` 之和 |
+| | `inflight_elapsed_s` | float/null | 该批次已发出等待的秒数 |
 | 失败 | `fetch_failed` | int | 当前取信失败总数（补取成功会减少） |
 | | `fetch_failed_missing` | int | 缺失 UID |
 | | `fetch_failed_no_bad` | int | 单封 NO/BAD |
@@ -958,12 +969,12 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 示例（虚构数据）：
 
 ```json
-{"ts":"2026-10-26T14:03:22.123+08:00","schema":1,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"fetch_failed_timeout":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
+{"ts":"2026-10-26T14:03:22.123+08:00","schema":2,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_ms_max":5410.0,"inflight_msgs":6,"inflight_bytes":4132747,"inflight_elapsed_s":3.4,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"fetch_failed_timeout":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
 ```
 
 ### 7.4 隐私白名单
 
-允许写入：时间、应用名、run ID、账户邮箱、服务器主机、文件夹显示名、阶段、所有计数/速率/耗时/错误类别。
+允许写入：时间、应用名、run ID、账户邮箱、服务器主机、文件夹显示名、阶段、所有计数/速率/耗时/错误类别。在途批次只写封数、声明字节之和与已等时长，不写 UID、Message-Id 或主题。
 
 禁止写入：
 
@@ -1092,7 +1103,7 @@ ADR 需要说明：
   - 新增 `isolate_log_dir`（按需）：把 `core.LOG_DIR` 指向 `tmp_path/log`。
 - 新增/更新测试文件（名称可调整，覆盖必须存在）：
   - `tests/test_uid_scan.py`：SEARCH 分页、500 边界、合成 ID、畸形、SELECT NO。
-  - `tests/test_batch_fetch.py`：8/8MiB、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）。
+  - `tests/test_batch_fetch.py`：8/8MiB、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
   - `tests/test_scan_index.py`：schema、命中/未命中、失效矩阵、损坏、锁、并发、overwrite、格式保留、索引失败不影响下载。
   - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI；`BatchStalled` 不消耗预算且不等待、正文超时后重连续跑并使文件夹成功。
   - `tests/test_gui_backup_flow.py`：部分完成、文件夹失败、account_done、图标、事件契约。
@@ -1155,8 +1166,8 @@ basedpyright imapbackup312.py imapbackup_gui.py
 | E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连；`BatchStalled` 不占预算、不退避，超时后文件夹继续完成 |
 | F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；单账户停止不影响其他账户；停止优先于重连 |
 | G 并发 | 6–7 个假账户并发；每账户同一时刻至多 1 个在途请求；无共享锁/等待；停止一个不影响其余；无跨账户限速状态 |
-| H UI | 第二行格式与顺序；30 秒窗口；60 秒 ETA；`—` 阈值；0 如实显示；合计 ≥2 下载账户；扫描/连接/重连/停止无速率；部分完成黄色常驻；停止图标优先；冷却含 partial；列表底部跟随/上移不抢 |
-| I 诊断 | 10 秒 sample；phase/account_end/run_end 立即；run ID 共享；字段齐全；隐私白名单；14 天只删 `diag-*`；写失败禁用继续；CLI 不写 |
+| H UI | 第二行格式与顺序；120 秒窗口（速率与 ETA 同窗）；`—` 阈值；0 如实显示；合计 ≥2 下载账户；扫描/连接/重连/停止无速率；部分完成黄色常驻；停止图标优先；冷却含 partial；列表底部跟随/上移不抢 |
+| I 诊断 | 10 秒 sample；phase/account_end/run_end 立即；run ID 共享；字段齐全（schema 2：在途批次封数/字节/已等时长与本账户最长单批耗时）；批次不结束时连续多条 sample 的在途值仍在；隐私白名单；14 天只删 `diag-*`；写失败禁用继续；CLI 不写 |
 | J FAQ | 菜单打开；Q1–Q4 文案；只读滚动；单例；Esc；不连服务器/不读凭证/不写设置 |
 | K CLI | 参数、退出码、正常 stdout 不变；无诊断文件；批量/重连策略与 GUI 共用核心；文件夹失败继续 |
 
@@ -1206,7 +1217,7 @@ B 账户：与 A 同时跑一次，验证停止 A 不影响 B、A/B 的 run/统�
 2. **吞吐**：同一账户、可比网络与时间段的 R1/R2 吞吐 ≥ 旧版基线的 80%（封/分）。
 3. **持续降速**：对每个连续下载段（≥15 分钟）：
    - 丢弃前 5 分钟预热；
-   - 把剩余时间按前后三等分，最后三分之一的 30 秒字节速率中位数 ÷ 前三分之一中位数 ≥ 0.50；
+   - 把剩余时间按前后三等分，最后三分之一的 120 秒字节速率中位数 ÷ 前三分之一中位数 ≥ 0.50；
    - 任意 10 分钟窗口内，至少 40 个有效 10 秒 sample 的字节速率中位数 < 该运行峰值 5 分钟速率的 25% → 判持续降速。
 4. **正确性**：R1–R3 与假服务器套件均无丢信、重复写、错误跳过、停止失效、重连丢/重、崩溃/卡死。
 5. **CLI**：退出码/正常输出不变。
@@ -1346,7 +1357,7 @@ WP-9（全量验收/现场数据包，依赖全部）
 **验收测试**
 
 - 第 12.2 节 H 组。
-- 纯函数测试：30 秒窗口、5 秒/3 封阈值、60 秒 ETA、格式、合计 >=2、0 如实显示。
+- 纯函数测试：120 秒窗口、5 秒/3 封阈值、同窗 ETA、格式、合计 >=2、0 如实显示。
 - GUI 测试：底部跟随、上移不抢、切换账户到底部、1 秒 tick 不改 `yview`。
 - `uv run pytest -m gui -q` 通过。
 

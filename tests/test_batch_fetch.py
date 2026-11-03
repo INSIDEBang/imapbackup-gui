@@ -180,6 +180,56 @@ def test_fetch_ms_measures_fetch_only_not_parse_or_write(tmp_path):
     assert batches[0].fetch_ms < 100, batches[0]
 
 
+def test_the_inflight_batch_is_published_before_the_request_and_cleared_after_it(tmp_path):
+    """请求还在飞的这段时间里也要有读数可读：发出前发布封数与声明字节，请求一终止就清空。"""
+    sizes = {uid: uid * 100 for uid in range(1, 10)}      # 8 封 + 1 封两批
+    seen: list[tuple[list[int], object]] = []
+    progress = core.DownloadProgress()
+
+    def watch(_server, uids):
+        seen.append((list(uids), progress.inflight))
+
+    server = make_server(range(1, 10), sizes=sizes, body_hook=watch)
+    run(tmp_path, server, make_messages(range(1, 10), sizes), progress=progress)
+
+    assert [uids for uids, _ in seen] == [list(range(1, 9)), [9]], seen
+    first, second = (batch for _, batch in seen)
+    assert (first.msgs, first.bytes) == (8, 3600), first      # 声明字节，不是实际取回的字节
+    assert (second.msgs, second.bytes) == (1, 900), second
+    assert first.started_at <= second.started_at <= core.time.monotonic()
+    assert progress.inflight is None
+
+
+def test_progress_keeps_the_longest_batch_of_the_run(tmp_path):
+    """慢批要跨采样窗留住：窗口只看最近完成的批次，最长的一批只能靠本账户累计。"""
+    def slow_the_multi_message_batch(_server, uids):
+        if len(uids) > 1:
+            time.sleep(0.2)
+
+    server = make_server(range(1, 10), body_hook=slow_the_multi_message_batch)
+    progress, _, batches = run(tmp_path, server, make_messages(range(1, 10)))
+
+    assert [stats.msgs for stats in batches] == [8, 1], batches
+    assert batches[0].fetch_ms >= 200 and batches[1].fetch_ms < batches[0].fetch_ms
+    assert progress.max_fetch_ms == pytest.approx(batches[0].fetch_ms)
+
+
+def test_a_timed_out_batch_leaves_no_inflight_and_is_still_the_longest(tmp_path):
+    """超时结束的那批不留残值，也不该被忘掉：它没写完所以不进 batches，但耗时仍进最长单批。"""
+    def time_out_slowly(_server, batch):
+        time.sleep(0.2)
+        return TimeoutError("The read operation timed out")
+
+    server = make_server([1, 2], raise_body_hook=time_out_slowly)
+    progress = core.DownloadProgress()
+
+    with pytest.raises(core.BatchStalled):
+        run(tmp_path, server, make_messages([1, 2]), progress=progress, stall=core.BatchStall())
+
+    assert progress.inflight is None
+    assert progress.batches == 0 and progress.max_fetch_ms >= 200, progress.max_fetch_ms
+
+
 # --- C 组：失败矩阵 -------------------------------------------------------------
 
 def test_missing_uid_is_retried_alone_then_counted_missing(tmp_path):

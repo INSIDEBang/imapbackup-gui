@@ -155,6 +155,15 @@ class BatchStats:
     fetch_failed: int
 
 
+@dataclass(frozen=True)
+class InflightBatch:
+    """The body-fetch batch on the wire right now: message count and declared bytes."""
+
+    msgs: int
+    bytes: int
+    started_at: float
+
+
 @dataclass
 class DownloadProgress:
     """Mutable accumulator; the GUI shares one per account and a reconnect keeps adding to it."""
@@ -168,6 +177,8 @@ class DownloadProgress:
     done_bytes: int = 0
     batches: int = 0
     last_batch: BatchStats | None = None
+    inflight: InflightBatch | None = None
+    max_fetch_ms: float | None = None
     stopped: bool = False
     failures: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
     unreported_failures: set[tuple[str, str]] = field(default_factory=set, repr=False)
@@ -824,6 +835,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                       *, written: set[str] | None = None,
                       progress: DownloadProgress | None = None,
                       on_batch: Callable[[BatchStats], None] | None = None,
+                      on_batch_start: Callable[[InflightBatch], None] | None = None,
                       stall: BatchStall | None = None,
                       index_mbox: IndexWriter | None = None,
                       index_eml: IndexWriter | None = None) -> DownloadProgress:
@@ -898,11 +910,22 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                     log.info("%s: stopped by request before next batch", display)
                 break
             batch_t0 = time.monotonic()
+            progress.inflight = InflightBatch(len(batch),
+                                              sum(size for _, _, size in batch), batch_t0)
+            # 调用方要用这个值换快照：下一次请求会把线程埋进 socket 读，之后再没有检查点
             try:
-                fetched, failures = _fetch_batch(server, batch, log, display)
-            except TimeoutError as exc:
-                _handle_batch_timeout(exc, batch, stall, progress, log, display)
-            fetch_ms = (time.monotonic() - batch_t0) * 1000.0
+                if on_batch_start is not None:
+                    on_batch_start(progress.inflight)
+                try:
+                    fetched, failures = _fetch_batch(server, batch, log, display)
+                except TimeoutError as exc:
+                    _handle_batch_timeout(exc, batch, stall, progress, log, display)
+            finally:
+                progress.inflight = None
+                # 超时的一批也要算进最长单批：它正是「跑了 96 分钟」那种
+                fetch_ms = (time.monotonic() - batch_t0) * 1000.0
+                if progress.max_fetch_ms is None or fetch_ms > progress.max_fetch_ms:
+                    progress.max_fetch_ms = fetch_ms
             if should_stop is not None and should_stop():
                 progress.stopped = True
                 if not quiet:

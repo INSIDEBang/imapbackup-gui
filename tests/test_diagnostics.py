@@ -34,7 +34,7 @@ def test_every_row_has_the_full_schema_and_identity_fields(isolate_log_dir):
     assert text.endswith("\n") and text.count("\n") == 1 and "收件箱" in text
     (row,) = read_rows(isolate_log_dir)
     assert list(row) == FIELDS
-    assert (row["schema"], row["app"], row["event"]) == (1, "imapbackup-gui", "phase")
+    assert (row["schema"], row["app"], row["event"]) == (2, "imapbackup-gui", "phase")
     assert (row["account"], row["host"], row["folder"], row["phase"]) == (
         "tracer@example.com", "imap.example.com", "收件箱", "scanning")
     assert re.fullmatch(r"[0-9a-f]{8}", row["run"]), row["run"]

@@ -309,8 +309,8 @@ def _message(folder="INBOX", index=1, total=23, **overrides):
     return fields
 
 
-def test_speed_tracker_uses_a_30_second_window_and_minimum_samples():
-    """速率只统计近 30 秒；首次预热需要 5 秒与累计 3 封完成消息。"""
+def test_speed_tracker_uses_a_120_second_window_and_minimum_samples():
+    """速率只统计近 120 秒（批次变大后两批之间的静默要撑得住）；首次预热仍需 5 秒与累计 3 封。"""
     tracker = g.SpeedTracker()
     tracker.add(100.0, 100)
     tracker.add(101.0, 200)
@@ -325,8 +325,29 @@ def test_speed_tracker_uses_a_30_second_window_and_minimum_samples():
     assert tracker.rates(110.0) == pytest.approx((18.0, 60.0))
 
     tracker.add(120.0, 400)
-    assert tracker.rates(135.0) == pytest.approx((6.0, 30.0))  # 100 秒的样本已出窗
-    assert tracker.rates(140.0) == pytest.approx((4.0, 700 / 30))
+    assert tracker.rates(225.0) == pytest.approx((1.5, 7.5))       # t=100 出窗：3 封 / 900 字节 ÷ 120 秒
+    assert tracker.rates(230.0) == pytest.approx((1.0, 35 / 6))    # 只剩 110 与 120 两封
+
+
+def test_speed_tracker_keeps_a_block_visible_through_the_gap_between_batches():
+    """成块到账后不再立刻掉到 0：30 秒窗会在下一批到达前读成 0，120 秒窗给的是整批的速率。"""
+    tracker = g.SpeedTracker()
+    for _ in range(3):
+        tracker.add(0.0, 1200)                # 一批 3 封在同一时刻到账
+
+    assert tracker.rates(40.0) == pytest.approx((4.5, 90.0))       # 40 秒后仍在窗内
+    assert tracker.eta_seconds(40.0, 12600, 3600) == pytest.approx(100.0)
+    assert tracker.rates(121.0) == (0.0, 0.0)                      # 超过一个窗才认静默
+
+
+def test_speed_tracker_keeps_two_minutes_of_samples_for_the_widened_window():
+    """样本保留跟着读数窗一起放宽：否则新窗还没填满，旧样本就被丢了，速率低估一整批。"""
+    tracker = g.SpeedTracker()
+    for _ in range(4):
+        tracker.add(0.0, 1200)
+    tracker.add(119.0, 600)                                     # 下一批在 119 秒到账
+
+    assert tracker.rates(120.0) == pytest.approx((2.5, 45.0))   # 5 封 / 5400 字节都还在 120 秒窗内
 
 
 @pytest.mark.parametrize("read_during_warmup", [False, True])
@@ -337,14 +358,12 @@ def test_speed_tracker_stays_ready_across_empty_windows(read_during_warmup):
     if read_during_warmup:
         assert tracker.rates(4.0) is None
         assert tracker.rates(5.0) == pytest.approx((36.0, 180.0))
-    assert tracker.rates(32.0) == pytest.approx((2.0, 10.0))
-    assert tracker.rates(33.0) == (0.0, 0.0)
-    assert tracker.rates(70.0) == (0.0, 0.0)
-    assert tracker.eta_seconds(70.0, 9000, 900) is None
-    tracker.add(70.0, 900)
-    assert tracker.rates(70.0) == pytest.approx((2.0, 30.0))
-    assert tracker.rates(75.0) == pytest.approx((2.0, 30.0))
-    assert tracker.eta_seconds(75.0, 9000, 1800) == pytest.approx(480.0)
+    assert tracker.rates(130.0) == (0.0, 0.0)
+    assert tracker.eta_seconds(131.0, 9000, 900) is None
+    tracker.add(131.0, 900)
+    assert tracker.rates(131.0) == pytest.approx((0.5, 7.5))       # 不重新预热：1 封 / 900 字节 ÷ 120 秒
+    assert tracker.rates(136.0) == pytest.approx((0.5, 7.5))
+    assert tracker.eta_seconds(136.0, 9000, 1800) == pytest.approx(960.0)
 
 
 def test_speed_tracker_reports_a_zero_byte_rate_without_an_eta():
@@ -357,8 +376,8 @@ def test_speed_tracker_reports_a_zero_byte_rate_without_an_eta():
     assert tracker.eta_seconds(110.0, 1000, 0) is None
 
 
-def test_speed_tracker_eta_uses_60_second_byte_rate_and_remaining_bytes():
-    """ETA 用近 60 秒字节速率去除剩余字节；少于 10 秒样本不显示，降速后允许变长。"""
+def test_speed_tracker_eta_uses_the_120_second_byte_rate_and_remaining_bytes():
+    """ETA 用近 120 秒字节速率去除剩余字节；少于 10 秒样本不显示，降速后允许变长。"""
     tracker = g.SpeedTracker()
     assert tracker.eta_seconds(10.0, 1000, 200) is None   # 首批尚未完成
     tracker.add(0.0, 100)
@@ -366,8 +385,8 @@ def test_speed_tracker_eta_uses_60_second_byte_rate_and_remaining_bytes():
     tracker.add(8.0, 100)
     assert tracker.eta_seconds(9.0, 1000, 200) is None    # 只有 9 秒
     tracker.add(9.0, 100)
-    assert tracker.eta_seconds(10.0, 1000, 200) == pytest.approx(20.0)   # 800 / 40
-    assert tracker.eta_seconds(65.0, 1000, 200) == pytest.approx(160.0)  # 800 / 5
+    assert tracker.eta_seconds(10.0, 1000, 200) == pytest.approx(20.0)    # 800 / 40
+    assert tracker.eta_seconds(100.0, 1000, 200) == pytest.approx(200.0)  # 800 / 4：4 封仍在 120 秒窗内
 
 
 @pytest.mark.parametrize(("seconds", "expected"), [
@@ -939,23 +958,23 @@ def test_second_line_keeps_zero_rates_and_resumes_without_warmup(app, monkeypatc
         progress = (app.progress["value"], app.progress["maximum"])
         viewport = app.tree.yview()
 
-        clock[0] = 141.0
+        clock[0] = 231.0
         app._status_tick()
         assert app._status_full == "备份 INBOX（10 封） · 本账户 0.0 封/分 · 0 bytes/s"
         assert app._count_full == counts
         assert (app.progress["value"], app.progress["maximum"]) == progress
         assert app.tree.yview() == viewport
 
-        clock[0] = 175.0
+        clock[0] = 241.0
         app.events.put(("message", aid, _message(index=4, total=10), 1000))
         pump(app)
         app._refresh_status_line()
         assert app._status_full == (
-            "备份 INBOX（10 封） · 本账户 2.0 封/分 · 33 bytes/s · 预计剩余 6 分钟"
+            "备份 INBOX（10 封） · 本账户 0.5 封/分 · 8 bytes/s · 预计剩余 12 分钟"
         )
         app.events.put(("phase", aid, "download", "备份 Archive（6 封）"))
         pump(app)
-        assert "本账户 2.0 封/分" in app._status_full
+        assert "本账户 0.5 封/分" in app._status_full
         app.events.put(("phase", aid, "backoff", "连接中断，8 秒后重连（第 1/5 次）"))
         pump(app)
         assert "本账户" not in app._status_full
@@ -1040,7 +1059,7 @@ def test_second_line_aggregates_only_downloading_accounts(app, monkeypatch):
         "全部 36.0 封/分 · 90 bytes/s"
     ), app._status_full
 
-    clock[0] = 141.0
+    clock[0] = 231.0
     app._refresh_status_line()
     assert app._status_full == (
         "备份 INBOX（3 封） · 本账户 0.0 封/分 · 0 bytes/s · 全部 0.0 封/分 · 0 bytes/s"
@@ -5545,6 +5564,72 @@ def test_a_sample_taken_mid_download_reads_what_the_running_worker_published(app
     pump(app, 5)
     (end,) = _diag_rows(diag_env, "account_end")
     assert (end["result"], end["done_msgs"], end["batch_msgs"]) == ("completed", 12, 4)
+
+
+def test_a_batch_stuck_in_flight_keeps_reporting_itself(app, diag_env, diag_clock, monkeypatch, tmp_path):
+    """真线程 worker 卡在第 2 批正文请求里跨过一个采样窗：连续两条 sample 都在途批次给值。"""
+    raws = _fake_mailbox("stall", 12)[0]                       # 第 1 批 8 封，第 2 批 4 封
+    reached, go = g.threading.Event(), g.threading.Event()
+    requests: list[list[int]] = []
+
+    def hold_the_second_batch(_server, uids):
+        requests.append(list(uids))
+        if len(requests) > 1:
+            reached.set()
+            assert go.wait(10)
+
+    monkeypatch.setattr(g.core, "connect_and_login",
+                        lambda _cfg, _log: UidFetchServer(raws, body_hook=hold_the_second_batch))
+    account = _diag_account(app, "stall")
+    app._cycle["t0"] = diag_clock.now
+    app.events.put(("account_begin", account["id"]))
+    thread = g.threading.Thread(target=app._backup_account_thread, daemon=True, args=(
+        account, str(tmp_path), app.events, logging.getLogger("test.diag.stall"), g.threading.Event()))
+    thread.start()
+    try:
+        assert reached.wait(10)
+        pump(app, 5)                                           # 第 1 批的阶段与 8 封：都在 fake t=1000
+        diag_clock.now = 1010.0
+        _diag_tick(app)
+        diag_clock.now = 1020.0
+        _diag_tick(app)
+        samples = _diag_rows(diag_env, "sample")
+    finally:
+        go.set()
+        thread.join(10)
+    assert not thread.is_alive()
+
+    second_batch = sum(len(raws[uid]) for uid in range(9, 13))
+    assert [row["inflight_msgs"] for row in samples] == [4, 4], samples
+    assert [row["inflight_bytes"] for row in samples] == [second_batch, second_batch], samples
+    # 已等时长只比增量：started_at 出自核心的真实单调钟，采样用的是测试假钟，两者绝对值不可比
+    waits = [row["inflight_elapsed_s"] for row in samples]
+    assert waits[0] is not None and waits[1] - waits[0] == pytest.approx(10.0, abs=0.1), samples
+    assert samples[0]["fetch_ms_avg"] is not None                 # 第 1 批还在 10 秒窗内
+    assert samples[1]["fetch_ms_avg"] is None                     # 出窗后只有在途字段能说明请求还没答完
+    assert samples[-1]["batch_msgs"] == 8 and samples[-1]["fetch_ms_max"] is not None
+
+
+def test_a_sample_reports_the_inflight_batch_and_the_longest_batch_of_the_run(app, diag_env, diag_clock):
+    """在途批次取自 worker 发出请求前发布的快照；本账户最长单批跨采样窗累计，还没发出过批次就是 null。"""
+    account = _diag_account(app, "inflight")
+    app._cycle["t0"] = diag_clock.now
+    _diag_begin(app, account, "download", "备份 INBOX（若干封）")
+    (phase,) = _diag_rows(diag_env, "phase")
+    assert (phase["inflight_msgs"], phase["inflight_bytes"],
+            phase["inflight_elapsed_s"], phase["fetch_ms_max"]) == (None, None, None, None)
+
+    inflight = g.core.InflightBatch(msgs=9, bytes=12345, started_at=1002.5)
+    app._publish_account_stats(account["id"], g.AccountStats(
+        folder="INBOX", batches=((1004.0, 300.0), (1006.0, 120.0)),
+        progress=g.core.DownloadProgress(max_fetch_ms=543210.0, inflight=inflight)))
+    diag_clock.now = 1010.0
+    _diag_tick(app)
+
+    (sample,) = _diag_rows(diag_env, "sample")
+    assert (sample["inflight_msgs"], sample["inflight_bytes"]) == (9, 12345)
+    assert sample["inflight_elapsed_s"] == pytest.approx(7.5)
+    assert sample["fetch_ms_max"] == 543210.0
 
 
 def test_batch_timings_cover_only_the_last_ten_seconds(app, diag_env, diag_clock):
