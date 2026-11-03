@@ -2,7 +2,8 @@
 
 正文按 UID 升序切批（≤64 封、≤32 MiB，超限/未知大小独占一批），每批解析完才写盘；
 失败按 missing / no_bad / malformed / timeout 四桶计数，绝不冲抵已备份；批次 NO/BAD 整批重试
-一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败；正文读超时先拆批再放弃单封。
+一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败；正文读超时后按对半缩小的
+批次重取，只有单独取仍超时的那封才放弃。
 假服务器，不需要凭证。
 """
 import imaplib
@@ -69,6 +70,17 @@ def timeout_on(uids):
     return hook
 
 
+def timeout_once():
+    """只在第一次正文请求抛 TimeoutError，模拟一次读超时之后链路恢复正常。"""
+    calls: list[list[int]] = []
+
+    def hook(_server, batch):
+        calls.append(list(batch))
+        return TimeoutError("The read operation timed out") if len(calls) == 1 else None
+
+    return hook
+
+
 def run_until_stable(tmp_path, server, messages, stall, progress=None, log=None):
     """按 download_folder_with_reconnect 的语义重跑：每轮只传剩余消息，直到不再抛 BatchStalled。"""
     progress = progress if progress is not None else core.DownloadProgress()
@@ -121,6 +133,15 @@ def test_oversized_and_unknown_sizes_get_their_own_batch(tmp_path):
     run(tmp_path, server, make_messages([1, 2, 3, 4, 5], sizes))
 
     assert server.body_fetches == [[1], [2], [3], [4], [5]], server.body_fetches
+
+
+def test_a_low_ceiling_shortens_the_batch_it_touches(tmp_path):
+    """上限表怎么影响切批：上限 1 独占一批，一批的封数不会超过批内最小的那个上限。"""
+    stall = core.BatchStall(caps={"<2@x>": 2, "<4@x>": 1})
+    server = make_server([1, 2, 3, 4, 5, 6])
+    run(tmp_path, server, make_messages([1, 2, 3, 4, 5, 6]), stall=stall)
+
+    assert server.body_fetches == [[1, 2], [3], [4], [5, 6]], server.body_fetches
 
 
 def test_a_bigger_payload_cuts_the_request_count_of_the_same_pending_set(tmp_path, monkeypatch):
@@ -474,8 +495,68 @@ def test_folders_sharing_an_output_name_count_their_failures_separately(tmp_path
 
 # --- C 组补充：正文取信超时（socket 读超时）--------------------------------------
 
-def test_a_timed_out_multi_message_batch_is_split_for_the_next_attempt(tmp_path):
-    """整批超时先拆成单封：不写半批，记住这批 UID 下一轮逐封取。"""
+def test_a_timed_out_64_message_batch_is_rescued_in_two_smaller_batches(tmp_path):
+    """64 封一批超时：对半缩小后两次请求收齐全批，没有一封写两遍（ADR 0016）。"""
+    uids = list(range(1, 65))
+    server = make_server(uids, raise_body_hook=timeout_once())
+    stall = core.BatchStall()
+    progress, written = run_until_stable(tmp_path, server, make_messages(uids), stall)
+
+    assert server.body_fetches == [uids, list(range(1, 33)), list(range(33, 65))], server.body_fetches
+    assert stall.caps == {f"<{uid}@x>": 32 for uid in uids}, stall.caps
+    assert progress.backed == 64 and progress.fetch_failed == 0
+    assert written == {f"<{uid}@x>" for uid in uids}
+    assert len(mbox_ids(tmp_path)) == 64                 # 救回的一批没有一封写两遍
+
+
+def test_a_batch_that_keeps_timing_out_halves_down_to_one_message(tmp_path):
+    """一批里有一封读不动：8→4→2→1 逐级对半，只有单独取仍超时的那封才放弃。
+
+    救回的同轮请求仍是缩过的小批——上限只降不升，成功也不会把批次合回 8 封。
+    """
+    uids = list(range(1, 9))
+    server = make_server(uids, raise_body_hook=timeout_on([1]))
+    stall = core.BatchStall()
+    progress, written = run_until_stable(tmp_path, server, make_messages(uids), stall)
+
+    assert server.body_fetches == [uids, [1, 2, 3, 4], [1, 2], [1], [2], [3, 4],
+                                   [5, 6, 7, 8]], server.body_fetches
+    assert stall.skipped == {"<1@x>"} and stall.caps == {
+        "<2@x>": 1, "<3@x>": 2, "<4@x>": 2, "<5@x>": 4, "<6@x>": 4, "<7@x>": 4, "<8@x>": 4}
+    assert written == {f"<{uid}@x>" for uid in range(2, 9)}
+    assert progress.backed == 7 and (progress.fetch_failed, progress.fetch_failed_timeout) == (1, 1)
+    assert len(mbox_ids(tmp_path)) == 7
+
+
+def test_a_byte_limited_batch_still_halves_after_a_timeout(tmp_path):
+    """受字节上限约束的一批（远不到 64 封）同样缩得下来：否则下一轮原样重发同一个请求。"""
+    uids = list(range(1, 6))
+    sizes = dict.fromkeys(uids, 8 * MIB)
+    server = make_server(uids, sizes=sizes, raise_body_hook=timeout_once())
+    progress, written = run_until_stable(tmp_path, server, make_messages(uids, sizes),
+                                         core.BatchStall())
+
+    assert server.body_fetches == [[1, 2, 3, 4], [1, 2], [3, 4], [5]], server.body_fetches
+    assert progress.backed == 5 and written == {f"<{uid}@x>" for uid in uids}
+
+
+def test_a_new_run_starts_the_ceiling_table_empty(tmp_path):
+    """上限表只活一轮：新 tracker 下同一批消息重新一次请求拿回，不带着上一轮的缩批。"""
+    uids = list(range(1, 9))
+    server = make_server(uids, raise_body_hook=timeout_once())
+    run_until_stable(tmp_path / "first", server, make_messages(uids), core.BatchStall())
+    assert server.body_fetches == [uids, list(range(1, 5)), list(range(5, 9))], server.body_fetches
+
+    server.raise_body_hook = None
+    server.body_fetches.clear()
+    progress, _written = run_until_stable(tmp_path / "second", server, make_messages(uids),
+                                          core.BatchStall())
+    assert server.body_fetches == [uids], server.body_fetches
+    assert progress.backed == 8
+
+
+def test_a_timed_out_batch_lowers_the_ceiling_of_every_message_in_it(tmp_path):
+    """整批超时：不写半批，批内每封的批次上限对半——两封的一批缩到 1，就是各自独占一批。"""
     server = make_server([1, 2], raise_body_hook=timeout_on([2]))
     stall = core.BatchStall()
     progress = core.DownloadProgress()
@@ -484,7 +565,7 @@ def test_a_timed_out_multi_message_batch_is_split_for_the_next_attempt(tmp_path)
         run(tmp_path, server, make_messages([1, 2]), progress=progress, stall=stall)
 
     assert server.body_fetches == [[1, 2]], server.body_fetches
-    assert stall.split == {"<1@x>", "<2@x>"} and stall.skipped == set()
+    assert stall.caps == {"<1@x>": 1, "<2@x>": 1} and stall.skipped == set()
     assert progress.backed == 0 and progress.fetch_failed == 0
     assert mbox_ids(tmp_path) == []
 
@@ -514,20 +595,14 @@ def test_a_lone_message_that_stalls_is_abandoned_and_counted_as_timeout(tmp_path
 def test_a_single_message_batch_that_stalls_gets_one_more_attempt(tmp_path):
     """独占一批的大邮件先单独重试一次，不把一次超时直接当放弃。"""
     sizes = {1: 32 * MIB + 1}
-    calls = []
-
-    def timeout_once(_server, batch):
-        calls.append(list(batch))
-        return TimeoutError("The read operation timed out") if len(calls) == 1 else None
-
-    server = make_server([1], sizes=sizes, raise_body_hook=timeout_once)
+    server = make_server([1], sizes=sizes, raise_body_hook=timeout_once())
     stall = core.BatchStall()
     progress, written = run_until_stable(tmp_path, server, make_messages([1], sizes), stall)
 
     assert server.body_fetches == [[1], [1]], server.body_fetches
     assert written == {"<1@x>"}
     assert (progress.backed, progress.fetch_failed) == (1, 0)
-    assert stall.split == {"<1@x>"} and stall.skipped == set()
+    assert stall.caps == {"<1@x>": 1} and stall.skipped == set()
 
 
 def test_a_stall_without_a_tracker_propagates_the_timeout(tmp_path):

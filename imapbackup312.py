@@ -48,7 +48,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
@@ -188,11 +188,15 @@ class DownloadProgress:
 class BatchStall:
     """One folder run's memory of body-fetch batches that hit the read timeout.
 
-    ``split`` messages are fetched alone on the next attempt; a message that
-    times out even alone moves to ``skipped`` and is given up for this run.
+    ``caps`` is the per-message ceiling on how many messages may share a batch: a
+    batch that times out has been proved too big, so every message in it may only
+    join a batch half as large as that one. A full 64-message batch therefore steps
+    down 64 → 32 → 16 → 8 → 4 → 2 → 1, and a ceiling only ever lowers. A message
+    that times out while alone at ceiling 1 moves to ``skipped`` and is given up
+    for this run.
     """
 
-    split: set[str] = field(default_factory=set)
+    caps: dict[str, int] = field(default_factory=dict)
     skipped: set[str] = field(default_factory=set)
 
 
@@ -626,31 +630,34 @@ def _fetch_one(server: imaplib.IMAP4, uid: int, items: str) -> tuple[str, tuple[
 
 
 def _plan_batches(items: list[tuple[str, int, int]],
-                  singles: Container[str]) -> list[list[tuple[str, int, int]]]:
+                  caps: Mapping[str, int]) -> list[list[tuple[str, int, int]]]:
     """Split UID-sorted (Message-Id, UID, size) into <=64 messages / <=32 MiB batches.
 
-    Unknown (size <= 0), oversized and ``singles`` messages take a batch of
-    their own, so one huge message never drags neighbours over the byte cap and
-    a message that stalled a batch is retried on its own.
+    A batch holds at most the smallest per-message ceiling of its members (``caps``,
+    from the stall tracker), so a message whose batches keep timing out is retried in
+    ever smaller groups and ceiling 1 takes a batch of its own. Unknown (size <= 0)
+    and oversized messages also take a batch of their own, so one huge message never
+    drags neighbours over the byte cap.
     """
     batches: list[list[tuple[str, int, int]]] = []
     current: list[tuple[str, int, int]] = []
     current_bytes = 0
+    current_cap = FETCH_BATCH_MAX_MESSAGES
     for item in items:
         size = item[2]
-        if size <= 0 or size > FETCH_BATCH_MAX_BYTES or item[0] in singles:
+        cap = caps.get(item[0], FETCH_BATCH_MAX_MESSAGES)
+        if size <= 0 or size > FETCH_BATCH_MAX_BYTES or cap == 1:
             if current:
                 batches.append(current)
-                current = []
-                current_bytes = 0
             batches.append([item])
+            current, current_bytes, current_cap = [], 0, FETCH_BATCH_MAX_MESSAGES
             continue
-        if len(current) == FETCH_BATCH_MAX_MESSAGES or current_bytes + size > FETCH_BATCH_MAX_BYTES:
+        if len(current) >= min(current_cap, cap) or current_bytes + size > FETCH_BATCH_MAX_BYTES:
             batches.append(current)
-            current = []
-            current_bytes = 0
+            current, current_bytes, current_cap = [], 0, FETCH_BATCH_MAX_MESSAGES
         current.append(item)
         current_bytes += size
+        current_cap = min(current_cap, cap)
     if current:
         batches.append(current)
     return batches
@@ -718,7 +725,7 @@ def _fetch_batch(server: imaplib.IMAP4, batch: list[tuple[str, int, int]], log: 
 def _handle_batch_timeout(exc: TimeoutError, batch: list[tuple[str, int, int]],
                           stall: BatchStall | None, progress: DownloadProgress,
                           log: logging.Logger, display: str) -> NoReturn:
-    """Split a timed-out batch for a per-UID retry, or give up one lone message.
+    """Halve a timed-out batch for the next attempt, or give up one lone message.
 
     Always raises: the original timeout when the caller keeps no stall tracker
     (old behavior), else BatchStalled so the link is rebuilt. The batch was not
@@ -726,20 +733,22 @@ def _handle_batch_timeout(exc: TimeoutError, batch: list[tuple[str, int, int]],
     """
     if stall is None:
         raise exc
+    if len(batch) == 1 and stall.caps.get(batch[0][0]) == 1:
+        msg_id, uid, size = batch[0]
+        del stall.caps[msg_id]
+        stall.skipped.add(msg_id)
+        _record_failure(progress, (display, msg_id), "timeout")
+        log.warning("%s: giving up on %s (UID %d, %s) after it timed out alone; skipping it for this run",
+                    display, msg_id, uid, pretty_byte_count(size))
+        raise BatchStalled(f"single message fetch timed out (UID {uid})") from exc
+    new_cap = (len(batch) + 1) // 2
+    for msg_id, _, _ in batch:
+        stall.caps[msg_id] = min(stall.caps.get(msg_id, FETCH_BATCH_MAX_MESSAGES), new_cap)
     total_bytes = sum(size for _, _, size in batch)
-    if len(batch) > 1 or batch[0][0] not in stall.split:
-        stall.split |= {msg_id for msg_id, _, _ in batch}
-        log.warning("%s: body fetch of %d message(s), %s, timed out; retrying them one by one",
-                    display, len(batch), pretty_byte_count(total_bytes))
-        raise BatchStalled(
-            f"body fetch timed out ({len(batch)} message(s), {total_bytes} bytes)") from exc
-    msg_id, uid, size = batch[0]
-    stall.split.discard(msg_id)
-    stall.skipped.add(msg_id)
-    _record_failure(progress, (display, msg_id), "timeout")
-    log.warning("%s: giving up on %s (UID %d, %s) after it timed out alone; skipping it for this run",
-                display, msg_id, uid, pretty_byte_count(size))
-    raise BatchStalled(f"single message fetch timed out (UID {uid})") from exc
+    log.warning("%s: body fetch of %d message(s), %s, timed out; the next attempt uses batches of at most %d",
+                display, len(batch), pretty_byte_count(total_bytes), new_cap)
+    raise BatchStalled(
+        f"body fetch timed out ({len(batch)} message(s), {total_bytes} bytes)") from exc
 
 
 @dataclass(frozen=True)
@@ -846,9 +855,9 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     counted as backed, and a stop discards the rest of the in-flight batch.
 
     A read timeout on a batch raises BatchStalled (when ``stall`` is tracked) so
-    the caller rebuilds the link: the batch is fetched one message at a time, and
-    a message that still times out alone is counted in the timeout bucket and
-    skipped for the rest of the run (spec §5.7.9).
+    the caller rebuilds the link: the same messages are retried in batches holding
+    half as many of them, and a message that still times out alone is counted in the
+    timeout bucket and skipped for the rest of the run (spec §5.7.9).
     """
     if skip_mbox is None:
         skip_mbox = frozenset()
@@ -889,7 +898,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     if stall is not None and stall.skipped:
         ordered = [item for item in ordered if item[0] not in stall.skipped]
     index_of = {msg_id: idx for idx, msg_id in enumerate(messages, start=1)}
-    batches = _plan_batches(ordered, stall.split if stall is not None else frozenset())
+    batches = _plan_batches(ordered, stall.caps if stall is not None else {})
     spinner = Spinner(f"Downloading {count} new messages to {display}", nospinner, quiet=quiet)
     biggest = 0
     output_bytes = 0

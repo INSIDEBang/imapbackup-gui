@@ -416,7 +416,7 @@ def test_download_resumes_after_abort_without_rewriting(tmp_path):
 
 
 def test_download_resumes_after_a_body_timeout_without_failing_the_folder(tmp_path):
-    """一批取信超时：拆成单封重取，仍超时那封记 timeout 跳过，其余写完（规格 §5.7.9）。"""
+    """一批取信超时：对半缩小重取，单独取仍超时那封记 timeout 跳过，其余写完（规格 §5.7.9）。"""
     log = NullLog()
     raws = {uid: _raw(uid) for uid in range(1, 4)}
     server1, server2 = UidFetchServer(dict(raws)), UidFetchServer(dict(raws))
@@ -447,14 +447,14 @@ def test_download_resumes_after_a_body_timeout_without_failing_the_folder(tmp_pa
         should_stop=None, log=log, stats=stats)
 
     assert live is server2
-    assert attempts == [[1, 2, 3], [1, 2, 3], [2, 3]]  # 最后一轮只剩没写的（2 已跳过但未写）
+    assert attempts == [[1, 2, 3], [1, 2, 3], [1, 2, 3], [2, 3]]   # 第三轮写出 1，最后一轮只剩没写的 2、3
     assert server1.body_fetches == [[1, 2, 3]]
-    assert server2.body_fetches == [[1], [2], [3]]
+    assert server2.body_fetches == [[1, 2], [1], [2], [3]]         # 3 封 → 2 封 → 单封
     assert written == {"<m1@x>", "<m3@x>"}
     assert progress.backed == 2
     assert (progress.fetch_failed, progress.fetch_failed_timeout) == (1, 1)
     assert stall.skipped == {"<m2@x>"}
-    assert (stats.attempts, stats.successes, stats.exhausted) == (2, 2, False)
+    assert (stats.attempts, stats.successes, stats.exhausted) == (3, 3, False)
 
 
 def test_uidvalidity_change_rescans_once_reuses_local_and_subtracts_written():

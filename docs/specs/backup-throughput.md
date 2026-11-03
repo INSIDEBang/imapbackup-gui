@@ -270,7 +270,9 @@ FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
 2. 依次放入当前批：
    - 当前批为空时，无条件放入；
    - `size <= 0` 或 `size > FETCH_BATCH_MAX_BYTES` → 先结束当前批，该封独占一批；
-   - 否则若 `len(batch) == 64` 或 `sum(bytes) + size > 32 MiB` → 先结束当前批，再放入下一批。
+   - 停滞上限（5.7.9）已到 1 的封同样独占一批；
+   - 否则若 `len(batch) == min(64, 批内各封上限的最小值)` 或 `sum(bytes) + size > 32 MiB` → 先结束当前批，再放入下一批。
+   未出现在上限表里的封按 64 起步；上限只影响封数，不影响字节上限。
 3. 批间不休眠、不拿令牌、不做 AIMD；上一批写完立即发下一批。
 4. 单封超过 32 MiB 时整封读取，不使用 `partial()`（Python 3.12.13 的 `imaplib.partial()` 不可用）。
 
@@ -339,7 +341,7 @@ def download_messages(
 
 - `written`：调用方为每个文件夹维护的已写完集合；重连续跑用，不持久化。
 - `progress`：调用方传入的可变累计器；重连后继续累加，不因异常丢失已完成的计数。
-- `stall`：调用方为每个文件夹运行维护的正文超时记忆（5.7.9）；`None` 表示不处理读超时（旧行为）。
+- `stall`：调用方为每个文件夹运行维护的正文超时记忆——每封的批次封数上限表与本轮放弃集合（5.7.9）；`None` 表示不处理读超时（旧行为）。
 - `index_writer`：索引写入器；`None` 表示索引禁用。
 - `on_batch`：每批完成后回调，用于诊断采样与 UI 批次统计。
 - `on_batch_start`：每批**发出前**回调，用于把在途批次换进调用方的快照；`None` 表示调用方不采样（CLI）。
@@ -361,7 +363,7 @@ def download_messages(
 | 整批每封都是「缺失 UID」 | 全部记 `fetch_failed(missing)`；**不是**文件夹失败 |
 | 隔离结果混合 missing/malformed/NO-BAD | 各按其桶计数；只要存在 missing 或 malformed，就不升级为 `FolderFetchError`，文件夹继续 |
 | 连接 abort/OSError/BYE | 不在 `download_messages` 内重试；本批不写半批；交给 5.7 重连 |
-| 正文 FETCH 读超时（`TimeoutError`） | 多封批次：不写盘，下一轮把整批拆成单封取；单封仍超时：记 `fetch_failed(timeout)` 并跳过该封；刻意的重建连接不占重连预算（5.7.9） |
+| 正文 FETCH 读超时（`TimeoutError`） | 不写盘，下一轮把批对半缩小重取（64→32→…→1）；某封上限到 1 且单独取仍超时：记 `fetch_failed(timeout)` 并跳过该封；刻意的重建连接不占重连预算（5.7.9） |
 | 认证/SELECT NO | 不重试；SELECT NO 算文件夹失败，认证失败按账户失败 |
 | 本地写盘错误 | `BackupWriteError`；不算已备份；不触发重连；向上抛 |
 
@@ -675,26 +677,26 @@ GUI/CLI 的 `get_names`（LIST）也通过同一 helper：LIST 遇到连接级�
 
 只有 `TimeoutError`（socket 读超时）进入这条路径；abort/OSError/BYE 仍按 5.7.3–5.7.4 处理。
 
-调用方为**每个文件夹运行**创建一个 `BatchStall`，跨重连尝试保留：
+调用方为**每个文件夹运行**创建一个 `BatchStall`，跨重连尝试保留，本轮结束即丢弃（ADR 0016）：
 
 ```python
 @dataclass
 class BatchStall:
-    split: set[str]      # 下一轮单封取信的 Message-Id
-    skipped: set[str]    # 本轮放弃的 Message-Id
+    caps: dict[str, int]   # Message-Id → 该封允许的批次封数上限（只降不升）
+    skipped: set[str]      # 本轮放弃的 Message-Id
 ```
 
 `download_messages(..., stall=...)`：
 
-1. 规划批次时排除 `stall.skipped`，并让 `stall.split` 里的消息独占一批（与超大/未知大小同样的单封批）。`stall=None` 时不做任何处理。
+1. 规划批次时排除 `stall.skipped`，并按 `stall.caps` 缩批（5.2.2）：一批的封数不超过批内最小的那个上限，上限 1 独占一批。表里没有的封按 64 计。`stall=None` 时不做任何处理。
 2. `_fetch_batch` 抛 `TimeoutError`：
    - `stall is None`：原样上抛（旧行为）。
-   - 多封批次：本批不写盘；把批内 Message-Id 全部记入 `split`；记 WARNING（几封、合计字节）；抛 `BatchStalled`。
-   - 单封批次且该封不在 `split`：记入 `split`；抛 `BatchStalled`（独占一批的邮件也先单独重试一次）。
-   - 单封批次且该封已在 `split`：单独取仍读不动——从 `split` 移除、记入 `skipped`、计入 `fetch_failed(timeout)`、记 WARNING（Message-Id、UID、大小）；抛 `BatchStalled`。本轮不再请求该封，下一轮运行自然重试。
+   - 该封单独一批且上限已是 1：单独取仍读不动——从 `caps` 移除、记入 `skipped`、计入 `fetch_failed(timeout)`、记 WARNING（Message-Id、UID、大小）；抛 `BatchStalled`。本轮不再请求该封，下一轮运行自然重试。
+   - 其余情况（多封的一批，或上限还没到 1 的单封批）：本批不写盘；批内每封的上限取 `min(现值, ceil(本批封数 / 2))`（64 → 32 → 16 → 8 → 4 → 2 → 1，只降不升，同轮不因成功而回升）；记 WARNING（几封、合计字节、缩到几封一批）；抛 `BatchStalled`。
 3. `run_with_reconnect` 把 `BatchStalled` 当作可重试的连接级错误：关闭旧连接、立即重连（无退避），但**不增加**连续失败计数；`reauth`/拨号失败仍按 5.7.4 计数。
 4. 重连后 `download_folder_with_reconnect` 照常按 `pending − written` 续跑；被放弃的消息仍在 pending，末尾文件夹警告带 `timeout=N`。
-5. 日志只写批次大小与 Message-Id/UID/大小，不写邮件内容。
+5. 服务端读不动**大批次**时，2 次请求就能救回一批 64 封；某封读不动时按 64→32→…→1 逐级缩到它单独一批才被放弃，代价是每级一次读超时与一次重建链路（量级见 ADR 0016 后果）。不设二分地板，也不设每文件夹停滞次数封顶。
+6. 日志只写批次大小与 Message-Id/UID/大小，不写邮件内容。
 
 ### 5.8 停止
 
@@ -1066,10 +1068,13 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
 ## 10. ADR
 
-本 effort 新增两份 ADR：
+本 effort 新增的 ADR：
 
 - [ADR 0013：固定批量、无客户端自适应限速](../adr/0013-fixed-batching-no-adaptive-throttle.md)。
-- [ADR 0014：正文取信超时先拆单封，仍超时只放弃该封](../adr/0014-body-fetch-timeout-split-and-give-up.md)（5.7.9 与 timeout 桶的取舍）。
+- [ADR 0014：正文取信超时先拆单封，仍超时只放弃该封](../adr/0014-body-fetch-timeout-split-and-give-up.md)（timeout 桶的取舍；拆单封的机制由 ADR 0016 取代）。
+- [ADR 0015：正文批次载荷提高到 64 封 / 32 MiB](../adr/0015-body-batch-payload-64-32mib.md)（5.2 的批量上限）。
+- [ADR 0016：正文取信超时按对半缩小批次重取](../adr/0016-body-fetch-timeout-binary-halving.md)（5.7.9 的缩批规则）。
+- [ADR 0017：进程内共享取信字节额度](../adr/0017-process-wide-fetch-quota.md)（尚未实现）。
 
 理由：早期设计最初选择自适应闭环 + 同主机共享总速率；一次离散事件仿真证明常规模型下闭环更慢，后续架构决策进一步取消共享控制器。这是一个**硬反转**、**未来读者会问为什么**、**有真实取舍**的决策，必须留下 ADR。其他决策（索引、重连、诊断、FAQ）已在相关 ADR 与本文中有上下文，不另开 ADR。
 
@@ -1106,7 +1111,7 @@ ADR 需要说明：
   - 新增 `isolate_log_dir`（按需）：把 `core.LOG_DIR` 指向 `tmp_path/log`。
 - 新增/更新测试文件（名称可调整，覆盖必须存在）：
   - `tests/test_uid_scan.py`：SEARCH 分页、500 边界、合成 ID、畸形、SELECT NO。
-  - `tests/test_batch_fetch.py`：64 封/32 MiB 边界、第 65 封新批、同一待备份集的新旧请求次数对照、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
+  - `tests/test_batch_fetch.py`：64 封/32 MiB 边界、第 65 封新批、同一待备份集的新旧请求次数对照、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（64 封批超时后 2 次请求救回且不重复写、8→4→2→1 阶梯只降不升、上限 1 独占一批、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
   - `tests/test_scan_index.py`：schema、命中/未命中、失效矩阵、损坏、锁、并发、overwrite、格式保留、索引失败不影响下载。
   - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI；`BatchStalled` 不消耗预算且不等待、正文超时后重连续跑并使文件夹成功。
   - `tests/test_gui_backup_flow.py`：部分完成、文件夹失败、account_done、图标、事件契约。
@@ -1163,8 +1168,8 @@ basedpyright imapbackup312.py imapbackup_gui.py
 | 组 | 断言 |
 |---|---|
 | A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
-| B 批量 | 64 封/32 MiB 边界；第 65 封新批；单封 32 MiB+ 独占；size 0 独占；同一待备份集的新旧请求次数对照；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
-| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告；正文读超时 → 整批拆单封；单封仍超时 → `fetch_failed(timeout)` 且本轮不再请求；`stall=None` 原样抛 `TimeoutError`；警告带 `timeout=N` |
+| B 批量 | 64 封/32 MiB 边界；第 65 封新批；单封 32 MiB+ 独占；size 0 独占；同一待备份集的新旧请求次数对照；停滞上限表：1 独占一批、一批不超过批内最小上限；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
+| C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告；正文读超时 → 批内各封上限对半（64封批 2 次请求救回、8→4→2→1 阶梯、只降不升、跨重连保留、新运行重置）；上限到 1 且单独仍超时 → `fetch_failed(timeout)` 且本轮不再请求，其余消息照常写完；`stall=None` 原样抛 `TimeoutError`；警告带 `timeout=N` |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
 | E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连；`BatchStalled` 不占预算、不退避，超时后文件夹继续完成 |
 | F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；单账户停止不影响其他账户；停止优先于重连 |
