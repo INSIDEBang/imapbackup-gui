@@ -28,7 +28,7 @@ Related: [GLOSSARY.md](../../GLOSSARY.md)、[ADR 0003](../adr/0003-structured-me
 
 | 编号 | 目标 | 判据 |
 |---|---|---|
-| G1 | 提高首次全量吞吐 | 正文按 8 封 / 8 MiB 批量取信；每账户同一时刻至多一个请求在途；批间不休眠、不排队 |
+| G1 | 提高首次全量吞吐 | 正文按 64 封 / 32 MiB 批量取信；每账户同一时刻至多一个请求在途；批间不休眠、不排队 |
 | G2 | 服务端降速时不失控 | 不做客户端自适应限速；用固定批量 + 现场诊断判断是否需要后续方案 |
 | G3 | 降低中断恢复的本地扫描成本 | 本地扫描索引命中时不再逐封读 mbox/eml；索引失败不影响备份 |
 | G4 | 让速度与失败可见 | 第二行显示本账户速率、预计剩余、合计速率；取信失败/文件夹失败判「部分完成」；10 秒 JSONL 诊断 |
@@ -135,7 +135,7 @@ connect + login + LIST
   │
   ├─ 下载（CLI 逐文件夹；GUI pass 2 逐文件夹）
   │    SELECT readonly → 校验 UIDVALIDITY
-  │      → 按 UID 升序切批（≤8 封、≤8 MiB）
+  │      → 按 UID 升序切批（≤64 封、≤32 MiB）
   │      → UID FETCH (UID INTERNALDATE BODY.PEEK[])
   │      → 整批解析完成后逐封写缺失格式
   │      → report / written / 索引登记 / on_batch
@@ -255,9 +255,12 @@ SCAN_PAGE_UIDS = 500
 #### 5.2.1 常量
 
 ```python
-FETCH_BATCH_MAX_MESSAGES = 8
-FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
+FETCH_BATCH_MAX_MESSAGES = 64
+FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
 ```
+
+两个上限由 ADR 0015 从 8 封 / 8 MiB 抬高（服务端按请求而非按字节付出等待），切批规则本身不变；
+回退就是把这两个常数改回 8 / 8 MiB 的一次独立提交，不留开关。
 
 #### 5.2.2 切批算法
 
@@ -267,9 +270,9 @@ FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
 2. 依次放入当前批：
    - 当前批为空时，无条件放入；
    - `size <= 0` 或 `size > FETCH_BATCH_MAX_BYTES` → 先结束当前批，该封独占一批；
-   - 否则若 `len(batch) == 8` 或 `sum(bytes) + size > 8 MiB` → 先结束当前批，再放入下一批。
+   - 否则若 `len(batch) == 64` 或 `sum(bytes) + size > 32 MiB` → 先结束当前批，再放入下一批。
 3. 批间不休眠、不拿令牌、不做 AIMD；上一批写完立即发下一批。
-4. 单封超过 8 MiB 时整封读取，不使用 `partial()`（Python 3.12.13 的 `imaplib.partial()` 不可用）。
+4. 单封超过 32 MiB 时整封读取，不使用 `partial()`（Python 3.12.13 的 `imaplib.partial()` 不可用）。
 
 #### 5.2.3 请求与解析
 
@@ -1072,7 +1075,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 
 ADR 需要说明：
 
-- v1 固定 8 封 / 8 MiB、每账户单请求在途、无休眠/令牌桶/AIMD/共享状态。
+- 固定 64 封 / 32 MiB（ADR 0015）、每账户单请求在途、无休眠/令牌桶/AIMD/共享状态。
 - 重评触发条件：现场出现锯齿、错误率上升、服务商公布限额，或验收显示持续降速且客户端策略有明确收益。
 - 若未来引入控制器，必须是新 ADR + 新设置/参数，不在 v1 预留空接口。
 
@@ -1103,7 +1106,7 @@ ADR 需要说明：
   - 新增 `isolate_log_dir`（按需）：把 `core.LOG_DIR` 指向 `tmp_path/log`。
 - 新增/更新测试文件（名称可调整，覆盖必须存在）：
   - `tests/test_uid_scan.py`：SEARCH 分页、500 边界、合成 ID、畸形、SELECT NO。
-  - `tests/test_batch_fetch.py`：8/8MiB、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
+  - `tests/test_batch_fetch.py`：64 封/32 MiB 边界、第 65 封新批、同一待备份集的新旧请求次数对照、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（整批拆单封、单封超时放弃并计入 timeout、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
   - `tests/test_scan_index.py`：schema、命中/未命中、失效矩阵、损坏、锁、并发、overwrite、格式保留、索引失败不影响下载。
   - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI；`BatchStalled` 不消耗预算且不等待、正文超时后重连续跑并使文件夹成功。
   - `tests/test_gui_backup_flow.py`：部分完成、文件夹失败、account_done、图标、事件契约。
@@ -1116,7 +1119,7 @@ ADR 需要说明：
 ### 11.4 文档
 
 - `README.md` Fork Notes：
-  - 首量吞吐：UID 扫描、8 封 / 8 MiB、每账户单请求在途、无客户端限速。
+  - 首量吞吐：UID 扫描、64 封 / 32 MiB、每账户单请求在途、无客户端限速。
   - 中断恢复：本地扫描索引位置、可删除、卸载行为。
   - 断线重连：有界重试、UIDVALIDITY、停止优先。
   - 部分完成：取信失败/文件夹失败含义；正文读超时的拆批与放弃（不计入重连预算、下一轮补取）；第二行速率/ETA。
@@ -1160,7 +1163,7 @@ basedpyright imapbackup312.py imapbackup_gui.py
 | 组 | 断言 |
 |---|---|
 | A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
-| B 批量 | 8 封/8 MiB 边界；第 9 封新批；单封 8 MiB+ 独占；size 0 独占；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
+| B 批量 | 64 封/32 MiB 边界；第 65 封新批；单封 32 MiB+ 独占；size 0 独占；同一待备份集的新旧请求次数对照；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
 | C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告；正文读超时 → 整批拆单封；单封仍超时 → `fetch_failed(timeout)` 且本轮不再请求；`stall=None` 原样抛 `TimeoutError`；警告带 `timeout=N` |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
 | E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连；`BatchStalled` 不占预算、不退避，超时后文件夹继续完成 |
@@ -1443,7 +1446,7 @@ WP-9（全量验收/现场数据包，依赖全部）
 10. **诊断不含邮件内容**：无法从诊断还原具体哪封失败；只能看到计数与类别。
 11. **UIDVALIDITY 缺失**：服务器不提供时无法确认选中态，该文件夹按失败跳过；不再尝试重扫。
 12. **首次连接不重连**：初始 DNS/连接/认证失败沿用现有失败路径，不进入 5 次预算。
-13. **大附件内存**：8 MiB 批量 + 单封超限整封读取；多账户同时遇到超大邮件时内存可能上升，v1 不引入流式 `partial()`。
+13. **大附件内存**：32 MiB 批量 + 单封超限整封读取；每账户取信峰值内存按声明字节的 3–4 倍估算（ADR 0015 的后果），多账户并发时内存可能上升，本版不引入流式 `partial()`。
 
 ## 15. 未决问题
 

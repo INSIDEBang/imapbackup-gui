@@ -403,7 +403,7 @@ def test_writer_commits_registered_messages_at_every_batch_end(tmp_path):
     root = tmp_path / "backup"
     raws = {uid: (f"From: s@example.com\r\nSubject: {uid}\r\n"
                   f"Message-Id: <{uid}@x>\r\n\r\nbody {uid}\r\n").encode()
-            for uid in range(1, 10)}
+            for uid in range(1, 67)}
     ids = {f"<{uid}@x>": (uid, len(raws[uid])) for uid in raws}
     index = open_index()
     writer = index.writer("mbox", root, "acct", "INBOX", "acct/INBOX.mbox")
@@ -420,8 +420,8 @@ def test_writer_commits_registered_messages_at_every_batch_end(tmp_path):
     finally:
         reader.close()
         index.close()
-    assert counts == [8, 9], counts
-    assert progress.backed == 9
+    assert counts == [64, 66], counts
+    assert progress.backed == 66
 
     stats = core.IndexStats()
     index = open_index(stats)

@@ -373,13 +373,13 @@ def _raw(uid: int) -> bytes:
 def test_download_resumes_after_abort_without_rewriting(tmp_path):
     """UIDVALIDITY 不变：重连后只取剩余 UID，已写消息不重复写（规格 §5.7.6）。"""
     log = NullLog()
-    raws = {uid: _raw(uid) for uid in range(1, 11)}
+    raws = {uid: _raw(uid) for uid in range(1, 67)}
     server1, server2 = UidFetchServer(dict(raws)), UidFetchServer(dict(raws))
     body_calls = []
 
     def drop_on_second_body(_server, uids):
         body_calls.append(list(uids))
-        if len(body_calls) == 2:             # 第一批 8 封写完后、第二批取信时断线
+        if len(body_calls) == 2:             # 第一批 64 封写完后、第二批取信时断线
             raise imaplib.IMAP4.abort("socket error: EOF")
 
     for server in (server1, server2):
@@ -403,16 +403,16 @@ def test_download_resumes_after_abort_without_rewriting(tmp_path):
         rescan=lambda conn: core.scan_folder(conn, "INBOX", True, quiet=True, log=log),
         should_stop=None, log=log)
     assert live is server2
-    assert attempts == [list(range(1, 11)), [9, 10]]  # 第二次只剩断线时未写的两封
-    assert server2.body_fetches == [[9, 10]]  # 重连后重新 SELECT，只请求剩余两封
-    assert progress.backed == 10
-    assert len(written) == 10
+    assert attempts == [list(range(1, 67)), [65, 66]]  # 第二次只剩断线时未写的两封
+    assert server2.body_fetches == [[65, 66]]  # 重连后重新 SELECT，只请求剩余两封
+    assert progress.backed == 66
+    assert len(written) == 66
     box = core.mailbox.mbox(tmp_path / "INBOX.mbox")
     try:
         ids = sorted(m.get("Message-Id") for m in box)
     finally:
         box.close()
-    assert ids == sorted(f"<m{uid}@x>" for uid in range(1, 11))
+    assert ids == sorted(f"<m{uid}@x>" for uid in range(1, 67))
 
 
 def test_download_resumes_after_a_body_timeout_without_failing_the_folder(tmp_path):

@@ -332,8 +332,8 @@ BAR_EMPTY = "░"
 FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate per char
 
 SCAN_PAGE_UIDS = 500
-FETCH_BATCH_MAX_MESSAGES = 8
-FETCH_BATCH_MAX_BYTES = 8 * 1024 * 1024
+FETCH_BATCH_MAX_MESSAGES = 64
+FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
 RECONNECT_MAX_ATTEMPTS = 5
 RECONNECT_BACKOFF_BASE_S = 2.0
 RECONNECT_BACKOFF_CAP_S = 300.0
@@ -627,7 +627,7 @@ def _fetch_one(server: imaplib.IMAP4, uid: int, items: str) -> tuple[str, tuple[
 
 def _plan_batches(items: list[tuple[str, int, int]],
                   singles: Container[str]) -> list[list[tuple[str, int, int]]]:
-    """Split UID-sorted (Message-Id, UID, size) into <=8 messages / <=8 MiB batches.
+    """Split UID-sorted (Message-Id, UID, size) into <=64 messages / <=32 MiB batches.
 
     Unknown (size <= 0), oversized and ``singles`` messages take a batch of
     their own, so one huge message never drags neighbours over the byte cap and

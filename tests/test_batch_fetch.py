@@ -1,6 +1,6 @@
 """UID 批量正文取信与失败矩阵（规格 §12.2 B、C 组）。
 
-正文按 UID 升序切批（≤8 封、≤8 MiB，超限/未知大小独占一批），每批解析完才写盘；
+正文按 UID 升序切批（≤64 封、≤32 MiB，超限/未知大小独占一批），每批解析完才写盘；
 失败按 missing / no_bad / malformed / timeout 四桶计数，绝不冲抵已备份；批次 NO/BAD 整批重试
 一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败；正文读超时先拆批再放弃单封。
 假服务器，不需要凭证。
@@ -87,39 +87,70 @@ def run_until_stable(tmp_path, server, messages, stall, progress=None, log=None)
 
 # --- B 组：切批 -----------------------------------------------------------------
 
-def test_eight_messages_fit_one_batch_and_the_ninth_starts_another(tmp_path, monkeypatch):
+def test_sixty_four_messages_fit_one_batch_and_the_65th_starts_another(tmp_path, monkeypatch):
     monkeypatch.setattr(core.time, "sleep", lambda _s: pytest.fail("batch loop must not sleep"))
-    uids = list(range(1, 18))
+    uids = list(range(1, 131))
     server = make_server(uids)
     messages = dict(reversed(list(make_messages(uids).items())))   # 插入顺序故意逆序
 
     progress, reports, batches = run(tmp_path, server, messages)
 
-    assert server.body_fetches == [list(range(1, 9)), list(range(9, 17)), [17]], server.body_fetches
-    assert [stats.msgs for stats in batches] == [8, 8, 1], batches
-    assert progress.batches == 3 and progress.backed == 17
+    assert server.body_fetches == [list(range(1, 65)), list(range(65, 129)), [129, 130]], server.body_fetches
+    assert [stats.msgs for stats in batches] == [64, 64, 2], batches
+    assert progress.batches == 3 and progress.backed == 130
     # report.index 是消息在传入 messages 列表中的位置，与取信顺序无关
-    assert [rec["index"] for rec in reports] == list(range(17, 0, -1)), [r["index"] for r in reports]
+    assert [rec["index"] for rec in reports] == list(range(130, 0, -1)), [r["index"] for r in reports]
     assert server.max_in_flight == 1, server.max_in_flight
 
 
-def test_eight_mebibyte_boundary_splits_before_exceeding_the_cap(tmp_path):
-    server_a = make_server([1, 2, 3], sizes={1: 4 * MIB, 2: 4 * MIB, 3: 1})
-    run(tmp_path / "a", server_a, make_messages([1, 2, 3], {1: 4 * MIB, 2: 4 * MIB, 3: 1}))
+def test_thirty_two_mebibyte_boundary_splits_before_exceeding_the_cap(tmp_path):
+    sizes_a = {1: 16 * MIB, 2: 16 * MIB, 3: 1}
+    server_a = make_server([1, 2, 3], sizes=sizes_a)
+    run(tmp_path / "a", server_a, make_messages([1, 2, 3], sizes_a))
     assert server_a.body_fetches == [[1, 2], [3]], server_a.body_fetches
 
-    sizes = {1: 2 * MIB, 2: 2 * MIB, 3: 2 * MIB, 4: 2 * MIB, 5: 1}
-    server_b = make_server([1, 2, 3, 4, 5], sizes=sizes)
-    run(tmp_path / "b", server_b, make_messages([1, 2, 3, 4, 5], sizes))
+    sizes_b = {1: 8 * MIB, 2: 8 * MIB, 3: 8 * MIB, 4: 8 * MIB, 5: 1}
+    server_b = make_server([1, 2, 3, 4, 5], sizes=sizes_b)
+    run(tmp_path / "b", server_b, make_messages([1, 2, 3, 4, 5], sizes_b))
     assert server_b.body_fetches == [[1, 2, 3, 4], [5]], server_b.body_fetches
 
 
 def test_oversized_and_unknown_sizes_get_their_own_batch(tmp_path):
-    sizes = {1: 100, 2: 8 * MIB + 1, 3: 100, 4: 0, 5: 100}
+    sizes = {1: 100, 2: 32 * MIB + 1, 3: 100, 4: 0, 5: 100}
     server = make_server([1, 2, 3, 4, 5], sizes=sizes)
     run(tmp_path, server, make_messages([1, 2, 3, 4, 5], sizes))
 
     assert server.body_fetches == [[1], [2], [3], [4], [5]], server.body_fetches
+
+
+def test_a_bigger_payload_cuts_the_request_count_of_the_same_pending_set(tmp_path, monkeypatch):
+    """对照只看请求次数与 UID 分组，不断言墙钟：纯小邮件正好降到旧策略的 1/8，混合大小更低。"""
+    def old_policy_requests(dirname, uids, sizes) -> int:
+        """把两个上限改回 8 封 / 8 MiB 跑一遍，得到旧策略对同一待备份集付的请求次数。"""
+        monkeypatch.setattr(core, "FETCH_BATCH_MAX_MESSAGES", 8)
+        monkeypatch.setattr(core, "FETCH_BATCH_MAX_BYTES", 8 * MIB)
+        server = make_server(uids, sizes=sizes)
+        run(tmp_path / dirname, server, make_messages(uids, sizes))
+        monkeypatch.undo()
+        return len(server.body_fetches)
+
+    small = list(range(1, 257))
+    small_sizes = dict.fromkeys(small, 1024)
+    old_small = old_policy_requests("old-small", small, small_sizes)
+    new_small = make_server(small, sizes=small_sizes)
+    run(tmp_path / "new-small", new_small, make_messages(small, small_sizes))
+
+    assert [len(batch) for batch in new_small.body_fetches] == [64] * 4, new_small.body_fetches
+    assert (old_small, len(new_small.body_fetches)) == (32, 4), old_small
+
+    mixed = list(range(1, 65))
+    mixed_sizes = dict.fromkeys(mixed, 1024)
+    mixed_sizes[64] = 9 * MIB      # 旧策略下它是「超大」，独占一批；32 MiB 下它和邻居同批
+    old_mixed = old_policy_requests("old-mixed", mixed, mixed_sizes)
+    new_mixed = make_server(mixed, sizes=mixed_sizes)
+    run(tmp_path / "new-mixed", new_mixed, make_messages(mixed, mixed_sizes))
+
+    assert (old_mixed, new_mixed.body_fetches) == (9, [mixed]), (old_mixed, new_mixed.body_fetches)
 
 
 def test_body_requests_carry_uid_and_body_peek_only(tmp_path):
@@ -153,17 +184,17 @@ def test_duplicate_uid_response_warns_and_keeps_the_first(tmp_path, caplog):
 
 
 def test_batch_stats_cover_messages_bytes_and_failures(tmp_path):
-    sizes = {uid: uid * 100 for uid in range(1, 10)}
-    server = make_server(range(1, 10), sizes=sizes)
-    progress, _, batches = run(tmp_path, server, make_messages(range(1, 10), sizes))
+    sizes = {uid: uid * 100 for uid in range(1, 66)}
+    server = make_server(range(1, 66), sizes=sizes)
+    progress, _, batches = run(tmp_path, server, make_messages(range(1, 66), sizes))
 
-    assert [stats.msgs for stats in batches] == [8, 1], batches
-    assert [stats.bytes for stats in batches] == [3600, 900], batches
-    assert [stats.backed for stats in batches] == [8, 1]
+    assert [stats.msgs for stats in batches] == [64, 1], batches
+    assert [stats.bytes for stats in batches] == [208000, 6500], batches
+    assert [stats.backed for stats in batches] == [64, 1]
     assert [stats.fetch_failed for stats in batches] == [0, 0]
     assert all(stats.fetch_ms >= 0 for stats in batches)
     assert progress.batches == 2 and progress.last_batch is batches[-1]
-    assert progress.done_bytes == 4500, progress.done_bytes
+    assert progress.done_bytes == 214500, progress.done_bytes
 
 
 def test_fetch_ms_measures_fetch_only_not_parse_or_write(tmp_path):
@@ -182,20 +213,20 @@ def test_fetch_ms_measures_fetch_only_not_parse_or_write(tmp_path):
 
 def test_the_inflight_batch_is_published_before_the_request_and_cleared_after_it(tmp_path):
     """请求还在飞的这段时间里也要有读数可读：发出前发布封数与声明字节，请求一终止就清空。"""
-    sizes = {uid: uid * 100 for uid in range(1, 10)}      # 8 封 + 1 封两批
+    sizes = {uid: uid * 100 for uid in range(1, 66)}      # 64 封 + 1 封两批
     seen: list[tuple[list[int], object]] = []
     progress = core.DownloadProgress()
 
     def watch(_server, uids):
         seen.append((list(uids), progress.inflight))
 
-    server = make_server(range(1, 10), sizes=sizes, body_hook=watch)
-    run(tmp_path, server, make_messages(range(1, 10), sizes), progress=progress)
+    server = make_server(range(1, 66), sizes=sizes, body_hook=watch)
+    run(tmp_path, server, make_messages(range(1, 66), sizes), progress=progress)
 
-    assert [uids for uids, _ in seen] == [list(range(1, 9)), [9]], seen
+    assert [uids for uids, _ in seen] == [list(range(1, 65)), [65]], seen
     first, second = (batch for _, batch in seen)
-    assert (first.msgs, first.bytes) == (8, 3600), first      # 声明字节，不是实际取回的字节
-    assert (second.msgs, second.bytes) == (1, 900), second
+    assert (first.msgs, first.bytes) == (64, 208000), first    # 声明字节，不是实际取回的字节
+    assert (second.msgs, second.bytes) == (1, 6500), second
     assert first.started_at <= second.started_at <= core.time.monotonic()
     assert progress.inflight is None
 
@@ -206,11 +237,12 @@ def test_progress_keeps_the_longest_batch_of_the_run(tmp_path):
         if len(uids) > 1:
             time.sleep(0.2)
 
-    server = make_server(range(1, 10), body_hook=slow_the_multi_message_batch)
-    progress, _, batches = run(tmp_path, server, make_messages(range(1, 10)))
+    server = make_server(range(1, 66), body_hook=slow_the_multi_message_batch)
+    progress, _, batches = run(tmp_path, server, make_messages(range(1, 66)))
 
-    assert [stats.msgs for stats in batches] == [8, 1], batches
-    assert batches[0].fetch_ms >= 200 and batches[1].fetch_ms < batches[0].fetch_ms
+    assert [stats.msgs for stats in batches] == [64, 1], batches
+    # 0.2 秒只是「明显比正常批慢」：本机测过 time.sleep(0.2) 只走出 188 ms 的 fetch_ms（Windows 粗时钟）
+    assert batches[0].fetch_ms >= 100 and batches[1].fetch_ms < batches[0].fetch_ms
     assert progress.max_fetch_ms == pytest.approx(batches[0].fetch_ms)
 
 
@@ -399,25 +431,25 @@ def test_an_aborted_attempts_failures_are_reported_once_by_the_retry(tmp_path, c
 
     def drop_second_batch(_server, uids):
         nonlocal aborted
-        if 9 in uids and not aborted:
+        if 65 in uids and not aborted:
             aborted = True
             raise imaplib.IMAP4.abort("connection lost")
 
-    server = make_server(range(1, 10), missing_uids={1}, body_hook=drop_second_batch)
-    messages = make_messages(range(1, 10))
+    server = make_server(range(1, 66), missing_uids={1}, body_hook=drop_second_batch)
+    messages = make_messages(range(1, 66))
 
     with pytest.raises(imaplib.IMAP4.abort):
         run(tmp_path / "first", server, messages, progress=progress, log=log)
     assert progress.fetch_failed == 1
 
-    written = {f"<{uid}@x>" for uid in range(2, 9)}
+    written = {f"<{uid}@x>" for uid in range(2, 65)}
     run(tmp_path / "retry", server, messages, progress=progress, log=log, written=written)
 
     warnings = [rec.getMessage() for rec in caplog.records if "could not be fetched" in rec.getMessage()]
     assert warnings == [
         "INBOX: 1 message(s) could not be fetched (missing=1, no_bad=0, malformed=0, timeout=0)",
     ], warnings
-    assert progress.fetch_failed == 1 and progress.backed == 8
+    assert progress.fetch_failed == 1 and progress.backed == 64
 
 
 def test_folders_sharing_an_output_name_count_their_failures_separately(tmp_path, caplog):
@@ -481,7 +513,7 @@ def test_a_lone_message_that_stalls_is_abandoned_and_counted_as_timeout(tmp_path
 
 def test_a_single_message_batch_that_stalls_gets_one_more_attempt(tmp_path):
     """独占一批的大邮件先单独重试一次，不把一次超时直接当放弃。"""
-    sizes = {1: 8 * MIB + 1}
+    sizes = {1: 32 * MIB + 1}
     calls = []
 
     def timeout_once(_server, batch):
@@ -592,14 +624,14 @@ def test_stop_after_a_message_write_keeps_that_message(tmp_path):
 
 
 def test_stop_between_batches_sends_no_more_requests(tmp_path):
-    uids = list(range(1, 11))
+    uids = list(range(1, 66))
     server = make_server(uids)
     reports = []
     progress, reports, _ = run(tmp_path, server, make_messages(uids), reports=reports,
-                               should_stop=lambda: len(reports) >= 8)
+                               should_stop=lambda: len(reports) >= 64)
 
-    assert server.body_fetches == [list(range(1, 9))], server.body_fetches
-    assert progress.stopped and progress.batches == 1 and progress.backed == 8
+    assert server.body_fetches == [list(range(1, 65))], server.body_fetches
+    assert progress.stopped and progress.batches == 1 and progress.backed == 64
 
 
 def test_empty_messages_returns_the_caller_progress_without_requests(tmp_path):

@@ -3871,7 +3871,7 @@ def test_stopping_one_concurrent_account_leaves_the_others_running(app, monkeypa
 def test_reconnect_of_one_account_does_not_hold_up_another(app, monkeypatch, tmp_path):
     """G 组：6 个账户并发时 A 断线重连；其余 5 个在重连期间跑完，阶段与计数和干净跑法一致。"""
     _drain_worker_events(app)
-    raws_a = _fake_mailbox("ra", 10)[0]
+    raws_a = _fake_mailbox("ra", 66)[0]      # 64 + 2 两批，断线发生在第二批
     raws_b = _fake_mailbox("rb", 10)[0]
     a = _worker_account("ga")
     b_accounts = [_worker_account("gb", i) for i in range(5)]
@@ -3886,7 +3886,7 @@ def test_reconnect_of_one_account_does_not_hold_up_another(app, monkeypatch, tmp
     probe = _InFlightProbe()
 
     def drop_second_batch(_server, uids):
-        # 第一批 8 封已落盘，第二批取回前断线：重连后只该补后两封（written 续跑）
+        # 第一批 64 封已落盘，第二批取回前断线：重连后只该补后两封（written 续跑）
         a_batches.append(list(uids))
         if len(a_batches) == 2:
             raise imaplib.IMAP4.abort("socket error: EOF")
@@ -3962,14 +3962,14 @@ def test_reconnect_of_one_account_does_not_hold_up_another(app, monkeypatch, tmp
 
     assert a_waited == [True], a_waited       # A 的重连拨号确实等到了「5 个 B 都已跑完」
     assert len(a_servers) == 2, a_servers     # 断一次、重连一次
-    assert a_servers[0].body_fetches == [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10]], a_servers[0].body_fetches
-    assert a_servers[1].body_fetches == [[9, 10]], a_servers[1].body_fetches   # 只补没写完的两封
-    assert done[a["id"]][2] == 10 and done[a["id"]][5] is False, done[a["id"]]
+    assert a_servers[0].body_fetches == [list(range(1, 65)), [65, 66]], a_servers[0].body_fetches
+    assert a_servers[1].body_fetches == [[65, 66]], a_servers[1].body_fetches   # 只补没写完的两封
+    assert done[a["id"]][2] == 66 and done[a["id"]][5] is False, done[a["id"]]
     assert done[a["id"]][7:12] == (0, 0, 0, 0, 0), done[a["id"]]
     mbox = g.core.mailbox.mbox(tmp_path / a["id"] / a["user"] / "INBOX.mbox")
     try:
         assert sorted(str(message.get("Message-Id")) for message in mbox) == \
-            sorted(f"<ra{uid}@x>" for uid in range(1, 11))
+            sorted(f"<ra{uid}@x>" for uid in range(1, 67))
     finally:
         mbox.close()
 
@@ -5516,7 +5516,7 @@ def test_account_end_carries_the_workers_final_statistics(app, diag_env, diag_cl
 def test_a_sample_taken_mid_download_reads_what_the_running_worker_published(app, diag_env, diag_clock,
                                                                               monkeypatch, tmp_path):
     """真线程 worker 卡在第 2 批正文请求上：主线程的 sample 读到第 1 批完成后的进度、批次与速率。"""
-    raws = _fake_mailbox("live", 12)[0]                          # 第 1 批 8 封，第 2 批 4 封
+    raws = _fake_mailbox("live", 68)[0]                          # 第 1 批 64 封，第 2 批 4 封
     gates = [(g.threading.Event(), g.threading.Event()) for _ in range(2)]   # (已到达, 放行)
     requests: list[list[int]] = []
 
@@ -5552,23 +5552,23 @@ def test_a_sample_taken_mid_download_reads_what_the_running_worker_published(app
         thread.join(10)
     assert not thread.is_alive()
 
-    first_batch = sum(len(raws[uid]) for uid in range(1, 9))
+    first_batch = sum(len(raws[uid]) for uid in range(1, 65))
     assert (sample["phase"], sample["folder"], sample["account"]) == ("download", "INBOX", "live@example.com")
-    assert (sample["done_msgs"], sample["done_bytes"]) == (8, first_batch)
-    assert (sample["pending_msgs"], sample["pending_bytes"]) == (12, sum(len(raw) for raw in raws.values()))
-    assert (sample["batch_msgs"], sample["batch_bytes"]) == (8, first_batch)
+    assert (sample["done_msgs"], sample["done_bytes"]) == (64, first_batch)
+    assert (sample["pending_msgs"], sample["pending_bytes"]) == (68, sum(len(raw) for raw in raws.values()))
+    assert (sample["batch_msgs"], sample["batch_bytes"]) == (64, first_batch)
     assert sample["fetch_ms_avg"] is not None and sample["fetch_ms_p95"] is not None
-    assert sample["rate_msgs_per_min"] == pytest.approx(96.0)    # 8 封 / 5 秒
+    assert sample["rate_msgs_per_min"] == pytest.approx(768.0)    # 64 封 / 5 秒
     assert sample["rate_bytes_per_s"] == pytest.approx(first_batch / 5, abs=0.1)
     assert sample["eta_s"] is None                               # 距首封完成不足 10 秒
     pump(app, 5)
     (end,) = _diag_rows(diag_env, "account_end")
-    assert (end["result"], end["done_msgs"], end["batch_msgs"]) == ("completed", 12, 4)
+    assert (end["result"], end["done_msgs"], end["batch_msgs"]) == ("completed", 68, 4)
 
 
 def test_a_batch_stuck_in_flight_keeps_reporting_itself(app, diag_env, diag_clock, monkeypatch, tmp_path):
     """真线程 worker 卡在第 2 批正文请求里跨过一个采样窗：连续两条 sample 都在途批次给值。"""
-    raws = _fake_mailbox("stall", 12)[0]                       # 第 1 批 8 封，第 2 批 4 封
+    raws = _fake_mailbox("stall", 68)[0]                       # 第 1 批 64 封，第 2 批 4 封
     reached, go = g.threading.Event(), g.threading.Event()
     requests: list[list[int]] = []
 
@@ -5588,7 +5588,7 @@ def test_a_batch_stuck_in_flight_keeps_reporting_itself(app, diag_env, diag_cloc
     thread.start()
     try:
         assert reached.wait(10)
-        pump(app, 5)                                           # 第 1 批的阶段与 8 封：都在 fake t=1000
+        pump(app, 5)                                           # 第 1 批的阶段与 64 封：都在 fake t=1000
         diag_clock.now = 1010.0
         _diag_tick(app)
         diag_clock.now = 1020.0
@@ -5599,7 +5599,7 @@ def test_a_batch_stuck_in_flight_keeps_reporting_itself(app, diag_env, diag_cloc
         thread.join(10)
     assert not thread.is_alive()
 
-    second_batch = sum(len(raws[uid]) for uid in range(9, 13))
+    second_batch = sum(len(raws[uid]) for uid in range(65, 69))
     assert [row["inflight_msgs"] for row in samples] == [4, 4], samples
     assert [row["inflight_bytes"] for row in samples] == [second_batch, second_batch], samples
     # 已等时长只比增量：started_at 出自核心的真实单调钟，采样用的是测试假钟，两者绝对值不可比
@@ -5607,7 +5607,7 @@ def test_a_batch_stuck_in_flight_keeps_reporting_itself(app, diag_env, diag_cloc
     assert waits[0] is not None and waits[1] - waits[0] == pytest.approx(10.0, abs=0.1), samples
     assert samples[0]["fetch_ms_avg"] is not None                 # 第 1 批还在 10 秒窗内
     assert samples[1]["fetch_ms_avg"] is None                     # 出窗后只有在途字段能说明请求还没答完
-    assert samples[-1]["batch_msgs"] == 8 and samples[-1]["fetch_ms_max"] is not None
+    assert samples[-1]["batch_msgs"] == 64 and samples[-1]["fetch_ms_max"] is not None
 
 
 def test_a_sample_reports_the_inflight_batch_and_the_longest_batch_of_the_run(app, diag_env, diag_clock):
