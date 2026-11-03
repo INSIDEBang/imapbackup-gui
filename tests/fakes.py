@@ -10,6 +10,7 @@ import base64
 import imaplib
 import logging
 import re
+import threading
 from builtins import list as _list  # 类内定义 list 方法会遮蔽内置名，注解里用 _list（同类型桩）
 from logging import NullHandler
 
@@ -63,6 +64,24 @@ def fallback_literal(uid: int) -> bytes:
             f"Date: Sun, 12 May 2024 02:15:30 +0000\r\nSubject: no id {uid}\r\n\r\n").encode()
 
 
+class InflightBytes:
+    """跨连接记录同时在途的正文声明字节峰值（取信额度回归用它看真实叠加）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.current = 0
+        self.peak = 0
+
+    def enter(self, nbytes: int) -> None:
+        with self._lock:
+            self.current += nbytes
+            self.peak = max(self.peak, self.current)
+
+    def exit(self, nbytes: int) -> None:
+        with self._lock:
+            self.current -= nbytes
+
+
 class UidFetchServer(imaplib.IMAP4):
     """按 UID 应答 SEARCH / FETCH 的假服务器，覆盖扫描与批量取信。
 
@@ -82,6 +101,7 @@ class UidFetchServer(imaplib.IMAP4):
     - raise_body：正文请求直接抛出该异常（abort/OSError 传播）。
     - raise_body_hook：按批次返回要抛出的异常；返回 None 表示正常应答。用来让
       指定 UID 或指定批次的正文请求超时，而不影响其余请求。
+    - inflight：共享的 InflightBytes，把本连接的在途正文声明字节也记进同一个账（跨账户额度）。
     - select_ok=False / uidvalidity=None：SELECT 失败、缺 UIDVALIDITY。
     """
     def __init__(self, raws, *, sizes=None, uidvalidity: int | str | None = 777, select_ok=True,
@@ -90,7 +110,7 @@ class UidFetchServer(imaplib.IMAP4):
                  fail_search_times=0, fail_header_times=0, fail_body_times=0,
                  duplicate_uids=(), folders=("INBOX",), select_fail_folders=(),
                  reverse_responses=False, body_hook=None, raise_body=None,
-                 raise_body_hook=None, internaldate=DEFAULT_INTERNALDATE):
+                 raise_body_hook=None, inflight=None, internaldate=DEFAULT_INTERNALDATE):
         self.raws = dict(raws)
         self.sizes = dict(sizes or {})
         self.uidvalidity = uidvalidity
@@ -112,6 +132,7 @@ class UidFetchServer(imaplib.IMAP4):
         self.body_hook = body_hook
         self.raise_body = raise_body
         self.raise_body_hook = raise_body_hook
+        self.inflight = inflight
         self.internaldate = internaldate
         self.current_mailbox: str | None = None
         self.untagged_responses: dict[str, _list] = {}
@@ -142,6 +163,17 @@ class UidFetchServer(imaplib.IMAP4):
         return "OK", [str(len(self.raws)).encode()]
 
     def uid(self, command, *args) -> tuple[str, _list]:
+        if self.inflight is None or not (command == "FETCH" and len(args) > 1 and "BODY.PEEK[]" in args[1]):
+            return self._answer(command, *args)
+        uids = [int(part) for part in args[0].split(",") if part]
+        booked = sum(self.sizes.get(uid, len(self.raws.get(uid, b""))) for uid in uids)
+        self.inflight.enter(booked)
+        try:
+            return self._answer(command, *args)
+        finally:
+            self.inflight.exit(booked)
+
+    def _answer(self, command, *args) -> tuple[str, _list]:
         self.uid_calls.append((command, list(args)))
         if command == "SEARCH":
             if self.fail_search_times:

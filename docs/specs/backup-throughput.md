@@ -176,6 +176,9 @@ class DownloadProgress:
     done_bytes: int = 0                  # 已备份消息的 RFC822.SIZE 之和
     batches: int = 0
     last_batch: "BatchStats | None" = None
+    inflight: "InflightBatch | None" = None   # 正在请求中的正文批次（5.2.3）
+    max_fetch_ms: float | None = None          # 本账户本次运行的最长单批取信耗时
+    quota_wait_s: float = 0.0                  # 本账户本次运行等取信额度的累计秒数（5.2.7）
     stopped: bool = False
     failures: dict[tuple[str, str], str] = field(default_factory=dict)
                                          # 已计失败的 (文件夹显示名, Message-Id) → 桶；重连重试去重
@@ -257,10 +260,13 @@ SCAN_PAGE_UIDS = 500
 ```python
 FETCH_BATCH_MAX_MESSAGES = 64
 FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
+FETCH_QUOTA_MAX_BYTES = 64 * 1024 * 1024
+FETCH_QUOTA_POLL_S = 0.2
 ```
 
 两个上限由 ADR 0015 从 8 封 / 8 MiB 抬高（服务端按请求而非按字节付出等待），切批规则本身不变；
 回退就是把这两个常数改回 8 / 8 MiB 的一次独立提交，不留开关。
+`FETCH_QUOTA_MAX_BYTES` 是进程内在途正文字节预算（5.2.7、ADR 0017），不是设置项，也不出参数。
 
 #### 5.2.2 切批算法
 
@@ -273,7 +279,7 @@ FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
    - 停滞上限（5.7.9）已到 1 的封同样独占一批；
    - 否则若 `len(batch) == min(64, 批内各封上限的最小值)` 或 `sum(bytes) + size > 32 MiB` → 先结束当前批，再放入下一批。
    未出现在上限表里的封按 64 起步；上限只影响封数，不影响字节上限。
-3. 批间不休眠、不拿令牌、不做 AIMD；上一批写完立即发下一批。
+3. 批间不休眠、不拿令牌、不做 AIMD；上一批写完立即发下一批。唯一的例外是取信额度（5.2.7）：它等的是别的账户占着的在途字节，不是自己的节奏，等完照样发原来那一批。
 4. 单封超过 32 MiB 时整封读取，不使用 `partial()`（Python 3.12.13 的 `imaplib.partial()` 不可用）。
 
 #### 5.2.3 请求与解析
@@ -316,6 +322,7 @@ typ, data = server.uid("FETCH", "101,102,...",
 - 每批开始前检查 `should_stop()`；每封写完后再次检查。
 - 停止时丢弃本批尚未写的数据，返回；已写消息保留，`written` 保留。
 - 在途 FETCH 无法中断：等响应到达后丢弃，不写盘。
+- 等额度（5.2.7）时也检查停止：以 0.2 秒节奏醒来，被打断的这一批根本不发请求，账户按同样口径收口。
 - 停止不把剩余 pending 计为 `fetch_failed`。
 
 #### 5.2.6 接口
@@ -332,6 +339,7 @@ def download_messages(
     written: set[str] | None = None,
     progress: DownloadProgress | None = None,
     stall: "BatchStall | None" = None,
+    quota: "FetchQuota | None" = None,
     index_writer: "IndexWriter | None" = None,
     on_batch: Callable[[BatchStats], None] | None = None,
     on_batch_start: Callable[[InflightBatch], None] | None = None,
@@ -342,11 +350,23 @@ def download_messages(
 - `written`：调用方为每个文件夹维护的已写完集合；重连续跑用，不持久化。
 - `progress`：调用方传入的可变累计器；重连后继续累加，不因异常丢失已完成的计数。
 - `stall`：调用方为每个文件夹运行维护的正文超时记忆——每封的批次封数上限表与本轮放弃集合（5.7.9）；`None` 表示不处理读超时（旧行为）。
+- `quota`：进程内共享的取信额度（5.2.7）；`None` 表示不计量、不等待（CLI 与所有旧调用点）。
 - `index_writer`：索引写入器；`None` 表示索引禁用。
 - `on_batch`：每批完成后回调，用于诊断采样与 UI 批次统计。
 - `on_batch_start`：每批**发出前**回调，用于把在途批次换进调用方的快照；`None` 表示调用方不采样（CLI）。
 - 返回传入的 `progress`；未传入时内部新建并返回。
 - 现有 `download_messages` 的 `messages` 值从 `int` 改为 `(UID, size)`；所有调用点与测试同步迁移。
+
+#### 5.2.7 取信额度（ADR 0017）
+
+`FetchQuota` 是进程内的在途正文字节预算：GUI 每进程创建一个，传给每个账户的每一次正文下载；预算 `FETCH_QUOTA_MAX_BYTES`（64 MiB），按批次的**声明 `RFC822.SIZE`** 计量。它存在的唯一理由是多账户同时首量时把总在途体积压回单账户的量级，别的什么都不管。
+
+- 申请发生在每个正文批次取信之前（在 5.2.3 的在途快照与本批耗时起点之前，所以等待不污染任何耗时字段），释放在该批写盘结束之后；请求异常、停止、重连退栈同样释放——一次申请恰好一次释放。
+- 额度不足则**等待**，绝不缩小批次：一个运行发出的请求数只由 5.2.2 的切批与 5.7.9 的停滞上限决定。等待以 `FETCH_QUOTA_POLL_S`（0.2 秒）的节奏醒来检查停止信号。
+- 旁路：声明字节达到或超过整个额度、或按 0 入账（大小未知）的批次不等待直接取——等一个永远装不进的额度就是死锁，而 0 字节永远装得进。超限批次照样入账，所以后来的批次会为它等。
+- 等待不烧重连预算（5.7 的计数器不因它而动）、不计入正文取信停滞（5.7.9 的上限表不变）、不算文件夹失败（5.3.2）、不新增账户状态（阶段还是 `download`，5.9）。累计等待秒数只进 `DownloadProgress.quota_wait_s`，界面不出现「额度」「在途批次」这类内部术语（6.2 的第二行不为此改一个字）。
+- 扫描阶段（5.1）不申请额度、不受额度约束。
+- 不按主机分额度、不按账户分额度、不做公平调度、不读物理内存；`quota=None`（CLI 与所有旧调用点）时不计量也不等待，行为与本机制之前完全一致。
 
 ### 5.3 失败语义
 
@@ -775,6 +795,7 @@ worker 在阶段切换、每封写完、每批发出前、每批结束、收尾�
    - 建立 `written: set[str]`、`progress = DownloadProgress()`、`state = {"scan": scan, "uidvalidity": scan.uidvalidity, "uidvalidity_checked": False}`。
    - `run_with_reconnect(server, connect_for_reconnect, operation, should_stop=stop_event.is_set, stats=...)`。
    - `operation` 按 5.7.6 执行 SELECT、UIDVALIDITY、`download_messages`。
+   - 所有账户的 `download_messages` 共用 `self._fetch_quota` 这一个 `core.FetchQuota`（5.2.7）。
    - `FolderFetchError`/SELECT 失败 → `folder_failures += 1`，继续。
    - `ReconnectStopped` 或停止事件 → 结束下载循环。
    - `ReconnectAuthError` → 账户失败；`BackupWriteError`/其他异常 → 账户失败。
@@ -951,6 +972,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 | 在途 | `inflight_msgs` | int/null | 正在请求中的正文批次封数；不在请求中为 null |
 | | `inflight_bytes` | int/null | 该批次声明的 `RFC822.SIZE` 之和 |
 | | `inflight_elapsed_s` | float/null | 该批次已发出等待的秒数 |
+| 额度 | `quota_wait_s` | float | 本账户本次运行累计等待取信额度（5.2.7）的秒数；没等过为 0 |
 | 失败 | `fetch_failed` | int | 当前取信失败总数（补取成功会减少） |
 | | `fetch_failed_missing` | int | 缺失 UID |
 | | `fetch_failed_no_bad` | int | 单封 NO/BAD |
@@ -974,12 +996,12 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 示例（虚构数据）：
 
 ```json
-{"ts":"2026-10-26T14:03:22.123+08:00","schema":2,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_ms_max":5410.0,"inflight_msgs":6,"inflight_bytes":4132747,"inflight_elapsed_s":3.4,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"fetch_failed_timeout":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
+{"ts":"2026-10-26T14:03:22.123+08:00","schema":2,"app":"imapbackup-gui","run":"9f3a1c2d","event":"sample","account":"manager@example.com","host":"imap.example.com","folder":"INBOX","phase":"download","done_msgs":1519,"done_bytes":1960000000,"pending_msgs":4200,"pending_bytes":5500000000,"rate_msgs_per_min":84.0,"rate_bytes_per_s":1887436.8,"eta_s":1875,"batch_msgs":8,"batch_bytes":8388608,"fetch_ms_avg":412.5,"fetch_ms_p95":980.0,"fetch_ms_max":5410.0,"inflight_msgs":6,"inflight_bytes":4132747,"inflight_elapsed_s":3.4,"quota_wait_s":0.0,"fetch_failed":2,"fetch_failed_missing":1,"fetch_failed_no_bad":1,"fetch_failed_malformed":0,"fetch_failed_timeout":0,"folder_failures":0,"index_hits":1,"index_misses":0,"index_rebuilds":0,"index_disabled":false,"scan_local_ms":320,"scan_remote_ms":8450,"reconnect_attempts":0,"reconnect_successes":0,"reconnect_exhausted":false,"uidvalidity_changes":0,"reconnect_reason":null,"result":null,"duration_s":null}
 ```
 
 ### 7.4 隐私白名单
 
-允许写入：时间、应用名、run ID、账户邮箱、服务器主机、文件夹显示名、阶段、所有计数/速率/耗时/错误类别。在途批次只写封数、声明字节之和与已等时长，不写 UID、Message-Id 或主题。
+允许写入：时间、应用名、run ID、账户邮箱、服务器主机、文件夹显示名、阶段、所有计数/速率/耗时/错误类别。在途批次只写封数、声明字节之和与已等时长，不写 UID、Message-Id 或主题；额度等待只写本账户累计秒数，不写谁在等谁。
 
 禁止写入：
 
@@ -1074,7 +1096,7 @@ eq.put(("message", account_id, d, sizes.get(d["msg_id"], 0)))
 - [ADR 0014：正文取信超时先拆单封，仍超时只放弃该封](../adr/0014-body-fetch-timeout-split-and-give-up.md)（timeout 桶的取舍；拆单封的机制由 ADR 0016 取代）。
 - [ADR 0015：正文批次载荷提高到 64 封 / 32 MiB](../adr/0015-body-batch-payload-64-32mib.md)（5.2 的批量上限）。
 - [ADR 0016：正文取信超时按对半缩小批次重取](../adr/0016-body-fetch-timeout-binary-halving.md)（5.7.9 的缩批规则）。
-- [ADR 0017：进程内共享取信字节额度](../adr/0017-process-wide-fetch-quota.md)（尚未实现）。
+- [ADR 0017：进程内共享取信字节额度](../adr/0017-process-wide-fetch-quota.md)（5.2.7 的额度）。
 
 理由：早期设计最初选择自适应闭环 + 同主机共享总速率；一次离散事件仿真证明常规模型下闭环更慢，后续架构决策进一步取消共享控制器。这是一个**硬反转**、**未来读者会问为什么**、**有真实取舍**的决策，必须留下 ADR。其他决策（索引、重连、诊断、FAQ）已在相关 ADR 与本文中有上下文，不另开 ADR。
 
@@ -1088,8 +1110,8 @@ ADR 需要说明：
 
 ### 11.1 核心 `imapbackup312.py`
 
-- 新增常量：`SCAN_PAGE_UIDS`、`FETCH_BATCH_MAX_MESSAGES`、`FETCH_BATCH_MAX_BYTES`、`INDEX_DIR`、`DB_NAME`。
-- 新增：`FolderScan`、`DownloadProgress`、`BatchStats`、`ReconnectStats`、`ReconnectStopped`、`ReconnectAuthError`、`BackupWriteError`、`FolderFetchError`、`BatchStall`、`BatchStalled`、`ScanIndex`、`IndexWriter`、`IndexStats`、`run_with_reconnect`、`connect_for_reconnect`。
+- 新增常量：`SCAN_PAGE_UIDS`、`FETCH_BATCH_MAX_MESSAGES`、`FETCH_BATCH_MAX_BYTES`、`FETCH_QUOTA_MAX_BYTES`、`FETCH_QUOTA_POLL_S`、`INDEX_DIR`、`DB_NAME`。
+- 新增：`FolderScan`、`DownloadProgress`、`BatchStats`、`ReconnectStats`、`ReconnectStopped`、`ReconnectAuthError`、`BackupWriteError`、`FolderFetchError`、`BatchStall`、`BatchStalled`、`FetchQuota`、`ScanIndex`、`IndexWriter`、`IndexStats`、`run_with_reconnect`、`connect_for_reconnect`。
 - 修改：`scan_folder` 返回 `FolderScan`；`download_messages` 改为 UID 批量、返回值/进度/索引/批次回调；CLI `main` 的文件夹循环接入索引与重连；`configure_logging` 不变。
 - 保持：`report_message` 字段不变；`MSGID_RE`/`UUID` 不变；CLI 参数与退出码不变。
 
@@ -1097,13 +1119,14 @@ ADR 需要说明：
 
 - 修改：`_backup_account` 两遍流程、事件契约、`_on_message_event`、`_on_account_done`、`_apply_account_icon`、`_in_done_cooldown`、`_after_account_terminal`、`_render_messages`、`_insert_message_row`、`_pump`、1 秒 tick、菜单栏、诊断写入。
 - 新增：`AccountStats` 线程安全快照、`SpeedTracker`/ETA 计算、`Diagnostics`、FAQ Toplevel。
+- 新增：每进程一个 `core.FetchQuota()`，传给每个账户的正文下载调用（5.2.7）；`sample` 行多一个 `quota_wait_s`。
 - 保持：第一行信息栏完全不变；`APP_MUTEX_NAME` 不变；设置页字段不变。
 
 ### 11.3 测试
 
 - `tests/fakes.py`：
   - `UidFetchServer` 实现 `uid("SEARCH","ALL")`、`uid("FETCH", ...)`、`select`、`untagged_responses["UIDVALIDITY"]`。
-  - 记录每个连接的命令、UID 集合、在途请求数、SELECT 次数、重连次数。
+  - 记录每个连接的命令、UID 集合、在途请求数、SELECT 次数、重连次数；可选地把在途正文声明字节记进一个共享账（跨账户额度）。
   - 注入：缺失 UID、畸形元数据、缺字面量、重复 UID、批次 NO/BAD、单封 NO/BAD、abort、BYE、OSError、认证失败、UIDVALIDITY 变化。
   - 保留现有 `ListServer`/`MainServer`/`FetchServer`/`HeaderServer` 的简单行为，或迁移到 UID 版本；不得让测试依赖真实网络。
 - `tests/conftest.py`：
@@ -1111,7 +1134,7 @@ ADR 需要说明：
   - 新增 `isolate_log_dir`（按需）：把 `core.LOG_DIR` 指向 `tmp_path/log`。
 - 新增/更新测试文件（名称可调整，覆盖必须存在）：
   - `tests/test_uid_scan.py`：SEARCH 分页、500 边界、合成 ID、畸形、SELECT NO。
-  - `tests/test_batch_fetch.py`：64 封/32 MiB 边界、第 65 封新批、同一待备份集的新旧请求次数对照、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（64 封批超时后 2 次请求救回且不重复写、8→4→2→1 阶梯只降不升、上限 1 独占一批、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）。
+  - `tests/test_batch_fetch.py`：64 封/32 MiB 边界、第 65 封新批、同一待备份集的新旧请求次数对照、单封超限、UID 升序、响应解析、失败矩阵、report 一次、停止；正文读超时（64 封批超时后 2 次请求救回且不重复写、8→4→2→1 阶梯只降不升、上限 1 独占一批、超限单封再给一次机会、无 tracker 时仍抛 `TimeoutError`、下一轮补取成功后清零 timeout 计数）；在途批次（发出前可读、请求结束后清零、超时那批也计入本账户最长单批耗时）；取信额度（线上字节恰是本批声明字节、失败也还额度、满了就等而不缩批、超限/未知大小直取、等待中停止不发请求、多账户共享时在途峰值不超过 64 MiB）。
   - `tests/test_scan_index.py`：schema、命中/未命中、失效矩阵、损坏、锁、并发、overwrite、格式保留、索引失败不影响下载。
   - `tests/test_reconnect.py`：分类、退避、停止、预算、UIDVALIDITY、written、写盘错误、CLI；`BatchStalled` 不消耗预算且不等待、正文超时后重连续跑并使文件夹成功。
   - `tests/test_gui_backup_flow.py`：部分完成、文件夹失败、account_done、图标、事件契约。
@@ -1131,7 +1154,7 @@ ADR 需要说明：
   - 诊断：`diag-*.jsonl` 位置、10 秒、14 天、隐私、仅 GUI。
   - 常见问题：菜单入口；通用原因 + 35 特例。
   - CLI：参数/输出/退出码不变；CLI 不写诊断。
-- `GLOSSARY.md`：不新增术语；「取信失败消息」补充正文读超时的口径；若实现中引入新领域词，先走 domain-modeling。
+- `GLOSSARY.md`：「取信失败消息」补充正文读超时的口径；新增「取信额度」；若实现中引入其他新领域词，先走 domain-modeling。
 - ADR 0013（固定批量、无自适应限速）、ADR 0014（正文读超时先拆后弃、不耗重连预算）：新增；ADR 目录无需索引文件（与现状一致）。
 
 ### 11.5 安装程序 `packaging/imapbackup-gui.iss`
@@ -1168,14 +1191,14 @@ basedpyright imapbackup312.py imapbackup_gui.py
 | 组 | 断言 |
 |---|---|
 | A 扫描 | `UID SEARCH ALL` 一次；每 500 UID 一页；无 `1:*` 游标；UID 从元数据取；缺 Message-Id 走合成回退；畸形/NO → `SkipFolderException`；UIDVALIDITY 随结果返回，缺失/畸形 → `SkipFolderException` 且不运行 SEARCH；`\Noselect` 容器不列为备份目标 |
-| B 批量 | 64 封/32 MiB 边界；第 65 封新批；单封 32 MiB+ 独占；size 0 独占；同一待备份集的新旧请求次数对照；停滞上限表：1 独占一批、一批不超过批内最小上限；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep |
+| B 批量 | 64 封/32 MiB 边界；第 65 封新批；单封 32 MiB+ 独占；size 0 独占；同一待备份集的新旧请求次数对照；停滞上限表：1 独占一批、一批不超过批内最小上限；批内 UID 升序；请求含 `UID INTERNALDATE BODY.PEEK[]`；无 `RFC822`/`partial()`；批间无 sleep；额度满时批次不缩水（等待前后的请求数与 UID 分组不变） |
 | C 失败 | 缺失 UID 单封重试一次 → `fetch_failed(missing)`；畸形 → `fetch_failed(malformed)`；批次 NO 整批重试一次 → 逐封隔离；全 NO → `FolderFetchError`；全缺失不算文件夹失败；abort/OSError 不写半批；认证/NO 不重试；重连重试同一封只计一次，补取成功后清除，abort 尝试的失败由重试补报警告；正文读超时 → 批内各封上限对半（64封批 2 次请求救回、8→4→2→1 阶梯、只降不升、跨重连保留、新运行重置）；上限到 1 且单独仍超时 → `fetch_failed(timeout)` 且本轮不再请求，其余消息照常写完；`stall=None` 原样抛 `TimeoutError`；警告带 `timeout=N` |
 | D 索引 | 冷/热；mbox 指纹命中/失效；eml 逐文件命中/失效；overwrite 清 sink；未选格式保留；根路径入键；损坏/锁/不可写 → 禁用并内容扫描；并发 WAL；写失败不影响备份 |
 | E 重连 | abort/BYE/OSError 重试；5 次耗尽；成功清零；认证/NO 不重试；退避停止立即生效；LIST 重连后重跑；UIDVALIDITY 不变续跑剩余；变化重扫远端、复用本地、不重复写；二次变化文件夹失败；写盘错误不重连；`BatchStalled` 不占预算、不退避，超时后文件夹继续完成 |
-| F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；单账户停止不影响其他账户；停止优先于重连 |
-| G 并发 | 6–7 个假账户并发；每账户同一时刻至多 1 个在途请求；无共享锁/等待；停止一个不影响其余；无跨账户限速状态 |
+| F 停止 | 每批前/每封后检查；在途批丢弃；停止后无新请求；等待额度时停止 → 本批一个请求都不发；单账户停止不影响其他账户；停止优先于重连 |
+| G 并发 | 6–7 个假账户并发；每账户同一时刻至多 1 个在途请求；取信额度（5.2.7）是唯一的跨账户等待：共享额度时在途声明字节的峰值不超过 64 MiB，与账户数无关；额度之外的共享锁/限速状态没有；停止一个不影响其余 |
 | H UI | 第二行格式与顺序；120 秒窗口（速率与 ETA 同窗）；`—` 阈值；0 如实显示；合计 ≥2 下载账户；扫描/连接/重连/停止无速率；部分完成黄色常驻；停止图标优先；冷却含 partial；列表底部跟随/上移不抢 |
-| I 诊断 | 10 秒 sample；phase/account_end/run_end 立即；run ID 共享；字段齐全（schema 2：在途批次封数/字节/已等时长与本账户最长单批耗时）；批次不结束时连续多条 sample 的在途值仍在；隐私白名单；14 天只删 `diag-*`；写失败禁用继续；CLI 不写 |
+| I 诊断 | 10 秒 sample；phase/account_end/run_end 立即；run ID 共享；字段齐全（schema 2：在途批次封数/字节/已等时长、本账户最长单批耗时与本账户额度累计等待秒数）；批次不结束时连续多条 sample 的在途值仍在；隐私白名单；14 天只删 `diag-*`；写失败禁用继续；CLI 不写 |
 | J FAQ | 菜单打开；Q1–Q4 文案；只读滚动；单例；Esc；不连服务器/不读凭证/不写设置 |
 | K CLI | 参数、退出码、正常 stdout 不变；无诊断文件；批量/重连策略与 GUI 共用核心；文件夹失败继续 |
 

@@ -1,9 +1,11 @@
-"""UID 批量正文取信与失败矩阵（规格 §12.2 B、C 组）。
+"""UID 批量正文取信与失败矩阵、进程内取信额度（规格 §12.2 B、C、G 组）。
 
 正文按 UID 升序切批（≤64 封、≤32 MiB，超限/未知大小独占一批），每批解析完才写盘；
 失败按 missing / no_bad / malformed / timeout 四桶计数，绝不冲抵已备份；批次 NO/BAD 整批重试
 一次后逐封隔离，只有隔离结果全是 NO/BAD 才升级为文件夹失败；正文读超时后按对半缩小的
 批次重取，只有单独取仍超时的那封才放弃。
+多路下载共享一个取信额度时装不下的批次只等待、不缩小，等待可被停止打断，装不进空额度的
+批次直接取。
 假服务器，不需要凭证。
 """
 import imaplib
@@ -16,7 +18,7 @@ import time
 import pytest
 
 import imapbackup312 as core
-from fakes import NullLog, UidFetchServer
+from fakes import InflightBytes, NullLog, UidFetchServer
 
 MIB = 1024 * 1024
 
@@ -717,3 +719,201 @@ def test_empty_messages_returns_the_caller_progress_without_requests(tmp_path):
 
     assert result is progress and progress.batches == 0
     assert not (tmp_path / "INBOX.mbox").exists()
+
+
+# --- 额度组：进程内共享的在途正文字节预算（规格 §5.2.7、ADR 0017）----------------
+
+def test_the_quota_covers_exactly_the_batch_on_the_wire(tmp_path):
+    """额度在发出请求前记下这一批的声明字节，写完盘就归还：下一批发起时只剩自己的。"""
+    sizes = dict.fromkeys(range(1, 6), 8 * MIB)      # 5 封 × 8 MiB → 32 MiB + 8 MiB 两批
+    quota = core.FetchQuota()
+    booked: list[int] = []
+    server = make_server(list(range(1, 6)), sizes=sizes,
+                         body_hook=lambda _srv, _uids: booked.append(quota.inflight_bytes))
+
+    progress, _, _ = run(tmp_path, server, make_messages(list(range(1, 6)), sizes), quota=quota)
+
+    assert server.body_fetches == [[1, 2, 3, 4], [5]], server.body_fetches
+    assert booked == [32 * MIB, 8 * MIB], booked
+    assert progress.quota_wait_s == 0.0
+    assert quota.inflight_bytes == 0
+
+
+def test_a_batch_that_never_lands_still_gives_its_quota_back(tmp_path):
+    """连接错误让整批作废：额度必须跟着还，否则一次失败就把后面的账户全堵死。"""
+    quota = core.FetchQuota()
+    server = make_server([1, 2], raise_body=imaplib.IMAP4.abort("connection lost"))
+
+    with pytest.raises(imaplib.IMAP4.abort):
+        run(tmp_path, server, make_messages([1, 2]), quota=quota)
+
+    assert quota.inflight_bytes == 0
+
+
+def test_an_account_that_does_not_fit_waits_instead_of_shrinking(tmp_path):
+    """两路下载共用一个额度：装不下的一路排队等，批次形状一个字节都不动。"""
+    quota = core.FetchQuota()
+    a_sizes = {1: 40 * MIB, 2: 4 * MIB}                    # 40 MiB 独占一批，再 4 MiB 一批
+    b_sizes = dict.fromkeys(range(3, 11), 8 * MIB)       # 两批 × 4 封 = 32 MiB
+    a_inside, b_inside, let_a_leave = threading.Event(), threading.Event(), threading.Event()
+    progress_a, progress_b = core.DownloadProgress(), core.DownloadProgress()
+    errors: list[BaseException] = []
+
+    def hold_the_big_batch(_server, _uids):
+        if not a_inside.is_set():
+            a_inside.set()
+            assert let_a_leave.wait(10)
+
+    def note_the_first_batch(_server, _uids):
+        b_inside.set()
+
+    server_a = make_server([1, 2], sizes=a_sizes, body_hook=hold_the_big_batch)
+    server_b = make_server(list(range(3, 11)), sizes=b_sizes, body_hook=note_the_first_batch)
+
+    def start(name, server, messages, progress):
+        def target():
+            try:
+                run(tmp_path, server, messages, filename=f"{name}.mbox",
+                    progress=progress, quota=quota)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    thread_a = start("A", server_a, make_messages([1, 2], a_sizes), progress_a)
+    assert a_inside.wait(10), "A 的 40 MiB 批次没有进入请求"
+    thread_b = start("B", server_b, make_messages(list(range(3, 11)), b_sizes), progress_b)
+    assert not b_inside.wait(0.6), "B 没等额度：它的批次和 A 的 40 MiB 同时在途了"
+    let_a_leave.set()
+    thread_a.join(10)
+    thread_b.join(10)
+
+    assert errors == []
+    assert server_a.body_fetches == [[1], [2]], server_a.body_fetches
+    assert server_b.body_fetches == [[3, 4, 5, 6], [7, 8, 9, 10]], server_b.body_fetches
+    assert (progress_a.backed, progress_b.backed) == (2, 8)
+    assert (progress_a.fetch_failed, progress_b.fetch_failed) == (0, 0)   # 等待不算取信失败
+    assert progress_a.quota_wait_s == 0.0
+    assert progress_b.quota_wait_s > 0.0
+    assert quota.inflight_bytes == 0
+
+
+def test_a_batch_the_budget_could_never_hold_is_taken_without_waiting(tmp_path):
+    """声明字节 ≥ 整个额度、或大小未知的批次直接取：等一个永远装不下的额度就是死锁。"""
+    quota = core.FetchQuota()
+    quota.acquire(70 * MIB)                      # 另一个账户已把在途顶过整个额度
+    sizes = {1: 70 * MIB, 2: 0}                  # 一批比整个额度还大，一批大小未知
+    server = make_server([1, 2], sizes=sizes)
+    progress = core.DownloadProgress()
+    errors: list[BaseException] = []
+
+    def target():
+        try:
+            run(tmp_path, server, make_messages([1, 2], sizes), progress=progress, quota=quota)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(10)
+
+    assert not thread.is_alive(), "装不进额度的批次一直在等额度（死锁）"
+    assert errors == []
+    assert server.body_fetches == [[1], [2]], server.body_fetches
+    assert progress.quota_wait_s == 0.0 and progress.backed == 2
+    assert quota.inflight_bytes == 70 * MIB      # 只剩「另一个账户」那份
+    quota.release(70 * MIB)
+
+
+def test_a_stop_interrupts_a_quota_wait_without_a_request(tmp_path):
+    """额度等待中按下停止：这个账户立刻收口，一个请求都不发，也不算取信失败。"""
+    quota = core.FetchQuota()
+    a_inside, b_inside, let_a_leave = threading.Event(), threading.Event(), threading.Event()
+    stop_b = threading.Event()
+    progress_a, progress_b = core.DownloadProgress(), core.DownloadProgress()
+    a_sizes, b_sizes = {1: 40 * MIB}, {2: 40 * MIB}
+    errors: list[BaseException] = []
+
+    def hold_a(_server, _uids):
+        a_inside.set()
+        assert let_a_leave.wait(10)
+
+    def start(name, server, messages, progress, **kwargs):
+        def target():
+            try:
+                run(tmp_path, server, messages, filename=f"{name}.mbox",
+                    progress=progress, quota=quota, **kwargs)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    server_a = make_server([1], sizes=a_sizes, body_hook=hold_a)
+    server_b = make_server([2], sizes=b_sizes, body_hook=lambda _s, _u: b_inside.set())
+    thread_a = start("A", server_a, make_messages([1], a_sizes), progress_a)
+    assert a_inside.wait(10), "A 的 40 MiB 批次没有进入请求"
+    thread_b = start("B", server_b, make_messages([2], b_sizes), progress_b,
+                     should_stop=stop_b.is_set)
+    assert not b_inside.wait(0.6), "B 没等额度，直接把 40 MiB 压上了链路"
+
+    stop_b.set()
+    thread_b.join(10)
+    assert not thread_b.is_alive(), "B 没有从额度等待里被停止唤醒"
+    let_a_leave.set()
+    thread_a.join(10)
+
+    assert errors == []
+    assert server_b.body_fetches == [], server_b.body_fetches
+    assert progress_b.stopped and (progress_b.backed, progress_b.fetch_failed) == (0, 0)
+    assert progress_b.quota_wait_s > 0.0
+    assert quota.inflight_bytes == 0
+
+
+def test_accounts_sharing_a_quota_never_put_more_than_the_budget_on_the_wire(tmp_path):
+    """上界与账户数无关：3 路各 32 MiB 挤一个 64 MiB 预算，第三路只能排队。"""
+    quota = core.FetchQuota()
+    ledger = InflightBytes()
+    all_three = threading.Barrier(3)     # 三路必须同时在途才凑得满
+    broken: list[BaseException] = []
+    errors: list[BaseException] = []
+    servers: dict[int, UidFetchServer] = {}
+    progresses: dict[int, core.DownloadProgress] = {}
+
+    def try_all_at_once(_server, _uids):
+        try:
+            all_three.wait(timeout=1)
+        except threading.BrokenBarrierError as exc:
+            broken.append(exc)
+
+    def start(index: int) -> threading.Thread:
+        uids = [index * 2 + 1, index * 2 + 2]
+        sizes = dict.fromkeys(uids, 16 * MIB)      # 一批 32 MiB
+        servers[index] = make_server(uids, sizes=sizes, body_hook=try_all_at_once, inflight=ledger)
+        progresses[index] = core.DownloadProgress()
+
+        def target():
+            try:
+                run(tmp_path, servers[index], make_messages(uids, sizes), filename=f"F{index}.mbox",
+                    progress=progresses[index], quota=quota)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    threads = [start(index) for index in range(3)]
+    for thread in threads:
+        thread.join(20)
+
+    assert errors == []
+    assert [servers[i].body_fetches for i in range(3)] == [[[1, 2]], [[3, 4]], [[5, 6]]]
+    assert [p.backed for p in progresses.values()] == [2, 2, 2]
+    assert ledger.peak <= core.FETCH_QUOTA_MAX_BYTES, ledger.peak
+    assert broken, "3 路正文请求同时在途：额度没有把第三路拦在请求之前"
+    assert sum(p.quota_wait_s for p in progresses.values()) > 0.0
+    assert quota.inflight_bytes == 0

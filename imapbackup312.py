@@ -179,6 +179,7 @@ class DownloadProgress:
     last_batch: BatchStats | None = None
     inflight: InflightBatch | None = None
     max_fetch_ms: float | None = None
+    quota_wait_s: float = 0.0
     stopped: bool = False
     failures: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
     unreported_failures: set[tuple[str, str]] = field(default_factory=set, repr=False)
@@ -198,6 +199,56 @@ class BatchStall:
 
     caps: dict[str, int] = field(default_factory=dict)
     skipped: set[str] = field(default_factory=set)
+
+
+class FetchQuota:
+    """Process-wide budget of in-flight body bytes, shared by every account thread.
+
+    ``acquire`` waits for room instead of shrinking the batch, so the requests a run
+    sends stay exactly what the batching and cap rules produce. A batch that could
+    never fit an empty budget — a message bigger than it, or one of unknown size — is
+    booked without waiting, because waiting on it would never end.
+
+    Note:
+        Counts declared ``RFC822.SIZE`` bytes, not measured memory, and only body
+        fetches are booked (the scan phase is not). Every acquire wants exactly one
+        release, which ``download_messages`` also performs when a batch fails.
+    """
+
+    def __init__(self) -> None:
+        self.inflight_bytes = 0
+        self._room = threading.Condition()
+
+    def acquire(self, nbytes: int, should_stop: Callable[[], bool] | None = None) -> float:
+        """Book nbytes against the budget, waiting for room; return the seconds waited.
+
+        The reservation always lands — even when a stop cut the wait short — so the
+        caller releases the same amount on every path.
+
+        Returns:
+            Seconds actually spent waiting; 0 when there was room right away or the
+            batch bypassed the budget.
+        """
+        wanted = max(nbytes, 0)
+        with self._room:
+            if wanted == 0 or wanted >= FETCH_QUOTA_MAX_BYTES:
+                self.inflight_bytes += wanted
+                return 0.0
+            waited = 0.0
+            while self.inflight_bytes + wanted > FETCH_QUOTA_MAX_BYTES:
+                if should_stop is not None and should_stop():
+                    break
+                tick = time.monotonic()
+                self._room.wait(FETCH_QUOTA_POLL_S)
+                waited += time.monotonic() - tick
+            self.inflight_bytes += wanted
+            return waited
+
+    def release(self, nbytes: int) -> None:
+        """Hand back what acquire booked so a waiting account can go."""
+        with self._room:
+            self.inflight_bytes -= max(nbytes, 0)
+            self._room.notify_all()
 
 
 @dataclass
@@ -338,6 +389,8 @@ FOLDER_DELIMS = "/\\."  # IMAP hierarchy delimiters a server may use; iterate pe
 SCAN_PAGE_UIDS = 500
 FETCH_BATCH_MAX_MESSAGES = 64
 FETCH_BATCH_MAX_BYTES = 32 * 1024 * 1024
+FETCH_QUOTA_MAX_BYTES = 64 * 1024 * 1024   # 进程内在途正文字节预算（ADR 0017），不是设置项
+FETCH_QUOTA_POLL_S = 0.2
 RECONNECT_MAX_ATTEMPTS = 5
 RECONNECT_BACKOFF_BASE_S = 2.0
 RECONNECT_BACKOFF_CAP_S = 300.0
@@ -846,6 +899,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                       on_batch: Callable[[BatchStats], None] | None = None,
                       on_batch_start: Callable[[InflightBatch], None] | None = None,
                       stall: BatchStall | None = None,
+                      quota: FetchQuota | None = None,
                       index_mbox: IndexWriter | None = None,
                       index_eml: IndexWriter | None = None) -> DownloadProgress:
     """Fetch pending messages in UID batches, writing only the formats each one lacks.
@@ -858,6 +912,10 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     the caller rebuilds the link: the same messages are retried in batches holding
     half as many of them, and a message that still times out alone is counted in the
     timeout bucket and skipped for the rest of the run (spec §5.7.9).
+
+    With a ``quota`` (ADR 0017) each batch waits for its declared bytes to fit the
+    process-wide in-flight budget before the request goes out and hands them back
+    once it is written; the seconds spent waiting land in ``progress.quota_wait_s``.
     """
     if skip_mbox is None:
         skip_mbox = frozenset()
@@ -905,6 +963,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
     t0 = time.monotonic()
     mbox: IO[bytes] | None = None
     completed = False
+    held_bytes = 0
     try:
         if basedir is not None:
             try:
@@ -918,9 +977,18 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                 if not quiet:
                     log.info("%s: stopped by request before next batch", display)
                 break
+            batch_bytes = sum(size for _, _, size in batch)
+            if quota is not None:
+                waited_s = quota.acquire(batch_bytes, should_stop)
+                progress.quota_wait_s += waited_s
+                held_bytes = batch_bytes
+                if should_stop is not None and should_stop():
+                    progress.stopped = True
+                    if not quiet and waited_s > 0:
+                        log.info("%s: stopped by request while waiting for the fetch quota", display)
+                    break
             batch_t0 = time.monotonic()
-            progress.inflight = InflightBatch(len(batch),
-                                              sum(size for _, _, size in batch), batch_t0)
+            progress.inflight = InflightBatch(len(batch), batch_bytes, batch_t0)
             # 调用方要用这个值换快照：下一次请求会把线程埋进 socket 读，之后再没有检查点
             try:
                 if on_batch_start is not None:
@@ -994,7 +1062,7 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                     if not quiet:
                         log.info("%s: stopped by request after %d/%d messages", display, idx, count)
                     break
-            stats = BatchStats(msgs=len(batch), bytes=sum(size for _, _, size in batch),
+            stats = BatchStats(msgs=len(batch), bytes=batch_bytes,
                                fetch_ms=fetch_ms,
                                backed=progress.backed - backed_before,
                                fetch_failed=batch_new_failures)
@@ -1011,10 +1079,15 @@ def download_messages(server: imaplib.IMAP4, filename: str, messages: dict[str, 
                 index_eml.batch_end()
             if on_batch is not None:
                 on_batch(stats)
+            if quota is not None:
+                quota.release(held_bytes)
+                held_bytes = 0
             if progress.stopped:
                 break
         completed = True
     finally:
+        if quota is not None and held_bytes:
+            quota.release(held_bytes)
         if mbox is not None:
             try:
                 mbox.close()

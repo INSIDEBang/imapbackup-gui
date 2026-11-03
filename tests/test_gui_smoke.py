@@ -3774,7 +3774,8 @@ def test_six_accounts_back_up_concurrently_without_shared_waiting(app, monkeypat
     servers: dict[str, UidFetchServer] = {}
 
     def all_at_once(_server, _uids):
-        # 6 个 worker 的正文请求必须同时在路上：任何共享锁/队列/限速都会让这里等到破裂
+        # 6 个 worker 的正文请求必须同时在路上：除取信额度（5.2.7，这些几十字节的批次远装得下）外的
+        # 任何共享锁/队列/限速都会让这里等到破裂
         try:
             barrier.wait(timeout=10)
         except g.threading.BrokenBarrierError as exc:
@@ -5630,6 +5631,55 @@ def test_a_sample_reports_the_inflight_batch_and_the_longest_batch_of_the_run(ap
     assert (sample["inflight_msgs"], sample["inflight_bytes"]) == (9, 12345)
     assert sample["inflight_elapsed_s"] == pytest.approx(7.5)
     assert sample["fetch_ms_max"] == 543210.0
+
+
+def test_the_process_holds_one_quota_shared_by_every_account(app, monkeypatch, tmp_path):
+    """GUI 每进程创建一个取信额度，传给每个账户的正文下载调用（规格 §5.2.7、ADR 0017）。"""
+    quotas: list[object] = []
+
+    class FakeServer:
+        def __init__(self):
+            self.untagged_responses = {"UIDVALIDITY": [b"777"]}
+
+        def select(self, *_args, **_kwargs):
+            return "OK", b""
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(g.core, "connect_and_login", lambda cfg, log: FakeServer())
+    monkeypatch.setattr(g.core, "get_names", lambda *a, **k: [("INBOX", "INBOX.mbox", "INBOX", "INBOX")])
+    monkeypatch.setattr(g.core, "scan_folder", lambda *a, **k: g.core.FolderScan({"<m@x>": (1, 10)}, 777))
+    monkeypatch.setattr(g.core, "scan_file", lambda *a, **k: {})
+    monkeypatch.setattr(g.core, "scan_eml_dir", lambda *a, **k: {})
+    monkeypatch.setattr(g.core, "ensure_basedir", lambda *a, **k: None)
+    monkeypatch.setattr(g.core, "create_folder_structure", lambda *a, **k: None)
+    monkeypatch.setattr(g.core, "download_messages",
+                        lambda _server, _label, *_a, quota=None, **_k: quotas.append(quota))
+
+    for index in (0, 1):
+        account = _worker_account("quota", index)
+        app._backup_account(account, str(tmp_path / account["id"]), app.events,
+                            logging.getLogger("test.quota"), g.threading.Event())
+
+    assert len(quotas) == 2, quotas
+    assert all(isinstance(quota, g.core.FetchQuota) for quota in quotas), quotas
+    assert quotas[0] is quotas[1] is app._fetch_quota
+
+
+def test_a_sample_reports_the_seconds_its_account_waited_for_the_quota(app, diag_env, diag_clock):
+    """额度等待按账户累计进 sample 的 quota_wait_s；开跑时没有任何请求，就是 0。"""
+    account = _diag_account(app, "quota")
+    app._cycle["t0"] = diag_clock.now
+    _diag_begin(app, account, "download", "备份 INBOX（若干封）")
+    app._publish_account_stats(account["id"], g.AccountStats(
+        folder="INBOX", progress=g.core.DownloadProgress(quota_wait_s=1.5)))
+    diag_clock.now = 1010.0
+    _diag_tick(app)
+
+    (sample,) = _diag_rows(diag_env, "sample")
+    assert sample["quota_wait_s"] == 1.5
+    assert _diag_rows(diag_env, "phase")[0]["quota_wait_s"] == 0.0
 
 
 def test_batch_timings_cover_only_the_last_ten_seconds(app, diag_env, diag_clock):

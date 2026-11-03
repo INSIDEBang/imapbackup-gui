@@ -723,6 +723,7 @@ DIAG_FIELDS = (
     "rate_msgs_per_min", "rate_bytes_per_s", "eta_s",
     "batch_msgs", "batch_bytes", "fetch_ms_avg", "fetch_ms_p95", "fetch_ms_max",
     "inflight_msgs", "inflight_bytes", "inflight_elapsed_s",
+    "quota_wait_s",
     "fetch_failed", "fetch_failed_missing", "fetch_failed_no_bad", "fetch_failed_malformed",
     "fetch_failed_timeout",
     "folder_failures",
@@ -1195,6 +1196,8 @@ class BackupApp:
         # 诊断采样（规格 §7）：写入器，以及 worker 发布、主线程只读的每账户统计快照
         self._diag = Diagnostics(self.log)
         self._diag.rotate()   # 启动时清一次过期诊断文件，每次运行开始时再清
+        # 进程内在途正文字节预算（ADR 0017）：一个额度管住所有账户线程的同时取信
+        self._fetch_quota = core.FetchQuota()
         self._account_stats: dict[str, AccountStats] = {}
         self._account_stats_lock = threading.Lock()
         # 左栏勾选（「备份所选」跑哪些账户）：纯界面态，不落盘；新建/读入的账户默认勾上
@@ -4846,6 +4849,7 @@ class BackupApp:
                                        skip_eml=plan.local_eml, foldername=display,
                                        report=report, should_stop=stop_event.is_set,
                                        written=written, progress=progress, stall=stall,
+                                       quota=self._fetch_quota,
                                        on_batch=report_batch,
                                        on_batch_start=lambda _inflight: publish(),
                                        index_mbox=index_mbox, index_eml=index_eml)
@@ -5399,6 +5403,7 @@ class BackupApp:
             "inflight_msgs": inflight.msgs if inflight else None,
             "inflight_bytes": inflight.bytes if inflight else None,
             "inflight_elapsed_s": round(now - inflight.started_at, 1) if inflight else None,
+            "quota_wait_s": round(progress.quota_wait_s, 1),
             "fetch_failed": progress.fetch_failed,
             "fetch_failed_missing": progress.fetch_failed_missing,
             "fetch_failed_no_bad": progress.fetch_failed_no_bad,
