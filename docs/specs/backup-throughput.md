@@ -4,7 +4,7 @@ Status: ready for implementation
 
 Applies to: `imapbackup312.py`、`imapbackup_gui.py`、`tests/`、`packaging/`、`README.md`
 
-Related: [GLOSSARY.md](../../GLOSSARY.md)、[ADR 0003](../adr/0003-structured-message-callback-and-cooperative-stop.md)、[ADR 0004](../adr/0004-per-format-incremental-dedupe.md)、[ADR 0011](../adr/0011-connection-merged-into-backup-flow.md)、[ADR 0012](../adr/0012-independent-account-runs-and-stop-all.md)、[ADR 0013](../adr/0013-fixed-batching-no-adaptive-throttle.md)
+Related: [GLOSSARY.md](../../GLOSSARY.md)、[README.md](../../README.md)、[ADR 0003](../adr/0003-structured-message-callback-and-cooperative-stop.md)、[ADR 0004](../adr/0004-per-format-incremental-dedupe.md)、[ADR 0011](../adr/0011-connection-merged-into-backup-flow.md)、[ADR 0012](../adr/0012-independent-account-runs-and-stop-all.md)、[ADR 0013](../adr/0013-fixed-batching-no-adaptive-throttle.md)、[ADR 0014](../adr/0014-body-fetch-timeout-split-and-give-up.md)、[ADR 0015](../adr/0015-body-batch-payload-64-32mib.md)、[ADR 0016](../adr/0016-body-fetch-timeout-binary-halving.md)、[ADR 0017](../adr/0017-process-wide-fetch-quota.md)
 
 ## 0. 这份规格怎么用
 

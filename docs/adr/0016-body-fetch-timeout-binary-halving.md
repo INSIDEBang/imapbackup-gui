@@ -2,6 +2,8 @@
 
 Status: accepted
 
+Related: [备份吞吐实现规格](../specs/backup-throughput.md) · [README Fork Notes](../../README.md#what-changed-in-160-fork)
+
 取代 ADR 0014 的「超时后逐封拆单封重取」粒度。0014 的其余结论继续有效：只有 `TimeoutError`
 进入这条路径、`BatchStalled` 仍重建链路但不占重连预算、**只有单独取仍超时才计入 `timeout`
 并本轮放弃**、不跟踪停滞的旧调用方保持原行为。

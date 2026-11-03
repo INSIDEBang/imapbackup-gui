@@ -2,6 +2,8 @@
 
 Status: accepted
 
+Related: [备份吞吐实现规格](../specs/backup-throughput.md) · [README Fork Notes](../../README.md#what-changed-in-160-fork)
+
 取代 ADR 0013 的「每批最多 8 封、8 MiB」常数。0013 的其余结论——无客户端自适应限速、
 无跨账户共享速率状态、不新增设置项、CLI 与 GUI 共用同一固定策略——继续有效。
 跨账户共享的取信额度另见 ADR 0017。

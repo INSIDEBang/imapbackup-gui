@@ -2,6 +2,8 @@
 
 Status: accepted
 
+Related: [备份吞吐实现规格](../specs/backup-throughput.md) · [README Fork Notes](../../README.md#what-changed-in-160-fork)
+
 取代 ADR 0013 中「不额外加锁，也不做跨账户排队、轮转或启动错峰」「不新增控制器接口、主机注册表、
 共享实例」这一条。0013 的其余结论继续有效：无自适应限速、无按服务端速率的退让、固定批量、
 不新增设置项、账户之间不共享速率状态。
