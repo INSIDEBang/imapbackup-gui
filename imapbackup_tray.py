@@ -81,7 +81,6 @@ SM_CXSMICON = 49
 SM_CYSMICON = 50
 
 CS_DBLCLKS = 0x0008
-ERROR_CLASS_ALREADY_EXISTS = 1410
 TRAY_ICON_ID = 1
 
 # 菜单项 ID：TrackPopupMenu 用 TPM_RETURNCMD 直接返回被点项的 ID
@@ -141,6 +140,8 @@ class _Api:
 
         u.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
         u.RegisterClassExW.restype = ctypes.c_ushort
+        u.UnregisterClassW.argtypes = [LPCWSTR, HINSTANCE]
+        u.UnregisterClassW.restype = BOOL
         u.CreateWindowExW.argtypes = [DWORD, LPCWSTR, LPCWSTR, DWORD, ctypes.c_int, ctypes.c_int,
                                       ctypes.c_int, ctypes.c_int, HWND, HMENU, HINSTANCE, ctypes.c_void_p]
         u.CreateWindowExW.restype = HWND
@@ -230,6 +231,7 @@ class TrayHost:
         self._hwnd: int | None = None
         self._api: _Api | None = None
         self._wndproc = None          # 必须持引用：回调被 GC 后窗口过程就是野指针
+        self._window_class: _WNDCLASSEXW | None = None
         self._icon_handle: int | None = None
         self._own_icon = False        # 图标句柄是否由 LoadImage 得到（只有它需要 DestroyIcon）
         self._icon_visible = False
@@ -314,13 +316,22 @@ class TrayHost:
             self._message_loop()
         except OSError as exc:
             self._log.warning("托盘不可用：%s", exc)
-            self._ready.set()
         except Exception:  # 托盘线程绝不允许把异常带出线程边界
             self._log.exception("托盘线程异常退出")
-            self._ready.set()
         finally:
+            self._delete_icon()
+            if self._api is not None:
+                if self._hwnd:
+                    self._api.user32.DestroyWindow(self._hwnd)
+                if self._window_class is not None:
+                    wc = self._window_class
+                    # 窗口类也持有回调地址，必须在宿主和回调被回收前注销。
+                    if not self._api.user32.UnregisterClassW(wc.lpszClassName, wc.hInstance):
+                        self._log.warning("托盘窗口类注销失败（错误码 %d）", ctypes.get_last_error())
+                    self._window_class = None
             self._destroy_icon_handle()
             self._hwnd = None
+            self._ready.set()
 
     def _create_window(self) -> bool:
         api = self._api
@@ -333,10 +344,10 @@ class TrayHost:
         wc.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p)
         wc.hInstance = api.kernel32.GetModuleHandleW(None)
         wc.lpszClassName = WINDOW_CLASS_NAME
-        if (not api.user32.RegisterClassExW(ctypes.byref(wc))
-                and ctypes.get_last_error() != ERROR_CLASS_ALREADY_EXISTS):
+        if not api.user32.RegisterClassExW(ctypes.byref(wc)):
             self._log.warning("托盘不可用：注册窗口类失败（错误码 %d）", ctypes.get_last_error())
             return False
+        self._window_class = wc
         hwnd = api.user32.CreateWindowExW(0, WINDOW_CLASS_NAME, "IMAP Backup GUI Tray",
                                           0, 0, 0, 0, 0, None, None, wc.hInstance, None)
         if not hwnd:
@@ -373,6 +384,8 @@ class TrayHost:
             elif self._taskbar_created and message == self._taskbar_created:
                 self._on_taskbar_created()
             elif message == WM_DESTROY:
+                self._delete_icon()
+                self._hwnd = None
                 api.user32.PostQuitMessage(0)
         except Exception:  # 回调异常不能打断消息循环
             self._log.exception("托盘消息处理失败")

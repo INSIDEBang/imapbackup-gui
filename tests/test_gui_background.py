@@ -7,12 +7,17 @@ Tcl 解释器（与库文件加载）反复起停，慢且脆；状态复位统�
 import contextlib
 import json
 import logging
+import os
+import subprocess
 import sys
+import textwrap
+import time
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 tk = pytest.importorskip("tkinter")
+import tkinter.ttk as ttk
 
 import imapbackup_gui as g
 
@@ -68,6 +73,25 @@ def widgets(node, kind):
         yield from widgets(child, kind)
 
 
+def find_toplevel(app, title):
+    """主窗口名下标题为 title 的弹窗（after 预排驱动真实 wait 循环时用）。"""
+    return next(w for w in app.root.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.title() == title)
+
+
+def find_button(dialog, text):
+    return next(w for w in widgets(dialog, ttk.Button) if str(w.cget("text")) == text)
+
+
+def dialog_center_error(app, dialog) -> tuple[int, int]:
+    """弹窗客户区中心相对主窗口客户区中心的偏差（px）。"""
+    app.root.update()
+    return ((dialog.winfo_rootx() + dialog.winfo_width() // 2)
+            - (app.root.winfo_rootx() + app.root.winfo_width() // 2),
+            (dialog.winfo_rooty() + dialog.winfo_height() // 2)
+            - (app.root.winfo_rooty() + app.root.winfo_height() // 2))
+
+
 def drain_log(app) -> list[str]:
     """取事件队列里的运行日志行（日志面板与运行日志文件同一批记录）。"""
     lines: list[str] = []
@@ -118,6 +142,27 @@ def app(tmp_path_factory):
         patch.undo()
 
 
+def reset_run_state(app) -> None:
+    """把每账户的备份阶段全部收回空闲，复位「停止所有」与停止信号（ADR 0012）。"""
+    for state in app._states.values():
+        state["run_phase"] = g.PHASE_IDLE
+    app._stopping_all = False
+    app._stop_events = {}
+    app._on_active_set_changed()
+
+
+def begin_account_run(app, account_id="acc", backed=0, skipped=0, failures=None, stopped=False,
+                      elapsed=0.0) -> None:
+    """把一个账户置为备份中并初始化周期记账（不起线程、不联网）。"""
+    if not app._find_account(account_id):
+        app.accounts.append({"id": account_id, "name": "甲", "user": "a@x.com", "server": "s"})
+    app._state(account_id)["run_phase"] = g.PHASE_BACKING
+    app._cycle = {"t0": time.monotonic() - elapsed, "backed": backed, "skipped": skipped,
+                  "fetch_failed": 0, "folder_failures": 0,
+                  "failures": failures or [], "stopped": stopped, "ids": {account_id}}
+    app._on_active_set_changed()
+
+
 @pytest.fixture
 def tray(app):
     """每个用例复位共享实例：可见窗口、空闲状态、默认偏好、一枚全新的假托盘。
@@ -125,9 +170,11 @@ def tray(app):
     用例自己把 app._tray 换成 None / 换 show 结果时不需要还原——下一个用例会装上新的。
     """
     app._tray = FakeTray()
-    app.running = False
-    app.stopping = False
-    app.stop_flag.clear()
+    reset_run_state(app)
+    app.accounts[:] = []
+    app._states.clear()
+    app._selected_account_id = None
+    app._ui_settings["selected_account"] = None
     app._ui_settings[g.CLOSE_ACTION_KEY] = g.CLOSE_ACTION_ASK
     app._settings_action_var.set(g.CLOSE_ACTION_ASK)
     _normalize_window(app)
@@ -267,49 +314,64 @@ def test_tray_show_event_restores_the_window(app, tray):
     assert ("set_tooltip", g.TRAY_TOOLTIP_IDLE) in tray.calls
 
 
-def test_tray_stop_event_only_stops_a_running_backup(app):
+def test_tray_stop_event_only_stops_a_running_backup(app, tray):
+    """托盘「停止备份」＝停止所有活动账户：空闲时无效果，活动时每账户的信号都置位。"""
     app._handle_event(("tray_stop",))
-    assert (app.running, app.stopping) == (False, False)
-    app.running = True
+    assert app._stopping_all is False
+
+    begin_account_run(app, "acc")
     app._handle_event(("tray_stop",))
-    assert app.stop_flag.is_set() and app.stopping is True
+    assert app._stopping_all is True
+    assert app._stop_events["acc"].is_set()
+    assert app._state("acc")["run_phase"] == g.PHASE_STOPPING
 
 
 def test_run_finished_in_background_only_sends_a_balloon(app, tray):
     """后台隐藏期间备份结束：窗口保持隐藏，只弹托盘气泡。"""
+    begin_account_run(app, "acc", elapsed=61.1)
     app.root.withdraw()
-    app.running = True
-    app._handle_event(("run_done", 3, 7, 61.5, False, 3))
+    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 3, 0, 0, 0, 0, 0))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_DONE,
-            f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.5)}") in tray.calls
+            f"本次备份 3 封，跳过 7 封，用时 {g._fmt_duration(61.1)}") in tray.calls
     assert tray.running is False
     assert tray.tooltip == g.TRAY_TOOLTIP_IDLE
 
 
 def test_stopped_run_in_background_sends_the_stopped_balloon(app, tray):
+    begin_account_run(app, "acc", stopped=True, elapsed=3.0)
     app.root.withdraw()
-    app.running = True
-    app._handle_event(("run_done", 0, 0, 3.0, True, 5))
+    # 停止优先：即使伴随取信/文件夹失败，气泡仍是「已停止」
+    app._handle_event(("account_done", "acc", 0, 0, 3.0, True, 5, 2, 2, 0, 0, 1))
     assert app.root.state() == "withdrawn"
     assert ("notify", g.TRAY_TITLE_STOPPED, g.TRAY_BODY_STOPPED) in tray.calls
+
+
+def test_partial_run_in_background_counts_failures(app, tray):
+    begin_account_run(app, "acc", elapsed=61.1)
+    app.root.withdraw()
+    app._handle_event(("account_done", "acc", 3, 7, 61.1, False, 23, 2, 2, 0, 0, 1))
+    assert ("notify", g.TRAY_TITLE_PARTIAL,
+            f"本次备份 3 封，跳过 7 封，取信失败 2 封，文件夹失败 1 个，用时 "
+            f"{g._fmt_duration(61.1)}") in tray.calls
 
 
 def test_failed_run_in_background_does_not_pop_a_dialog(app, tray, monkeypatch):
     """后台失败也只发气泡：不在隐藏窗口背后弹阻断式错误框。"""
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: pytest.fail("后台不该弹错误框"))
+    begin_account_run(app, "acc", failures=[("甲", "boom")])
     app.root.withdraw()
-    app.running = True
-    app._handle_event(("run_failed", "boom"))
+    app._handle_event(("account_failed", "acc", "boom"))
     assert ("notify", g.TRAY_TITLE_FAILED, g.TRAY_BODY_FAILED) in tray.calls
 
 
-def test_visible_run_finished_keeps_the_dialog_path(app, monkeypatch):
-    """窗口可见时行为不变：失败仍走原来的错误框。"""
+def test_visible_failure_of_the_selected_account_pops_a_dialog(app, monkeypatch):
+    """窗口可见且失败账户正被看着：弹一次错误框；别的账户失败只走红叉。"""
     shown = []
     monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: shown.append(a))
-    app.running = True
-    app._handle_event(("run_failed", "boom"))
+    begin_account_run(app, "acc")
+    app._selected_account_id = "acc"
+    app._handle_event(("account_failed", "acc", "boom"))
     assert shown
 
 
@@ -320,15 +382,118 @@ def test_tray_quit_confirms_only_while_running(app, tray, monkeypatch):
     assert destroyed == [True]  # 空闲：直接退出
 
     destroyed.clear()
+    begin_account_run(app, "acc")
     asked = []
-    monkeypatch.setattr(g.messagebox, "askokcancel", lambda *a, **k: asked.append(a) or False)
-    app.running = True
+    monkeypatch.setattr(app, "_ask_quit_while_running", lambda n: asked.append(n) or False)
     app._handle_event(("tray_quit",))
-    assert asked and destroyed == []  # 运行中且用户拒绝：留在后台
+    assert asked == [1] and destroyed == []  # 活动中且用户拒绝：不退出
 
-    monkeypatch.setattr(g.messagebox, "askokcancel", lambda *a, **k: True)
+    started = []
+    monkeypatch.setattr(app, "_ask_quit_while_running", lambda n: True)
+    monkeypatch.setattr(app, "_begin_quit_after_stop", lambda *a, **k: started.append(1))
     app._handle_event(("tray_quit",))
-    assert destroyed == [True]
+    assert started == [1]                    # 确认后进入优雅停止流程
+
+
+def test_quit_confirmation_starts_stopping_before_the_waiting_dialog_closes(app, tray, monkeypatch):
+    """确认退出要立刻发停止信号：等待窗等账户收尾才关，调用方不能反过来等窗关。
+
+    回归自现场：确认后弹窗转「正在停止…」但备份一直不停，因为确认回调刻意不关窗，
+    wait_window 却要等窗口销毁才返回，后面的 _begin_quit_after_stop 永远走不到。
+    """
+    begin_account_run(app, "acc")
+    started: list[bool] = []
+
+    def begin(*, waiting_label=None, on_done=None):
+        started.append(any(isinstance(w, tk.Toplevel) and w.title() == g.QUIT_CONFIRM_TITLE
+                           for w in app.root.winfo_children()))
+        app._on_stop_all()
+        for w in list(app.root.winfo_children()):
+            if isinstance(w, tk.Toplevel) and w.title() == g.QUIT_CONFIRM_TITLE:
+                w.destroy()
+
+    monkeypatch.setattr(app, "_begin_quit_after_stop", begin)
+    timed_out: list[bool] = []
+
+    def drive():
+        dialog = find_toplevel(app, g.QUIT_CONFIRM_TITLE)
+        find_button(dialog, g.QUIT_CONFIRM_BTN).invoke()
+
+        def watchdog():
+            # 旧实现：确认后不关窗，wait_window 卡住；这里替真实用户把窗关掉，免得挂死测试
+            if not started:
+                timed_out.append(True)
+                dialog.destroy()
+
+        app.root.after(100, watchdog)
+
+    app.root.after(0, drive)
+    assert app._confirm_and_quit() is True
+    assert timed_out == [] and started == [True]
+    assert app._stop_events["acc"].is_set()
+    assert app._state("acc")["run_phase"] == g.PHASE_STOPPING
+
+
+def test_quit_waiting_dialog_stays_centered_after_the_text_shrinks(app, tray, monkeypatch):
+    """确认后文案换成「正在停止…」，窗口缩小时必须重新居中，不能固定左上角缩。"""
+    begin_account_run(app, "acc")
+    monkeypatch.setattr(app, "_begin_quit_after_stop", lambda **kwargs: None)
+    seen = {}
+
+    def drive():
+        dialog = find_toplevel(app, g.QUIT_CONFIRM_TITLE)
+        seen["before"] = dialog_center_error(app, dialog)
+        find_button(dialog, g.QUIT_CONFIRM_BTN).invoke()
+        seen["after"] = dialog_center_error(app, dialog)
+        dialog.destroy()
+
+    app.root.after(0, drive)
+    app._confirm_and_quit()
+    assert abs(seen["before"][0]) <= 2 and abs(seen["before"][1]) <= 2, seen
+    assert abs(seen["after"][0]) <= 2 and abs(seen["after"][1]) <= 2, seen
+
+
+def test_hiding_while_active_never_asks(app, tray, monkeypatch):
+    """「隐藏到后台」不是退出：活动账户在跑也不拦截（备份本就该在后台继续）。"""
+    monkeypatch.setattr(app, "_save_column_config", lambda: None)
+    monkeypatch.setattr(app, "_ask_quit_while_running",
+                        lambda n: pytest.fail("隐藏到后台不该走退出确认"))
+    app._ui_settings[g.CLOSE_ACTION_KEY] = g.CLOSE_ACTION_TRAY
+    begin_account_run(app, "acc")
+    app._on_close()
+    assert app.root.state() == "withdrawn"
+    assert app.running and app._state("acc")["run_phase"] == g.PHASE_BACKING
+
+
+def test_graceful_quit_polls_until_accounts_settle(app, monkeypatch):
+    """确认退出：等活动账户收尾后落盘退出；超时也强退。"""
+    begin_account_run(app, "acc")
+    quits = []
+    monkeypatch.setattr(app, "_quit", lambda: quits.append(1))
+    monkeypatch.setattr(app, "_save_column_config", lambda: None)
+
+    future = time.monotonic() + 100
+    app._quit_deadline = time.monotonic() + 1
+    assert app._quit_after_stop_step(future) is True   # 超过等待上限：放行（强退）
+
+    app._quit_deadline = time.monotonic() + 100
+    assert app._quit_after_stop_step(time.monotonic()) is False  # 还在跑且未超时：继续等
+
+    app._state("acc")["run_phase"] = g.PHASE_IDLE
+    assert app._quit_after_stop_step(time.monotonic()) is True   # 活动集合排空：干净放行
+    done = []
+
+    def on_done():   # 真实 on_done 关等待窗后调 _quit，这里一并模拟
+        done.append(1)
+        app._quit()
+
+    app._finish_quit_after_stop(on_done, forced=False)
+    assert quits == [1] and done == [1]
+
+    # 超时强退：记 warning 后落盘退出
+    quits.clear()
+    app._finish_quit_after_stop(None, forced=True)
+    assert quits == [1]
 
 
 # ------------------------------------------------------------------ 窗口状态记忆
@@ -390,9 +555,12 @@ def test_tray_quit_while_hidden_keeps_the_maximized_choice(app, tray, monkeypatc
 
 # ------------------------------------------------------------------ 页面与设置
 
-def test_menubar_carries_the_two_pages(app):
+def test_menubar_carries_the_pages_and_the_help_menu(app):
     labels = [app.menubar.entrycget(i, "label") for i in range(app.menubar.index("end") + 1)]
-    assert labels == [label for _name, label in g.PAGE_LABELS] == ["备份", "设置"]
+    assert labels == [*[label for _name, label in g.PAGE_LABELS], g.HELP_MENU_LABEL] == \
+        ["备份", "设置", "帮助"]
+    assert app.menubar.type(len(g.PAGE_LABELS)) == "cascade"
+    assert app.help_menu.entrycget(0, "label") == g.FAQ_TITLE
     assert app._page_var.get() == g.PAGE_BACKUP
 
 
@@ -410,6 +578,10 @@ def test_settings_page_lists_the_sections_and_selects_the_first(app):
     assert [app.settings_nav.get(i) for i in range(app.settings_nav.size())] == \
         [title for _key, title in g.SETTINGS_SECTIONS]
     app._show_page(g.PAGE_SETTINGS)
+    # 进设置页默认落在第一个分类（账户）；切到「窗口与后台」再看它自己的详情
+    assert app.settings_nav.curselection() == (0,)
+    assert app._settings_section == g.SETTINGS_SECTIONS[0][0]
+    app._show_settings_section(g.SETTINGS_WINDOW_SECTION)
     index = [key for key, _title in g.SETTINGS_SECTIONS].index(g.SETTINGS_WINDOW_SECTION)
     assert app.settings_nav.curselection() == (index,)
     assert app._settings_section == g.SETTINGS_WINDOW_SECTION
@@ -459,7 +631,7 @@ def test_invalid_close_action_falls_back_to_ask_and_warns(app, tmp_path, monkeyp
         app._ui_settings = original
 
 
-def test_tray_host_wiring_is_available_on_windows():
+def test_tray_host_wiring_is_available_on_windows(monkeypatch):
     """托盘宿主接线（ctypes 全套）：真造一个宿主，挂出图标、走通二次启动唤起通道再收掉。
 
     Note:
@@ -468,6 +640,7 @@ def test_tray_host_wiring_is_available_on_windows():
     """
     if sys.platform != "win32":
         pytest.skip("托盘只在 Windows 上可用")
+    monkeypatch.setattr(g.imapbackup_tray, "WINDOW_CLASS_NAME", f"imapbackup-tray-test-{os.getpid()}")
     host = g.imapbackup_tray.create_tray(
         icon_path=g._window_icon_path(), tooltip="tray-test",
         on_show=lambda: None, on_stop=lambda: None, on_quit=lambda: None,
@@ -480,3 +653,80 @@ def test_tray_host_wiring_is_available_on_windows():
         assert g.imapbackup_tray.request_restore()  # 找到隐藏消息窗口并投递唤起请求
     finally:
         host.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 window procedure lifetime")
+@pytest.mark.parametrize("case", ["retained", "collected", "duplicate", "create_failed", "native_close"])
+def test_tray_window_class_lifetime(case):
+    script = textwrap.dedent('''
+        import gc
+        import logging
+        import os
+        import sys
+        import threading
+        import imapbackup_tray as tray
+
+        tray.WINDOW_CLASS_NAME = "imapbackup-tray-test-" + str(os.getpid())
+
+        def make(event):
+            return tray.create_tray(icon_path=None, tooltip="tray-test",
+                                    on_show=event.set, on_stop=lambda: None,
+                                    on_quit=lambda: None, log=logging.getLogger("tray-test"))
+
+        case = sys.argv[1]
+        api = tray._get_api()
+        if case == "create_failed":
+            original = api.user32.CreateWindowExW
+            api.user32.CreateWindowExW = lambda *args: None
+            try:
+                assert make(threading.Event()) is None
+            finally:
+                api.user32.CreateWindowExW = original
+
+        previous_event, current_event = threading.Event(), threading.Event()
+        previous = make(previous_event)
+        assert previous is not None
+        if case == "duplicate":
+            assert make(threading.Event()) is None
+            assert tray.request_restore()
+            assert previous_event.wait(1)
+            previous_event.clear()
+        if case == "native_close":
+            assert previous.show("tray-test")
+            commands = []
+            original = api.shell32.Shell_NotifyIconW
+
+            def notify(command, data):
+                commands.append(command)
+                return original(command, data)
+
+            api.shell32.Shell_NotifyIconW = notify
+            assert api.user32.PostMessageW(previous._hwnd, tray.WM_CLOSE, 0, 0)
+            previous._thread.join(2)
+            assert not previous._thread.is_alive()
+            assert tray.NIM_DELETE in commands
+            api.shell32.Shell_NotifyIconW = original
+        previous.close()
+        assert not previous._thread.is_alive()
+        current = make(current_event)
+        assert current is not None
+        if case == "collected":
+            del previous
+            gc.collect()
+        try:
+            assert tray.request_restore()
+            assert current_event.wait(1), "restore used a stale window procedure"
+            assert not previous_event.is_set()
+            assert current.show("tray-test")
+        finally:
+            current.close()
+        assert not current._thread.is_alive()
+        assert not tray.request_restore()
+    ''')
+    result = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", script, case],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, encoding="utf-8", timeout=20)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Windows fatal exception" not in output, output

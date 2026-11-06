@@ -8,24 +8,70 @@
 - 工作线程执行连接、枚举、扫描、下载和 logout，通过 `queue` 回投事件；主线程以 `after()` 轮询。工作线程不直接访问 widget。
 - GUI 通过结构化 `report` 获取进度，通过 `should_stop` 协作停止；调用核心时保持 `quiet=False`、`nospinner=True`。具体契约见 ADR 0003。
 - 停止只在下一封消息或下一个文件夹前生效，当前 I/O 可能持续到 socket 超时。界面只使用“停止”，不引入“暂停/继续”语义。
+- **托盘回调寿命**：Win32 窗口类在窗口销毁后仍持有 WNDPROC 地址；宿主必须先销毁窗口、注销自己注册的类，再允许回调回收。重复宿主不得复用别人的窗口类。原生回归在子进程中同时检查退出码和 stderr：access violation 可能伴随零退出码。
+- **Tk 测试环境**：Windows 下默认 fd 捕获曾在跨模块重建 Tk 时触发 Tcl 库加载失败，无真托盘也可复现；`pytest.ini` 使用 sys 捕获规避，底层 Tcl 原因尚未确定。布局测试在用例开始时恢复被最小化或隐藏的共享窗口；临时账户通过 finalizer 清理，避免断言失败污染后续用例。
 
 ## 界面设置与恢复
 
 - 应用数据目录是 `%LOCALAPPDATA%\imapbackup-gui\`，由程序首次运行时创建；它承载运行日志与界面设置。安装程序不预创建该目录，卸载时只处理这一目录，不触碰用户选择的备份根目录和其下的账号目录。
 - 界面设置按 Windows 用户全局保存，不按账号、邮箱文件夹或备份根目录分层。设置文件使用带版本号的通用结构，同时兼容旧的五列宽度格式。邮件列表五列的宽度在拖动释放后更新内存值并持久化，下一次打开对所有账号与文件夹生效；窗口缩放时所有列按比例调整并遵守各自原生最小宽度。主窗口保存正常状态的宽高和位置、最大化状态；最大化时保留最大化前最后一次正常几何，启动时先恢复正常几何再恢复最大化。窗口关闭时统一保存一次，保存失败只记录 warning 并继续退出。旧位置在当前显示器布局中完全不可见时只回退位置到 Tk 默认位置，保留有效尺寸。滚动位置和排序状态不在本次范围内。
-- 配置区字段（账号、收件服务器、SSL、端口、备份保存位置）随同一原子写落盘在 `config` 节（端口存字符串，校验在连接时做）。恢复顺序 ssl→端口；恢复出的端口视为用户确认过的值（置 `_port_touched`），挡住 SSL 联动改端口。字段逐个校验类型，坏字段跳过、坏节整节丢弃。
-- 邮箱密码以系统 DPAPI 加密形式保存（base64 密文进同一文件，仅当前用户、当前机器可解；防配置文件泄露，不防以本用户身份运行的进程）。空密码不落盘；非 Windows 平台密码不持久化、其余字段照常；解密失败（换机器/换账户/文件损坏）视为未保存，记一条 warning 后正常启动，不弹窗。会话令牌和邮件内容不属于界面设置，任何路径都不得写入。
-- 设置文件不存在、无法解析、字段类型不符或版本不兼容时，整份设置视为不可恢复：使用内置默认值启动并继续提供 GUI；不得因为设置损坏阻止连接或备份。应把可诊断信息写入运行日志，日志不可用时只向现有 console/状态提示降级，不弹出阻断式错误框。
+- 账户列表（连接设置、DPAPI 密码、文件夹与格式勾选）、全局备份保存位置与当前选中账户随同一原子写落盘在 `accounts` / `backup_root` / `selected_account`（见下节「多账户」）。文件夹勾选存 IMAP 文件夹名，缺省或全部失效时回落 `INBOX`。密码框显示固定掩码 `PASSWORD_MASK_TEXT`（8 颗星，不回显内容也不透露真实位数）：原样保存 = 不修改已存密文，清空 = 删除已存密码，改内容 = 写入新密码；账户名称不参与任何路径。
+- 邮箱密码以系统 DPAPI 加密形式保存（base64 密文进同一文件，仅当前用户、当前机器可解；防配置文件泄露，不防以本用户身份运行的进程）。空密码不落盘；非 Windows 平台密码不持久化、其余字段照常；解密失败（换机器/换账户/文件损坏）视为该账户没有密码，连接时提示去设置页重填，不影响启动与其他账户。
+- 设置文件不存在、无法解析、字段类型不符或版本不兼容时按节降级：整份不可解析时用内置默认值启动并继续提供 GUI；坏节丢弃、坏字段回落默认值（`accounts` 非列表整节丢弃，单个账户缺 `id` 跳过该账户）。不得因为设置损坏阻止连接或备份。应把可诊断信息写入运行日志，日志不可用时只向现有 console/状态提示降级，不弹出阻断式错误框。
 - 写入失败时保留当前进程中的设置，界面操作和备份继续；下一次启动重新使用上一次成功保存的设置或默认值。写入失败只产生可诊断警告，不覆盖一份仍可读取的旧设置文件，也不触碰备份输出。
 - 卸载向导分别提供“删除运行日志”和“删除界面设置”选项，默认均勾选；取消向导或中途取消进度时两者都保留，真静默卸载按默认值删除两者。用户备份永远不在范围内（ADR 0007、ADR 0008）。
+
+## 多账户
+
+改账户模型、备份页版式或账户运行模型前读这一节；配置模型见 ADR 0010、连接预检见 ADR 0011、独立运行/停止所有/退出保护见 ADR 0012。
+
+- **账户是唯一配置单位**：`self.accounts` 是账户字典列表（`id` / `name` / `user` / `server` / `ssl` / `port` / `password_dpapi` / `folders` / `mbox` / `eml`），引用一律用创建时生成的稳定 `id`（名称可改、邮箱地址可重复）。`parse_account` / `account_record` 是读写这两个方向的唯一入口；`account_display` 给出显示名（名称→邮箱地址→占位名）。
+- **账号目录名永远取邮箱地址**：`_backup_account` 用 `core.sanitize_segment(v["user"], …)` 拼 `<备份根>/<邮箱地址>/…`。账户名称只是显示名，任何路径、输出、判重逻辑都不得读它（AGENTS.md 的不变量）。
+- **界面分工**：设置页「账户」= 账户增删改 + 连接设置表单 +「保存」（保存是显式动作，校验邮箱地址/收件服务器/端口后落盘）；「备份」= 全局唯一的备份保存位置。备份页 = 左账户列表（`account_list`，固定 160px）+ 右账户备份详情；详情里连接信息与备份位置是**只读信息卡**（行构成照 foxmail：邮箱类型 / 邮箱地址 / 收件服务器 + SSL + 端口同排；**没有密码行**，密码只在设置页表单里维护），唯一可编辑项是格式复选框与文件夹勾选树。备份页不得出现 `tk.Entry`（`test_backup_detail_has_no_entry_widgets` 守着）。
+- **账户行是自绘的**：一行 = 复选框 + 名称 + 行尾状态图标槽（`_make_account_row`），不是一个 Listbox——点行切详情、点复选框只翻勾选，两个动作的命中区必须分开。行底色 `ACCOUNT_ROW_BG`（对话框灰），选中行整行 `SystemHighlight`（与原 Listbox 的选中蓝同一个系统色，`_render_account_rows` 上色，选中行连复选框与图标 Label 一起换底色）。勾选集合 `self._checked_accounts` 是纯界面态、不落盘：`_refresh_account_list` 里同步——删掉的账户不再占勾选，上一次画列表时还没有的账户默认勾上（「勾」是默认态，`_on_account_add` 经新增弹窗开户、不建空账户）；脱钩（取消勾选）立即清空闲账户的终态图标/冷却。复选框的 `padx/pady` 清零、名称紧贴控件右缘；名称截断预算要扣掉图标槽（`_fit_account_names`）。
+- **行尾状态图标**（ADR 0012）：右侧固定图标 Label 挂透明整格位图 `row_icon_blank` 占位（名称不横跳）。统计中蓝放大镜/备份中绿下箭头/停止中红块/完成绿勾/已停止灰块/失败红叉，全部代码逐像素（`_scan_icon`/`_download_icon`/`_check_icon`，红块/红叉/blank 复用），Python 侧持引用、`_attach_button_icons` 集中挂载；`_apply_account_icon` 按 run_phase/result 选图。完成绿勾 60 秒、已停止灰块 5 秒（`root.after`，句柄在 `state["icon_job"]`，重启/脱钩/删账户先取消），失败红叉常驻到下次启动；预检阶段不显示图标。启动期画布 Configure 可能早于图标挂载，`_fit_account_names` 用 getattr 兜底。
+- **账户列表装不下才挂滚条**：列表在画布 `account_canvas` 里（`account_scroll` 贴面板内沿，与「邮箱文件夹」同款）；`_sync_account_scroll` 比内容请求高度与画布高度决定滚条去留——行数变化后延到 `after_idle` 量（当场量到的还是旧值），窗口缩放走画布 `<Configure>`。画布单位 `yscrollincrement` = 实测行距，滚轮一格一行（`_on_wheel` 的账户列表分支，与文件夹面板同节奏）。
+- **文件夹树的滚动范围不能只依赖 `<Configure>`**：Tk 不在 `folder_inner` 变矮时送达该事件（实测换账户重画、折叠分支都是 0 次），scrollregion 会停留在旧高度、原点按像素留在旧深度——旧账户的长树滚到底后切到短树账户，新树第一行在视口上方两百多像素、滚条滑块还挂在旧树的区域底部，向上要滚三十多格才见到内容，事后拖窗口也不自愈。整棵树销毁后它的请求高度也不会自行重算（实测还是旧树的高度），空树不能按 bbox 量。所以这些路径都显式重写，`_sync_folder_scroll` 是 scrollregion 与行距的唯一写入点（空树直接写零范围）：换账户/重拉清单（`_render_folder_tree` 末尾 `yview_moveto(0)` + `after_idle(_sync_folder_scroll)`，旧树的深度对新树没有意义，新树一律从顶部开始）、折叠分支（`_toggle_folder_open` 后先 `update_idletasks` 排空布局传播再同步——当场量 bbox 还是旧高度；仍溢出时 Tk 随重写把原点钳到新底部，装得下回顶）、删到最后一个账户（`_render_account_detail` 空分支同步 + `yview_moveto(0)`）。增长路径照旧走 `_on_folder_inner_configure`。注意 Tk 的钳制保留的是「离 region 底部的距离」且视图原点按 `yscrollincrement` 对齐到行边界，滚到底时内容下方会留最多一行高的同色空白（看不出来），这是行对齐滚动的既有代价。
+- **一套共享控件 + 每账户状态字典**：`self._states[account_id]` 存 `snapshot`（服务器、地址、密码密文）/ `folder_rows` / `open_keys` / `messages` / `row_index` / 计数 / 状态文案 / 进度 / `run_phase` / `phase_kind` / `pending_bytes` / `done_bytes` / `speed` / `result` / `result_at` / `icon_job`。`_switch_account` → `_render_account_detail` 负责「收当前账户进度 → 重画目标账户」并让运行 spinner 当帧重画到新选中账户；`self.folder_rows`、`self._folder_nodes`、`self._folder_clickables` 始终指向可见账户的那一份。`_visible_state()` 对存在的账户按需建立状态。
+- **连接不再是用户动作**（ADR 0011）：移除「连接并加载文件夹」按钮与整套连接状态机（`connect_state`、连接 spinner、连接提示行、stale 概念）。文件夹清单靠**静默加载**（`_maybe_load_folders`）按需拉取——打开应用 / 切账户 / 保存账户后各触发一次，同一账户去重、连接参数没变（快照口径）则不重拉。失败在文件夹区提示并给恢复入口：工具栏右上角的 **⟳ 刷新按钮**（icon-only 字形，`_on_refresh_folders` 清掉快照强制重拉）；密码缺失 / 认证失败再弹**密码补录窗**（复用预检的 `_ask_password`，补完自动重拉；同账户同快照只弹一次，手动刷新必再弹，`state["password_prompted"]` 记忆）。真正的连接仍在备份预检时做。
+- **账户各自独立运行，可随时追加**（ADR 0012）：每账户独立线程/独立 IMAP 连接/独立协作停止信号（`_stop_events[id]`）/独立阶段 `run_phase`（idle/connecting/scanning/backing/stopping）；活动集合＝阶段非 idle 的账户，`self.running` 是其派生属性，全部 UI 收口在 `_on_active_set_changed`（停止所有按钮显隐、备份所选可用性、右下两按钮、配置锁、spinner、托盘）。`_launch_accounts` 复位候选基线、建信号、各起一条 `_backup_account_thread`；活动集合空→非空开新周期（`_cycle` 记账），追加的账户并入当前周期。事件只有 `account_begin`/`phase`/`totals`/`message`/`account_done`/`account_failed`（无 batch_done/account_skipped）：`phase(account_id, kind, text)` 的 `kind ∈ connecting/scanning/download/backoff/stopping`，分别驱动连接/统计/下载/停止阶段；**backoff 只改 `phase_kind` 与第二行，保留被中断的 `run_phase`**，不能把 LIST/扫描中的账户变成备份中。`totals` 带 `pending_bytes`，`message` 带 `fetch_size`（RFC822.SIZE）；stopping 后到达的 phase/totals 不许降级。终态经 `_after_account_terminal` 收口，活动集合排空时记结束日志、隐藏则发一次气泡。失败弹框只在失败账户正被看着且窗口可见时；其余走红叉+状态行。账户之间唯一的刻意耦合是进程内取信额度（`self._fetch_quota`，ADR 0017）：它只让装不下的大批次多等一会儿，不改计数、阶段或事件。
+- **第二行速率/ETA 与基础文案分开**：`state["status_text"]` 存 worker/终态的基础文案，`_refresh_status_line` 只合成可见的 `_status_full`，每秒 `_status_tick` 重算但不回写基础文案。`SpeedTracker` 按 `SPEED_WINDOW_S`（120 秒）保留 `(monotonic, fetch_size)` 样本并算本账户消息/字节速率，ETA 用同一个窗口按 `max(0, pending_bytes-done_bytes)` 计算；从非 download 重新进入 download 清窗并重新预热，换文件夹不清。预热只检查本段累计完成 3 封且距首封完成至少 5 秒；成熟窗口分母用完整窗口时长，旧样本出窗后仍显示数值（空窗为零），窗口字节速率为零时隐藏 ETA。只有选中账户 `phase_kind=="download"` 才显示速率/ETA；至少两个 download 账户才显示合计，顺序固定为本账户消息速率→字节速率→ETA→合计消息速率→合计字节速率→取信/文件夹失败后缀。UIDVALIDITY 重扫后的 `totals.pending_bytes` 要补回**当前文件夹**已 written 的字节，不能重复扣减 `done_bytes`；切账户由 `_restore_run_state` 当帧重算。
+- **完成冷却＝绿勾窗，同常量**：`DONE_COOLDOWN_S=60`，`_on_start_selected` 候选跳过冷却中的 done 账户（冷却名单有专门提示），右下 `_on_start` 绕过；已停止 TTL 5 秒。
+- **两个停止入口**：右下 `_on_stop` 只停选中账户；左栏「停止所有」满宽按钮在「备份所选」正下方（同 `bottom_actions` 容器），仅活动时 pack、排空 forget，点击后禁用并显示转圈（`_stopping_all`），托盘菜单停止等同停止所有。
+- **备份中退出二次确认**（ADR 0012）：关闭按钮的「退出程序」与托盘退出在有活动账户时走 `_confirm_and_quit` → 自绘 `_ask_quit_while_running`（取消安全侧）；确认后 `_on_stop_all` + 100ms 轮询 `_quit_after_stop_step`，活动排空或超 `QUIT_STOP_TIMEOUT_S=15s` 才落盘退出；确认窗转「正在停止，等待 N 个账户收尾…」态。隐藏到后台永不拦；隐藏态外部关闭仍 force_exit。
+- **备份 = 预检 + 独立启动**（ADR 0011/0012）：`_on_start`（绕过冷却的单账户命令）/ `_on_start_selected`（候选收集）交 `_begin_preflight`，弹窗对**本次候选**串行检测（登录 + LIST + 登出），与已在跑的下载并行不互扰；密码错误弹 `_ask_password`（重试 / 跳过，带「保存密码」，不勾只进 `_run_passwords`）；关闭弹窗只放弃本次候选，不影响活动账户；通过后 `_launch_accounts`。运行日志经 `_account_logger`（每账户真实 Logger + 前缀 Filter）加 `[账户名] ` 前缀。
+- **每个账户自己 LIST 文件夹**：`_backup_account(account, outdir, eq, log, stop_event)` 连接后调 `core.get_names` 并按账户快照里的文件夹名过滤，统计/下载循环与 `download_messages(should_stop=...)` 只读本账户信号。
+- **设置页账户表单**：行序照 foxmail（邮箱类型置顶 + 名称 / 邮箱地址 / 收件服务器 + SSL + 端口同排 / 密码）；右详情三块 body 四边内边距 8px（与面板间距同一基线），分类标题用 `_heading_font`（加粗、正文 +`HEADING_SIZE_DELTA` 磅）。`_account_form_entries` 是表单里的输入框（顺序仍是名称 / 邮箱地址 / 收件服务器 / 端口 / 密码，Enter 提交保存与右键菜单按它索引）；`_acct_ssl_var` 只联动仍是 993/143 的默认端口。密码框存的是掩码哨兵：`_on_acct_password_key` / `_on_acct_password_clip` 保证任何会改文本的动作（打字 / BackSpace / `<<Paste>>` / `<<Cut>>`）先把掩码整框清掉，免得在掩码中间拼出假密码；导航键与控制组合放行。**保存结果用保存按钮旁的状态文案反馈**（`_show_account_save_status`：成功绿「已保存」约 3 秒自动消失、失败红字写明原因，不再弹 messagebox，Q10 一套出口）；**「新增」弹自绘模态窗填表单**（`_ask_new_account`：字段与本表单一致，叉掉/取消零副作用不建空账户，校验红字留窗内，保存闪「已保存」约 0.8 秒自动关窗后新账户入列表并选中）；**「删除」的确认是自绘弹窗**（`_ask_delete_account`，居中到主窗口，文案不变）。删除账户要确认，且不碰磁盘上已备份的邮件；活动账户（备份中）先被「请先停止」warning 拦在确认窗前。
+
+相关回归：
+
+- `test_accounts_v1_settings_migrate_to_accounts` / `test_accounts_restore_tolerates_bad_records` / `test_accounts_save_and_restore_round_trip`
+- `test_backup_detail_has_no_entry_widgets` / `test_format_checkboxes_are_per_account`
+- `test_account_rows_are_gray_until_selected` / `test_account_checkboxes_are_independent_of_selection` / `test_backup_selected_runs_only_checked_accounts`
+- `test_account_row_checkbox_sits_next_to_the_name` / `test_account_list_scrolls_only_when_accounts_do_not_fit`
+- `test_account_form_password_mask_reflects_the_saved_password` / `test_password_box_saves_keeps_and_clears` / `test_password_mask_guards_typing_and_paste`
+- `test_account_form_follows_the_mail_client_layout` / `test_settings_detail_padding_matches_the_8px_gap` / `test_settings_section_titles_use_a_bigger_bold_font`
+- `test_account_save_reports_result_in_status_text` / `test_new_account_dialog_creates_account_only_on_save` / `test_delete_confirm_is_a_self_drawn_centered_dialog` / `test_add_delete_buttons_fill_the_account_list_width`
+- `test_launch_runs_accounts_concurrently_and_isolates_failures` / `test_stop_all_does_not_touch_an_unaffected_account` / `test_account_row_status_icons_follow_phases_and_ttl` / `test_done_cooldown_skips_batch_but_not_single_start` / `test_backup_selected_appends_only_the_new_account_while_others_run` / `test_run_controls_follow_the_selected_account` / `test_active_account_cannot_be_deleted` / `test_stop_all_button_lives_below_backup_selected` / `test_backup_account_uses_email_for_the_account_directory`
+- `test_folder_load_fills_the_tree` / `test_editing_credentials_triggers_a_silent_reload`
+- `test_refresh_button_reloads_folders` / `test_folder_load_failure_shows_hint_and_prompts_password`
+- `test_backoff_preserves_the_interrupted_run_phase` / `test_second_line_aggregates_only_downloading_accounts` / `test_second_line_places_failure_suffix_after_rates` / `test_uidvalidity_rescan_keeps_completed_bytes_in_the_eta_baseline`
+- `test_second_line_hides_rates_while_stopping` / `test_stop_all_restores_stopping_text_after_switching_accounts`
 
 ## 按钮与加载状态
 
 - 开始与停止图标由 `PhotoImage` 在代码中生成，不增加图片资产；Python 侧必须持有引用，避免图标被垃圾回收。
-- 连接与备份共用 `SPINNER_FRAMES`、`SPINNER_INTERVAL_MS` 和 `_set_loading_frame()`。修改帧或节奏时同时覆盖 `_connect_spinner_tick` 与 `_run_spinner_tick` 两条调度链。
-- 开始和停止按钮不设置固定 `width`。加载态使用 `_blank_icon()` 占住「有 image」这个高度前提，不把 `image` 设为 `""`，避免按钮高度变化；占位是 1px 宽 × 图标高——只借高度不占宽，转圈符贴近左边框、左右留白与静止态对称（回归自：整图标宽的占位让左边一大块空白、左松右紧）。宽度在加载/静止之间会随文案与图标槽变化，不再是「只随文案走」。
-- 点击停止后，转圈移到停止按钮；开始按钮恢复静止外观但保持禁用；状态行只清除文案而不收回布局；配置区显示停止提示。
-- 完成、停止、失败以及帧链自愈路径都必须恢复两颗按钮和配置区提示。
+- **图标语言**：开始=绿三角、停止=红方块、新增=绿加号、删除=红叉（`_plus_icon`/`_cross_icon`，笔画粗 `ICON_STROKE`、内缩同方块）；账户行状态=蓝放大镜（统计，`_scan_icon`，`SCAN_ICON_COLOR`）/绿下箭头（备份，`_download_icon`）/绿勾（完成，`_check_icon`）/灰方块（已停止）/红叉（失败），行槽另有一枚整格透明 `row_icon_blank`（与按钮转圈用的 1px `blank_icon` 不是一个）；色板只用 `PLAY_ICON_COLOR`/`STOP_ICON_COLOR`/`SCAN_ICON_COLOR`/`ICON_DISABLED_COLOR`、边长一律 `_icon_size()`，全部由 `_attach_button_icons` **统一挂载**（`compound="left"`，时机在两页建完之后——账户行在 `_refresh_account_list` 才建，早挂会 AttributeError；「停止所有」钮也在此挂红方块）。**禁用换灰度图**（ttk 主题只压暗按钮面、不给图片置灰）：`start_icon_off`/`stop_icon_off` 在状态写点换挂，`_restore_start_button`/`_restore_stop_button`/`_update_start_state` 按可用性取彩色/灰度。
+- **按钮一律 `ttk.Button`**（vista 主题原生观感，与系统 messagebox 同视觉；`test_all_buttons_are_themed` 守「无经典 tk.Button 残留」）。**width 语义（实测 Tk 8.6/vista）**：正数＝**固定**文本槽（avgchar 倍数，正 4 约 28px），CJK 文案超出槽宽被标签元素直接裁切、按钮也不会被撑宽（「浏览…」、加载态「⠋ 正在停止…」都这么被裁过）；`0`＝按内容自然宽；**负数＝字符数下限**（至少 N 字符、内容更长照长）。旧版注释里「`width=0` 被钉 87px 最小宽」在已映射窗口上不复现（短文案 width=0 即贴内容），但带图标按钮在未映射控件上量到过该宽度，所以**短文案按钮统一给负 width 双保险**：开始/停止 `width=-1`（逐态贴合：静止 74/50px、加载态长文案 97px，宽度只在状态切换瞬间变一次，盲文帧等宽不横跳，`pack(side=right)` 变宽向左生长）、新增/删除/浏览…/账户列表三键 `width=-1`（网格键的视觉等宽由 uniform 列保证，与 width 无关）、邮箱文件夹工具栏三颗 `width=-7`（同下限保三颗等宽 ≈59px）；⟳ `width=0`；弹窗按钮排不设 width（自然宽恰是 messagebox 观感）。硬契约见 `test_all_ttk_buttons_use_flexible_width`（全库按钮 width≤0）。弹窗按钮排一律走 `_make_equal_button_row`：同排**等宽**（grid uniform 列取组内最宽自然宽、`sticky="we"` 铺满）、**整排居中**（`pack(anchor="center")`，容器要 `fill="x"`；与状态文案同排时包一层内容宽 group 整体居中）、两侧各 `BTN_GAP//2` 合成 4px 相邻间距——**不对称 padx 会让末颗宽一截**（回归自等宽断言炸掉，这也是 gui.md grid 间隔口径的由来）。**默认按钮**聚焦呈现（vista 主题画不进 messagebox 那圈蓝描边，行为语义靠焦点承载）：新增弹窗=保存、删除确认/关闭询问=安全侧（取消/隐藏到后台），密码补录焦点照旧在密码框；Enter 触发主操作、Esc 走安全侧。
+- **状态读写双口径**：ttk 的 `cget("state")` 返回 **index 对象**（不是 str），统一走 `widget_state()` 归一化（内部 `instate`）；`configure(state=…)`/`widget["state"] = …` 写法对 ttk 仍然有效（实测），`_register` 存默认态用 `widget_state()`。`_make_square_button` 走 **padding 像素精调**（width 字符粒度 ±8px 调不进 ±2px）：`padding=[0,0]` 量内容基准后对半摊。
+- **按钮排外边距契约**：面板内按钮排到边框 **4px**（备份页 全选/反选/清空 排净 4px：容器 `padx=2`+按钮 `padx=BTN_GAP//2`；设置页新增/删除 `padx=4, pady=4`；日志工具栏 4px），卡片内按钮排随卡片 **8px**（文件夹工具栏 `CARD_PAD`）。两套基线暂行并存，全局标准待统一（用户口径）。
+- 加载态用 `SPINNER_FRAMES`、`SPINNER_INTERVAL_MS` 和 `_set_loading_frame()`。帧链有**两条**、各有自己的 job 槽：运行 spinner（`_run_spinner_tick`）与文件夹加载 spinner（`_folder_loading_tick`，画在「邮箱文件夹」卡的加载层上）；连接 spinner 已随连接按钮移除。运行 spinner 一条链但有两类目标：`_stopping_all` 时画左栏「停止所有」，同时按**选中账户**的 run_phase 画右下开始钮（connecting/scanning→「正在统计…」`SCANNING_BTN_LABEL`、backing→「正在备份…」）或停止钮（stopping→「正在停止…」）；选中账户空闲而别的账户在跑时两右下钮静止。running（活动集合空）变假时帧链自愈退出并复位。切账户在 `_render_account_detail` 里取消并当帧重画，转圈立即落到新选中账户。
+- **文件夹加载态**：拉取文件夹清单期间（启动静默加载 / 切账户 / 保存后 / 补录后 / 手动 ⟳，全走 `_maybe_load_folders`）「邮箱文件夹」卡盖上加载层（`folder_loading`：居中旋转 spinner +「正在加载邮箱文件夹…」），树与旧内容在层下不可交互、⟳ 禁用防重入；**只跟随当前选中账户**（`_sync_folder_loading_view` 是唯一裁决点，切账户经 `_render_account_detail` 换视图，后台账户完成不打断当前显示），失败即退出加载态、恢复原有失败提示与密码补录。
+- 开始和停止按钮 `width=-1`：负 width 是**字符数下限**，请求宽随当前文案+图标逐态贴合（静止「开始备份」74px/「停止」50px，加载态「⠋ 正在统计/备份/停止…」97px），长文案不再被裁；宽度只在该账户阶段切换瞬间变一次（转圈 10 帧实测等宽、帧内零横跳），`pack(side=right)` 变宽向左生长、进度条让宽。加载态使用 `_blank_icon()` 占住「有 image」这个高度前提，不把 `image` 设为 `""`，避免按钮高度变化；占位是 1px 宽 × 图标高——只借高度不占宽，转圈符贴近左边框、左右留白与静止态对称（回归自：整图标宽的占位让左边一大块空白、左松右紧）。
+- 右下停止只作用于**当前选中账户**：点击后转圈移到停止钮、开始钮恢复静止但禁用，第二行改成「正在停止…」并保留既有取信/文件夹失败后缀，行布局不收回；该账户到终态（完成/失败）或选中别的空闲账户后两按钮按 `_update_start_state` 的选中账户口径恢复。
+- 「停止所有」是左栏满宽按钮（`fill="x"` 不设 width，侧栏最小 120px 下转圈文案实测 108≥86 完整不裁），只在有活动账户时存在；它给每个活动账户分别保存上述停止文案，切换账户后仍能恢复；「备份所选」本身运行中保持可用。
+- **进度条更新只动 value**（`_refresh_counts`）：value 钳进 `[0, maximum]`，maximum 仅在值真正变化时配置、length 仅在跨布局档位时配置（缓存于 `_progress_length`）。禁止每封邮件重配 maximum/length——原生 vista 进度条在高频 PBM_SETPOS 与几何重算同批交错时填充块会错位显示成满格（实测故障：122/4839 仍满格）。每封邮件只 `configure(value=…)`。进度同时回写 `state["progress"]`（切账户还原，旧实现只在 totals 记 0 会归零）。账户行尾状态图标与复选框/名称同为行命中区：`_make_account_row` 里 frame/label/**icon** 都绑 `<Button-1>` 切账户。停止后开始按钮恢复静止文案必须 `_bar.update_idletasks()` 立即重排，否则要等窗口 `<Configure>` 才按新请求宽布局，期间文本被裁。
+- 邮箱文件夹工具栏右上角的 **⟳ 刷新按钮**是 icon-only 字形按钮（`RELOAD_GLYPH`；PhotoImage 画不了圆弧，不自绘图标），**正方形**（`width=0` 取单字形自然宽，`_make_square_button` 再按 padding 像素精调补成精确正方形、实测误差 0px），悬停有气泡（`_bind_widget_tip`，无截断语义、悬停即弹），运行中随 `_register` 名单一起禁用。
 
 相关回归：
 
@@ -33,24 +79,57 @@
 - `test_loading_buttons_keep_their_height`
 - `test_stopping_feedback_covers_buttons_status_line_and_hint`
 - `test_stopping_then_failing_restores_the_controls`
+- `test_folder_loading_shows_spinner_and_hides_tree` / `test_folder_loading_follows_the_selected_account`
+- `test_all_buttons_are_themed` / `test_all_ttk_buttons_use_flexible_width` / `test_reload_button_is_square`
+- `test_run_buttons_fit_each_state_and_hold_width_across_frames`
+- `test_progress_bar_value_tracks_messages_without_overfilling` / `test_progress_length_not_reconfigured_every_message` / `test_stop_restores_start_button_at_full_width_without_resize` / `test_row_icon_click_selects_the_account` / `test_fit_account_names_survives_missing_icons`
 
 ## 布局与滚轮
 
 - 主内容左右边距保持同一基线；单个面板不额外增加右边距。邮箱文件夹面板的滚条贴住面板右边框。
+- **版式封顶**（图1/2/3 的「分隔太远 / 截断遮挡 / 输入框过长」同根因：内容列无上限拉伸）：「账户信息」「输出」两卡的值列 `weight=0` 不拉伸（窗口再大右侧留白），内容块封顶 `CARD_CONTENT_MAX_WIDTH`（620px），超长值（邮箱地址、收件服务器、备份保存位置）截断显示、悬停 tooltip 显示全文（`_fit_card_values` + `_bind_tip`）；设置页账户表单块封顶 `ACCOUNT_FORM_MAX_WIDTH`（640px，`_fit_account_form_block` 用 `place` 定宽、块内输入框照常拉伸），「备份」分类的备份保存位置行同封顶（`_fit_backup_root_row`，同 place 口径）。**收件服务器行放不下就换行**（`_layout_conn_row`，用户选定「实测宽度 + 迟滞带」）：判定是实时的（每次卡片 `<Configure>` 重算），各段取 `winfo_reqwidth` 实测宽 + 同排 `grid padx` 实际间隙（`CHIP_PADX_SAME_ROW` 等三个常量布局与量宽共用，不是估值），拼上服务器值像素地板 `SERVER_MIN_BUDGET` 与可用宽比；恢复同行比换行多要 `WRAP_HYSTERESIS`（12px）的富余，临界宽度来回拖不闪跳。换行后 SSL chip 与端口进**独立第二行容器** `_conn_wrap_row`（跨列 `columnspan` 不参与列宽计算、左缘贴值列）紧凑排一排——不能塞回第一行的网格列：列宽按第一行定，端口会被推到最右还截断（回归自截图）。换行与否决定截断预算里扣不扣 tails。
+- **两卡内容贴左、值列跨卡同线**（用户选定「左对齐 + 统一到同一条线」）：内容块 `inner.pack(..., anchor="w")` 按内容定宽贴左，窗口再大右侧整片留白——**不能** `fill="x"`：grid 会把自己居中在更宽的 master 里，看着又像居中（「内容居中」截图的根因是 pack 默认 anchor=center）。值 Label 统一 `padx=4`（首行曾漏它，「IMAP（仅接收，不发送）」比下一行值左移 4px）；两卡标签列取全部标签最大请求宽做 `columnconfigure(0, minsize=…)`（`_align_card_caption_columns`，标签右对齐、值列贴它起排），「账户信息」与「输出」的值列起点因此落在同一条竖线。标签文案静态，建完两卡量一次即可。
+- **SSL 是色块 chip 不是文字值**：启用绿、未启用灰（`_style_ssl_chip`，备份卡只读展示与设置表单同一视觉）；设置表单里 chip 可点击切换（`_on_acct_ssl_chip_click`，command 语义与原 Checkbutton 完全一致，默认端口联动照旧）。
+- **上部两栏固定 3:2**（账户信息 : 邮箱文件夹，用户更正后的比例）：两栏**不走 grid 权重**——列宽 = 请求宽 + 按权重分余量，左列内容请求宽几百像素，小窗下余量再怎么分右列都只剩零头（「邮箱文件夹被挤扁」的根因）。改 `place` 定宽（`_fit_top_columns`，同 `_fit_account_form_block` 口径）：净宽扣掉 `TOP_COLUMN_GAP`（8px 栏间隙）后按 `TOP_LEFT_SHARE`（3/5）分，所有窗口尺寸固定比例。
+- **底边对齐**：左列（账户信息 + 输出）叠出的自然高度是基准线，「邮箱文件夹」卡的高度、左列自身的高度与上半区容器的高度都去贴它（`_sync_top_region_height`），两卡下边框落在同一条线上，下方运行区排在上半区之下。**高度必须走 `place_configure(height=…)`，不能 `configure(height=…)`**：folder_group 的子控件在 grid 里，grid 传播会在子控件重新请求尺寸时把 height 选项覆盖回内容高（实测 119 掉回 52），卡片矮一截、底边就对不上（回归自「邮箱文件夹底部对不上输出」）；place 的高度选项不受请求变化影响。左列定高后的富余由「输出」卡 `pack(fill="both", expand=True)` 吸收（内容顶部对齐、下方留白），两卡底边因此永远同线。**卡高不得低于内容的最小排布**：兜底取两列请求高的较大者（`winfo_reqheight` 仍反映内容最小高），树画布只给 1px 的最小请求高（`height=1`，实际高由 `row=1` 的 `weight=1` 吃满）——grid 行不会缩到请求高以下，请求大了会把布局顶出卡片、画布盖掉 LabelFrame 底边框（回归自「下边线没了」）。
+- **卡片内容内边距统一 `CARD_PAD`（8px）**：「账户信息」「输出」两卡的内容行装进 `inner` 框（`padx=8, pady=5`，行自带 `pady=3` 合成四边 8px），「邮箱文件夹」toolbar 与树区同取 8px（滚条仍贴面板右内沿）。
+- **按钮排的按钮间隔统一 `BTN_GAP`（4px，用户选定，基准 = 备份页账户列表 全选/反选/清空）**：文件夹工具栏、设置页「账户」新增/删除、底栏 开始备份/停止、密码补录与关闭询问的按钮对，相邻按钮之间一律 4px（pack 用 `padx=(BTN_GAP, 0)` / `padx=(0, BTN_GAP)`，grid 用两侧各 `BTN_GAP // 2`）。**⟳ 例外**：右对齐在工具栏内沿（右上角，用户选定），与左排按钮之间是弹性余量、只保 `BTN_GAP` 下限——窗口窄到整排放不下时钳制会把右栏放大到装下整排（`_backup_detail_min_width`）。复选框对（mbox/eml 输出）不是按钮排，保留各自语义间隔。
+- **文件夹树的层级语言**：**一级行不画层级符号**（用户选定）——没有前缀槽，复选框（名称 Label 里的勾选符）直接贴树区左缘的 `CARD_PAD` 标准内边距（与 toolbar 同一条竖线），有子文件夹时展开箭头（`▾`/`▸`）**跟在名称后**（行内顺序 [名称, 尾随箭头]，测试别按下标取）。二级及以下维持前缀槽（固定 `ARROW_SLOT_W` 宽，名称左缘各级对齐）= 层级连接符（同级末个 `└`、其余 `├`，不画祖先竖线）+ 父行展开箭头（行内顺序 [前缀槽, 名称]）；子层缩进 `TREE_INDENT_W`（12px/级）。点箭头 = 展开/折叠、点名称 = 勾选，命中区不变。**前缀槽定宽但必须 `fill="y"`**：`pack_propagate(False)` 连高度传播也关掉，不给高度槽会塌成 1px，Windows 把子标签裁成一条横切片，`├`/`└`/`▾` 全都显示成「-」（回归自：符号看着像横杠；`node["prefix_label"]` 留了测试口，一级行为 `None`）。
+- **长名称截断 + 悬停看全文**：文件夹名与账户名与卡片值同一口径（`_fit_name_label` + `_bind_name_tip`，只在截断时弹气泡）——文件夹名按树区宽扣掉该行实占的缩进与前缀槽（一级行没有槽，改扣名称后的尾随箭头），账户名按列表宽；画布/侧边栏变宽自动恢复全文（双向）。
+- **侧边栏拖拽调宽**（三处各自独立持久化）：备份页账户列表、设置页左栏、设置页「账户」列表各有一个 overlay 拖拽手柄（`_make_sash`），**手柄压在「侧栏右边框与右侧内容之间」那条空隙带上**（用户选定）：带就是右侧内容的内边距/格距（备份页 8px = 右栏 `padx=8`、设置左栏 8px = `nav` 的 grid `padx=(0,8)`、账户列表 10px = `form_host` 的 `padx=(10,0)`），手柄挂宿主上、宽 = 带宽、`place(x=偏移+侧栏宽, width=带宽, relheight=1)`，侧栏改宽后 `_place_sash` 重摆。**手柄隐形**：背景与宿主同色（`str(host.cget("background"))`），可拖提示只靠 `sb_h_double_arrow` 光标——曾贴在侧栏内侧压住内容，出一条灰条（回归自截图）。宽度钳在 `[SIDEBAR_MIN_WIDTH, 上限]`（默认 160），上限取硬上限 `SIDEBAR_MAX_WIDTH`（240）与**动态钳制**的较小者（`_sash_max_width`，每次拖动 motion 重算 = 实时判断右侧内容还能不能显示完整）：窗口宽 - 同页其它栏位宽 - 右侧最小完整宽（设置页取账户表单块实测请求宽钳 320~640，备份页取 `_backup_detail_min_width` = 整体最小宽与**「邮箱文件夹」工具栏实测请求宽**反推的宽取大——先前只按 `BACKUP_DETAIL_MIN_WIDTH` 反推，拖宽后右上 ⟳ 被 pack 挤成一条竖缝，回归自截图；文件夹列 = (右栏宽-内边距-栏间隙)×(1-TOP_LEFT_SHARE)，卡内再扣 2×CARD_PAD 与卡边框）。**窗口收窄同口径兜底**：`_clamp_backup_sidebar`（挂在 `_fit_top_columns`）把实际宽度收成 `min(用户选定宽, 拖拽上限)`，窄窗下 ⟳ 不被挤没、拉宽后自动回到用户选定的宽（不动 `_backup_sidebar_width`）。三处宽度互不影响，各自写入界面设置的 `backup_sidebar_width` / `settings_sidebar_width` / `settings_account_list_width`（`parse_sidebar_width` 校验，越界回落默认）。**手柄必须晚于占住这条带的兄弟内容创建**：带常落在右侧内容的内边距上，Tk 同级后建者在上层，早建会被兄弟节点整个盖住点不到（回归自：设置页左栏拖不动）。
+- **自绘弹窗一律居中到主窗口**（用户选定）：预检加载窗、密码补录窗、关闭询问窗、新增账户弹窗、删除确认窗都走 `_center_on_root`（内容建完后、`grab`/`wait_window` 前调用）。注意 `wm geometry` 的 `+x+y` 落在**外框**、`winfo_rootx` 量的是**客户区**，中间差着一圈装饰（实测 8px 边框 + 31px 标题栏），直接套「root 中心 - 弹窗一半」会整体偏右下一截——所以先 `withdraw` 着摆一次 `+0+0` 量出装饰偏移，再按客户区中心反推外框坐标（实测落点误差 0px，弹窗全程未显示过，不闪）。系统 messagebox/filedialog 走原生居中、**不保证落在主窗口内**（删除确认曾用 `messagebox.askokcancel` 就没居中，已改自绘），本规则只约束自绘弹窗；悬停气泡跟随鼠标，不居中。
+- **智能滚条**：备份页账户列表与设置页「账户」列表的滚条都按内容显隐（`_sync_account_scroll` / `_sync_account_edit_scroll`，行数 × 行高超出可视高才 `grid`，装下 `grid_remove`），触发点是列表 `<Configure>` 与增删/重画；滚条挂出再收窄的二次 `<Configure>` 状态已稳定，不来回抖。设置页两个 Listbox 的滚轮沿用原生节奏（`_on_wheel` 只接管「邮箱文件夹」与备份页账户列表两块画布）。「邮箱文件夹」的滚条常驻、不按内容显隐，所以它的 `-command` 走 `_folder_scroll_command`：树装得下时箭头/滑轨/拖动全部空转（直连 `canvas.yview` 会在装得下时把原点推出内容外，与滚轮是同一条漂移路径）；账户列表的滚条装得下时已 `grid_remove`，事件到不了，无需这一层。
+- 面板与面板之间的间隔横竖都是 **8px**：左栏账户列表 ↔ 右栏、「账户信息」↔「邮箱文件夹」、「账户信息」↔「输出」（`pady=(0, 8)`），以及上半区 ↔ 运行区（配置区下边距 4 + 运行区上边距 4）。
 - 两个页签（邮件列表 / 运行日志）各有一层与「邮箱文件夹」面板同款的外包边框（`_panel_style_frame()`：groove + 面板同值 `borderwidth`）：滚条包在框内、贴着边框内侧，日志页签的工具栏也在框内，空态提示挂框内。
 - 邮件列表：外框与面板同款（groove）；白色表格**自己带凹陷边**（`tree_wrap`：`tk.Frame(relief="sunken", borderwidth=1, background="#ffffff")`，Tk 经典 3D 绘制——左/上 153 阴影、右/下 230 高光），整块贴着外框内沿、不留灰边距。**只保留右侧那条凹陷线**：树用 `place(x=-1, y=-1, relwidth=1.0, relheight=1.0, width=1, height=2)` 往左上各溢出 1px、右下各多铺 1px（宽那 1px 用来吃掉顶边最后一个像素，否则白板右上角会留下一个深色点），把白板的左/上/下三条线盖住（与外框合成一条线），右边留出的 230 高光正对滚条左缘的 1px 白色反光条（没有对比时白对白会糊成一片，用户口径，探针见 issues/15）。白底是必需的：3D 色阶由控件背景推出，白底才与日志板同色。树自己的 vista field 边框走派生样式 `Mail.Treeview`（layout 只留 `treearea`，全局 `Treeview` 布局不动）压平。
+- **邮件列表按 100ms 合批插入、只在底部跟随**：`_on_message_event` 只把可见账户的行放进 `_pending_message_rows`，`_pump` 处理完当前事件批后由 `_flush_message_rows` 一次插入；`_insert_message_row` 不再逐行 `see`。每批插入前记 `at_bottom = tree.yview()[1] >= 0.999`，为真才在最后一条上调用一次 `see`，用户向上滚动后新行不得抢视口。切账户由 `_render_messages` 清掉待插入队列、重画该账户全部行并 `yview_moveto(1.0)`；1 秒 `_status_tick` 不碰列表、`yview` 或 `see`。
 - 运行日志：板面与「打开日志文件夹」按钮同外框之间处处留 **4px** 灰边距（以最短的下边距统一，按钮与板面左缘同一竖线），板面保留 Tk 自带下沉边框、右侧贴住滚条；滚条也带 4px 上下边距（与文件夹面板的滚条同款）。
 - 回归：`test_right_edges_share_one_baseline` 断言这些边框 / 留白 / 凹陷边 / 滚条对齐。
 - notebook 客户区在 vista 主题里相对自身左缩 1px、右缩 3px、下缩 3px，且会在客户区四周自绘 1px 淡边线（原生绘制，颜色改不了：`TNotebook` 只有 `-tabmargins` 可配，换 background/bordercolor/lightcolor/darkcolor 像素纹丝不动，见 issues/15）。因此容器 `run` 的左右内边距用 7/5 把它补掉（按钮行与状态行用 `padx=(1, 3)` 保留 8px 边距），页签包裹边框的左/右线才与配置区左边线、上方面板右线**精确重合**；`tab_edge_left`/`tab_edge_right`/`tab_edge_bottom` 三条背景色窄条（1px/3px/3px，`place` 在 notebook 上、随其几何走）盖掉客户区内缩带，页签里就只剩包裹边框这一条线。**底边那条必须盖**：它的淡线落在包裹边框外侧，底边看起来会多出一道「突出」的线（用户复核）；顶边那条是页签行底界线，保留。
 - `test_right_edges_share_one_baseline` 断言上述三处均为**精确相等**，并断言窄条尺寸（左 1 / 右 3 / 下 3）== 实测内缩：换主题或 DPI 让内缩变了，会在这里炸出来，提醒同步改窄条尺寸与容器内边距。
-- 邮箱文件夹滚轮使用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；沿事件控件的 `.master` 向上判断是否位于 `folder_group`，其他区域返回 `None` 放行。
+- 邮箱文件夹与账户列表的滚轮共用窗口级入口 `root.bind("<MouseWheel>", _on_wheel)`；`_wheel_canvas` 沿事件控件的 `.master` 向上认面板（`_widget_in_panel`），落在「邮箱文件夹」或左栏账户列表里才接管，其他区域返回 `None` 放行（设置页那个 Listbox 因此照旧走原生滚动）。
 - 面板内滚条也调用 `_on_wheel` 并返回 `"break"`，由该入口完成滚动，避免 `TScrollbar` 默认步长覆盖统一节奏。
-- 每格滚动 `FOLDER_WHEEL_ROWS` 行；`yscrollincrement` 使用实测行距。不足一格的 delta 按 `WHEEL_DELTA` 累积，以支持高分辨率滚轮和触摸板。
+- 每格滚动 `FOLDER_WHEEL_ROWS` 行；`yscrollincrement` 使用实测行距（文件夹侧按**请求高度**量，建完控件就有，不受布局结算时机影响——按 `winfo_rooty` 量会被重建后早到的 `<Configure>` 量成占位值，一格的步长一直留错）。不足一格的 delta 按 `WHEEL_DELTA` 累积，以支持高分辨率滚轮和触摸板。
+- **滚轮只在内容高出可视区时才滚**（`_canvas_overflows`，按 **scrollregion** 高度判而不是 `bbox("all")`：树缩小后 Tk 不送达 `folder_inner` 的 `<Configure>`，两者会不一致，而 scrollregion 才是 `yview_scroll` 参照的那份）。装得下时 `_on_wheel` 直接 `"break"` 空转——不攒余量、也不做事后复位：Tk 在 scrollregion 不高于视口时不把视图原点钳在 0，硬滚会把内容推出负坐标（账户列表复现：行被推下去、上方露一片对话框灰，而 `yview` 始终报 `(0.0, 1.0)`、滚条也照旧隐藏，看不出这里不该滚）。同理，常驻的文件夹滚条命令（箭头/滑轨/拖动）也过同一判断（`_folder_scroll_command`）。
 
 相关回归：
 
 - `test_right_edges_share_one_baseline`
 - `test_folder_panel_wheel_covers_the_whole_panel`
+- `test_wheel_does_nothing_when_the_panel_content_fits` / `test_folder_scrollbar_cannot_scroll_a_tree_that_fits` / `test_folder_view_starts_at_the_top_after_switching_accounts` / `test_collapsing_a_branch_keeps_the_folder_view_in_range` / `test_deleting_the_last_account_leaves_no_stale_folder_scroll`
+- `test_account_list_scrolls_only_when_accounts_do_not_fit`
+- `test_top_columns_split_three_to_two` / `test_conn_row_wraps_when_tight`
+- `test_card_content_is_left_aligned_and_values_line_up` / `test_card_value_columns_align_across_cards`
+- `test_folder_card_bottom_matches_output_card`
+- `test_ssl_chip_renders_and_toggles` / `test_backup_root_row_is_capped`
+- `test_settings_sash_is_on_top_and_draggable` / `test_account_edit_list_has_sash_and_smart_scroll`
+- `test_sash_sits_in_the_gap_band` / `test_dialogs_are_centered_on_root`
+- `test_backup_sash_keeps_the_folder_toolbar_visible`
+- `test_button_gaps_are_uniform`
+- `test_folder_prefix_labels_are_not_clipped` / `test_folder_card_bottom_border_not_overflow`
+- `test_folder_top_rows_have_no_tree_symbol`
+- `test_reload_button_is_square` / `test_long_names_are_ellipsized_with_tip`
+- `test_message_rows_wait_for_the_pump_and_scroll_once_per_batch` / `test_incoming_rows_keep_the_mail_list_viewport_when_scrolled_up` / `test_switching_accounts_renders_the_latest_message_at_the_bottom`
 
 ## 邮件列表选中
 
@@ -69,7 +148,7 @@
 ## 输入框焦点
 
 - 措辞先立稳：**选中**（selection）是邮件行的高亮，**聚焦**（focus）是输入框的光标归属——两件事共用同一个窗口级左键入口，别混着叫。
-- 焦点只归属 5 个输入框（帐号/服务器/端口/密码/保存路径）。点击后焦点仍在某个输入框、而落点不是这个框时，焦点收归主窗口 `root.focus_set()`——光标消失，Tab 从第一个控件重新开始。
+- 焦点只归属设置页账户表单的输入框与设置页「备份」里的地址栏（`_account_form_entries` + `backup_root_entry`；备份页没有输入框）。点击后焦点仍在某个输入框、而落点不是这个框时，焦点收归主窗口 `root.focus_set()`——光标消失，Tab 从第一个控件重新开始。
 - 收归与否看落点控件是否原生接焦：Tk 只让输入框、列表、日志文本在点击时拿焦点（禁用中的输入框不拿），标签、空白、按钮、勾选框点完焦点原地不动，正需要入口收走；点另一个输入框/列表/日志文本时类绑定先完成转移，处理器不插手也不抢占。
 - 例外与上节同口径：点邮件列表自己的滚条时选中与焦点都不动。Alt-Tab 与滚轮不产生 Button-1，天然不清；不用 `<FocusOut>`。
 - 测试不赌前台归属：`focus_set` 是「非强制」的，窗口被外部抢走前台时请求会被推迟（`focus_get()` 停在原处）。所以断言分两路——用替身数 `root.focus_set` 的调用（确定性契约：处理器必须发出收归请求），焦点去向只做宽松校验；合成鼠标事件偶发被丢弃时重发一次再判。
@@ -98,14 +177,16 @@
 
 改关闭按钮行为、托盘、菜单栏或设置页前先读这一节；完整决策见 ADR 0009。
 
-- **关闭三态**：`close_action` = `ask`（默认）/ `tray` / `exit`，读写都在既有设置文件里，**不升 `UI_SETTINGS_VERSION`**（升版本会让老设置整份失效），非法值回退 `ask` + warning。关闭动作由纯函数 `decide_close(preference, hidden=)` 决定（`force_exit` / `hide` / `exit` / `ask`）；备份是否运行中只影响对话框文案与托盘「退出」的确认，不参与判定。
-- **「已隐藏」只认 `root.state() == "withdrawn"`**，不设影子标志；据此定死一条规则：**隐藏状态下收到的关闭请求一律真退出**（那只可能是安装器/卸载器/任务管理器发来的），否则升级安装关不掉旧实例。
-- **托盘线程边界与工作线程同款**：`imapbackup_tray.TrayHost` 的回调只往 `self.events` 投 `tray_show` / `tray_stop` / `tray_quit`，由 `_pump` 在 Tk 线程消费；界面侧所有托盘调用都必须走 `TrayHost` 的公开方法（内部转给托盘线程），绝不在托盘线程里碰 widget。托盘为 `None`（非 Windows / 建不起来 / `show()` 返回 False）时「隐藏到后台」退化为 `iconify()`——出口路径必须先成立。
-- **图标常驻**：`TrayHost.show()` 是幂等的「确保挂出并刷新 tooltip」，启动时调一次（失败只记 warning），隐藏窗口前再调一次并以它的返回值决定是否隐藏；`hide()` 不存在——唯一移除点是真宿主的 `close()`（`_quit()` 调用）。tooltip 与菜单「停止备份」的可用性由 `_sync_tray()` 在启动、开始备份、运行结束、隐藏、恢复、后台通知处追平。
-- **后台结束只发气泡**：`run_done` / `run_failed` 在 `_background_hidden()` 为真时不恢复窗口、不弹错误框，改为 `tray.notify(...)` + `_sync_tray()`；点气泡或左键图标走 `tray_show` 恢复窗口。
+- **关闭三态**：`close_action` = `ask`（默认）/ `tray` / `exit`，读写都在既有设置文件里，**自身不升版本号**（新键按字段独立校验，不合法即回退 `ask` + warning；`UI_SETTINGS_VERSION` 只在账户模型这类结构性变化时升，且必须配套迁移）。关闭动作由纯函数 `decide_close(preference, hidden=)` 决定（`force_exit` / `hide` / `exit` / `ask`）；活动集合只影响「退出程序」分支的二次确认（ADR 0012），不参与偏好判定，「隐藏到后台」永不拦截。
+- **「已隐藏」只认 `root.state() == "withdrawn"`**，不设影子标志；据此定死一条规则：**隐藏状态下收到的关闭请求一律真退出**（那只可能是安装器/卸载器/任务管理器发来的，优雅停止确认也不拦），否则升级安装关不掉旧实例。
+- **托盘线程边界与工作线程同款**：`imapbackup_tray.TrayHost` 的回调只往 `self.events` 投 `tray_show` / `tray_stop` / `tray_quit`，由 `_pump` 在 Tk 线程消费；`tray_stop` 消费为 `_on_stop_all()`；界面侧所有托盘调用都必须走 `TrayHost` 的公开方法（内部转给托盘线程），绝不在托盘线程里碰 widget。托盘为 `None`（非 Windows / 建不起来 / `show()` 返回 False）时「隐藏到后台」退化为 `iconify()`——出口路径必须先成立。
+- **图标常驻**：`TrayHost.show()` 是幂等的「确保挂出并刷新 tooltip」，启动时调一次（失败只记 warning），隐藏窗口前再调一次并以它的返回值决定是否隐藏；`hide()` 不存在——唯一移除点是真宿主的 `close()`（`_quit()` 调用）。tooltip 与菜单「停止备份」的可用性由 `_sync_tray()` 读 `self.running`（活动集合派生）在活动集合变化、隐藏、恢复、后台通知处追平。
+- **后台结束只发气泡**：最后一个活动账户到终态（`_after_account_terminal` 检测活动集合排空，无 `batch_done`）且 `_background_hidden()` 为真时不恢复窗口、不弹错误框，按周期记账（stopped/failures/完成三选一）发一次 `tray.notify(...)`；点气泡或左键图标走 `tray_show` 恢复窗口。
+- **备份中退出**：可见窗口的「退出程序」与托盘退出在有活动账户时走 `_confirm_and_quit()`（自绘确认窗，取消安全侧；隐藏时从托盘退出先恢复窗口）；确认后窗转等待态，`_begin_quit_after_stop` 停所有活动账户并 100ms 轮询，排空干净退、超 `QUIT_STOP_TIMEOUT_S` 强退；预检中不拦（daemon 不写盘）。
 - **设置落盘仍是「一次写」**：设置页单选钮与关闭对话框只改内存 `_ui_settings`，隐藏/退出/外部关闭三条路径各调一次 `_save_column_config()`；隐藏时先落盘再 `withdraw()`（此刻几何还读得对）。
 - **窗口状态记忆**：`_window_maximized` 由 `_restore_window_settings()` 初始化、`<Configure>` 在 state 为 `zoomed`/`normal` 时维护；`_window_settings()` 与 `_show_window()` 都读它，**不现场读 `wm state`**——最小化（iconic）或已隐藏（withdrawn）时现读会把最大化记丢（托盘菜单退出、外部关闭正是后一种）。`withdraw()`→`deiconify()` **不带回最大化**（真机实测：回来是 normal + 最大化前几何），隐藏恢复必须重放 `state("zoomed")`；iconic 分支保持 `state("normal")`——Tk 自己记得最小化前的状态（含最大化）。
-- **页面外壳**：`page_host` 下 `backup_page` / `settings_page` 同格叠放，`_show_page()` 是唯一切页入口（`tkraise` + 菜单栏选中态 + 设置页回填）；菜单栏两项是顶层 radiobutton（不开下拉）。设置页两栏＝左 `Listbox` 分类栏（`SETTINGS_SECTIONS` 表驱动，固定 160px，`pack_propagate(False)`）+ 右详情（`tkraise` 切分类），**四边留白等宽**（`outer` 用 `padx=8, pady=8`：备份页的底边距由运行区自带，设置页下方没有内容，漏掉就会「三边等宽、底边贴边」）；设置页控件**不进 `_register`**。
+- **页面外壳**：`page_host` 下 `backup_page` / `settings_page` 同格叠放，`_show_page()` 是唯一切页入口（`tkraise` + 菜单栏选中态 + 设置页回填）；菜单栏两项是顶层 radiobutton（不开下拉），第三项「帮助」是唯一的下拉菜单。
+- **常见问题（帮助 → 常见问题）**：`_show_faq()` 开单例 `tk.Toplevel`（已开时只 `deiconify` + `lift` + `focus_force`，不建第二个），`tk.Text(state="disabled")` + `Scrollbar` 只读可滚；Esc 与 `WM_DELETE_WINDOW` 都走 `_close_faq()` 并清空 `_faq_win` / `_faq_text`。文案是 `FAQ_INTRO` + `FAQ_ITEMS` 常量（规格 §9.2，Q1–Q3 通用原因、Q4 35 云邮殿后），打开与关闭**不读账户、不连服务器、不碰 DPAPI、不写设置与日志**——这条是硬约束，别在 `_show_faq()` 里加任何落盘或自检调用。旧规则「菜单栏只有两项、不开新窗口」已被这一项放宽，改菜单结构前先看规格 §6.5。设置页两栏＝左 `Listbox` 分类栏（`SETTINGS_SECTIONS` 表驱动：账户 / 备份 / 窗口与后台，固定 160px，`pack_propagate(False)`）+ 右详情（`tkraise` 切分类，进页默认落在第一个分类），**四边留白等宽**（`outer` 用 `padx=8, pady=8`：备份页的底边距由运行区自带，设置页下方没有内容，漏掉就会「三边等宽、底边贴边」）；设置页控件**不进 `_register`**。备份页则是「左账户列表栏（固定 160px，`pack(before=…)` 插到右栏左侧）+ 右详情」，右栏内部的配置区与运行区沿用同一条 8px 基线。
 - **菜单栏的客户区代价**：Windows 原生菜单栏在窗口落地前会吃掉几何高度（实测 736 → 716），`__init__` 末尾 `update()` 落地后再重设一次 `_target_geometry`（由 `_restore_window_settings()` 记录，含位置）；最大化时不再重设，避免碰坏 ADR 0008 的正常几何。
 
 相关回归：
@@ -114,9 +195,10 @@
 - `test_close_with_tray_preference_hides_and_keeps_saving` / `test_close_with_exit_preference_closes_tray_and_window` / `test_close_while_hidden_always_exits_without_asking` / `test_ask_preference_dialog_result_drives_the_action` / `test_cancelled_dialog_changes_nothing`
 - `test_hide_degrades_to_iconify_without_a_tray` / `test_hide_degrades_when_the_icon_cannot_be_added`
 - `test_hide_and_show_keeps_the_maximized_window` / `test_maximized_is_recorded_when_iconic_at_save` / `test_tray_quit_while_hidden_keeps_the_maximized_choice`（窗口状态记忆与三种落盘时刻）
-- `test_run_finished_in_background_only_sends_a_balloon` / `test_stopped_run_in_background_sends_the_stopped_balloon` / `test_failed_run_in_background_does_not_pop_a_dialog`
-- `test_tray_icon_is_up_from_startup` / `test_tray_state_follows_the_run` / `test_tray_show_event_restores_the_window` / `test_tray_stop_event_only_stops_a_running_backup` / `test_tray_quit_confirms_only_while_running` / `test_tray_host_wiring_is_available_on_windows`
+- `test_run_finished_in_background_only_sends_a_balloon` / `test_stopped_run_in_background_sends_the_stopped_balloon` / `test_failed_run_in_background_does_not_pop_a_dialog` / `test_visible_failure_of_the_selected_account_pops_a_dialog` / `test_hiding_while_active_never_asks` / `test_graceful_quit_polls_until_accounts_settle`
+- `test_tray_icon_is_up_from_startup` / `test_tray_state_follows_the_run` / `test_tray_show_event_restores_the_window` / `test_tray_stop_event_only_stops_a_running_backup`（停止所有） / `test_tray_quit_confirms_only_while_running` / `test_tray_host_wiring_is_available_on_windows`
 - `test_menubar_navigation_switches_pages` / `test_settings_page_lists_the_sections_and_selects_the_first` / `test_settings_page_offers_the_three_close_options` / `test_changing_the_option_lands_in_memory_then_on_disk_with_the_close`
+- `test_menubar_carries_the_pages_and_the_help_menu` / `test_faq_menu_opens_one_read_only_scrollable_window` / `test_faq_has_no_network_credential_settings_or_log_side_effects`（帮助菜单与 FAQ 单例、只读滚动、无副作用）
 
 ## 单实例与验证
 

@@ -10,7 +10,7 @@
 import mailbox
 
 import imapbackup312 as core
-from fakes import FetchServer, NullLog
+from fakes import NullLog, UidFetchServer
 
 LOG = NullLog()
 
@@ -19,21 +19,17 @@ RAW = {
     2: b"From: B <b@b.com>\r\nSubject: two\r\nMessage-Id: <2@x>\r\n\r\nbody two\r\n",
     3: b"From: C <c@b.com>\r\nSubject: three\r\nMessage-Id: <3@x>\r\n\r\nbody three\r\n",
 }
-REMOTE = {"<1@x>": 1, "<2@x>": 2, "<3@x>": 3}
+REMOTE = {"<1@x>": (1, len(RAW[1])), "<2@x>": (2, len(RAW[2])), "<3@x>": (3, len(RAW[3]))}
 IDS = list(REMOTE)
-SEQS = [str(seq) for seq in REMOTE.values()]
 
 
 def server():
-    """A fake server answering FETCH with a fixed INTERNALDATE for all three messages."""
-    return FetchServer({
-        seq: (b'%d (INTERNALDATE "12-May-2024 10:15:30 +0800" RFC822 {64}' % seq, raw)
-        for seq, raw in RAW.items()
-    })
+    """A fake UID server answering body FETCH with a fixed INTERNALDATE for all three messages."""
+    return UidFetchServer(RAW)
 
 
-def fetch_seqs(srv):
-    return [str(seq) for seq, _ in srv.fetches]
+def fetch_uids(srv):
+    return [uid for batch in srv.body_fetches for uid in batch]
 
 
 def scan(td, basedir=True, eml=True, overwrite=False):
@@ -89,7 +85,7 @@ def test_eml_complete_mbox_absent_is_not_all_backed_up(tmp_path):
     # 这个曾经返回 {}，整轮被读成「已是最新，无待备份邮件」
     assert set(new) == set(REMOTE), sorted(new)
     srv = download(tmp_path, new, local_mbox, local_eml)
-    assert sorted(fetch_seqs(srv)) == SEQS, fetch_seqs(srv)
+    assert sorted(fetch_uids(srv)) == [1, 2, 3], fetch_uids(srv)
     assert sorted(mbox_ids(tmp_path)) == IDS, mbox_ids(tmp_path)
     emls = eml_files(tmp_path)
     assert len(emls) == 3
@@ -113,12 +109,12 @@ def test_mbox_complete_eml_absent_is_not_all_backed_up(tmp_path):
     srv = download(tmp_path, new, local_mbox, local_eml)
     assert len(eml_files(tmp_path)) == 3, len(eml_files(tmp_path))
     assert sorted(mbox_ids(tmp_path)) == IDS, mbox_ids(tmp_path)
-    assert sorted(fetch_seqs(srv)) == SEQS, fetch_seqs(srv)
+    assert sorted(fetch_uids(srv)) == [1, 2, 3], fetch_uids(srv)
 
 
 def test_eml_only_run_leaves_mbox_pending(tmp_path):
     """Single-format run keeps today's semantics: an unselected sink stays None."""
-    download(tmp_path, {"<1@x>": 1, "<2@x>": 2}, None, None, basedir=False)
+    download(tmp_path, {"<1@x>": REMOTE["<1@x>"], "<2@x>": REMOTE["<2@x>"]}, None, None, basedir=False)
     local_mbox, local_eml = scan(tmp_path, basedir=False)
     assert local_mbox is None
     new = core.pending_messages(REMOTE, local_mbox, local_eml)
@@ -127,7 +123,7 @@ def test_eml_only_run_leaves_mbox_pending(tmp_path):
 
 def test_mbox_only_run_leaves_eml_pending(tmp_path):
     """The mbox-only mirror of the previous test."""
-    download(tmp_path, {"<1@x>": 1, "<2@x>": 2}, None, None, basedir=True, eml=False)
+    download(tmp_path, {"<1@x>": REMOTE["<1@x>"], "<2@x>": REMOTE["<2@x>"]}, None, None, basedir=True, eml=False)
     local_mbox, local_eml = scan(tmp_path, eml=False)
     assert local_eml is None
     new = core.pending_messages(REMOTE, local_mbox, local_eml)
@@ -143,7 +139,7 @@ def test_overwrite_treats_a_full_sink_as_empty(tmp_path):
 
 def test_one_message_missing_from_eml_only(tmp_path):
     """Mixed split: one message present in the mbox but absent from the eml tree."""
-    core.download_messages(server(), "acct/INBOX.mbox", {"<1@x>": 1, "<2@x>": 2}, False, True, False,
+    core.download_messages(server(), "acct/INBOX.mbox", {"<1@x>": REMOTE["<1@x>"], "<2@x>": REMOTE["<2@x>"]}, False, True, False,
                            tmp_path, False, True, LOG, foldername="INBOX")
     core.download_messages(server(), "acct/INBOX.mbox", REMOTE, False, True, False,
                            None, False, True, LOG, eml_dir=tmp_path / "acct" / "INBOX", foldername="INBOX")
@@ -154,7 +150,7 @@ def test_one_message_missing_from_eml_only(tmp_path):
     assert set(new) == {"<3@x>"}, sorted(new)
     srv = download(tmp_path, new, local_mbox, local_eml)
     # 只取缺的那一封，两个 sink 各写各的
-    assert fetch_seqs(srv) == ["3"], fetch_seqs(srv)
+    assert fetch_uids(srv) == [3], fetch_uids(srv)
     assert sorted(mbox_ids(tmp_path)) == IDS, mbox_ids(tmp_path)
     emls = eml_files(tmp_path)
     assert len(emls) == 3 and not any("（" in p.name for p in emls), [p.name for p in emls]
